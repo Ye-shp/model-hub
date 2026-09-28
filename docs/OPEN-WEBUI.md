@@ -23,7 +23,7 @@ You do **not** need a public operations-panel hostname when Open WebUI and the c
 |---|---|
 | `CONTROLLER_URL` | `http://127.0.0.1:8787` when colocated |
 | `OWNER_KEY` | The controller's private owner key |
-| `PROJECT_ID` | `default`, or the exact ID of a project you created |
+| `PROJECT_ID` | `friends` (built in), or the ID of another dedicated project. `default` is refused: it holds the owner's own work |
 | `PROFILE` | `fast` for the first trial, then `balanced` |
 | `ALLOWED_EMAILS` | Leave empty for administrators only |
 | `ALLOW_FRONTIER` | `false` initially |

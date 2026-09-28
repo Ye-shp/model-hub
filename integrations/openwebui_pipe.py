@@ -41,7 +41,7 @@ class Pipe:
     class Valves(BaseModel):
         CONTROLLER_URL: str = Field(default="http://127.0.0.1:8787", description="Controller reachable from the Open WebUI server")
         OWNER_KEY: str = Field(default="", description="Private controller owner key; administrators only")
-        PROJECT_ID: str = Field(default="", description="Dedicated project for this Pipe (never 'default', which holds the owner's own work). All users of this Pipe share it.")
+        PROJECT_ID: str = Field(default="friends", description="Dedicated project for this Pipe (never 'default', which holds the owner's own work). All users of this Pipe share it.")
         PROFILE: str = Field(default="balanced", description="fast, balanced or deep")
         ALLOWED_EMAILS: str = Field(default="", description="Comma-separated invited users; empty means admins only")
         ALLOW_FRONTIER: bool = False

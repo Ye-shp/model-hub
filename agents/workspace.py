@@ -65,6 +65,8 @@ def init() -> None:
     with connection() as db:
         db.executescript(SCHEMA)
         db.execute("INSERT OR IGNORE INTO projects VALUES (?,?,?,?)", ("default", "My workspace", "", store.now()))
+        # Separate project for the Open WebUI Pipe, so invited friends never see the owner's own work.
+        db.execute("INSERT OR IGNORE INTO projects VALUES (?,?,?,?)", ("friends", "Shared with invited friends", "", store.now()))
         db.commit()
     import coordination
     coordination.init()
