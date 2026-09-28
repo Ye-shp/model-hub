@@ -1,5 +1,5 @@
 # Image service (services/image_server.py). Installed by deploy/image/Dockerfile on top of the
-# CUDA 12.8 PyTorch wheel. diffusers is pinned to the main-branch commit that added
+# CUDA 13.0 PyTorch wheel. diffusers is pinned to the main-branch commit that added
 # QwenImage21Pipeline (not in a release yet as of 0.40.0).
 diffusers @ git+https://github.com/huggingface/diffusers@5ff8e59ff9fe81c6e2df4fb4c6ea0d97a5df5ab2
 transformers==5.17.0

@@ -12,9 +12,9 @@ RUN curl -fsSL -o /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared
  && echo "bc073ef293d504cf5ac533bd0aa1c824ef6b4f358765ccaa6628a8a95cacb4b7  /tmp/cloudflared.deb" | sha256sum -c - \
  && dpkg -i /tmp/cloudflared.deb && rm /tmp/cloudflared.deb
 
-# PyTorch with its own CUDA 12.8 runtime (needs a host driver >= 570), then the pinned stack.
+# PyTorch 2.14 with its own CUDA 13.0 runtime (needs a host driver >= 580; Ampere or newer), then the pinned stack.
 COPY services/requirements-image.txt /tmp/requirements-image.txt
-RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 torch==2.14.0 \
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu130 torch==2.14.0 \
  && pip install --no-cache-dir -r /tmp/requirements-image.txt
 
 WORKDIR /opt/image
