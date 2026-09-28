@@ -39,7 +39,9 @@ if (!webuiKey || !clients.authenticate(`Bearer ${webuiKey}`) || existing?.fronti
 }
 
 const manifest = JSON.parse(await readFile(new URL('./models.json', import.meta.url), 'utf8'));
-const slots = await prepareModels(manifest, MODELS);
+// Status shown at https://api.<domain>/health so progress is visible from outside.
+const STATUS = join(DATA, 'status.json');
+const setStatus = (phase, detail = '') => writeFile(STATUS, JSON.stringify({phase, detail, at: new Date().toISOString()})).catch(() => {});
 
 // Each process gets only the settings it needs, so for example the chat website never sees
 // your frontier API keys or the tunnel token.
@@ -70,6 +72,7 @@ function keepRunning(name, command, args, childEnv, cwd = '/opt/hub') {
   start();
 }
 
+function startModels(slots) {
 for (const slot of ['1', '2']) {
   const n = Number(slot);
   const args = [
@@ -87,6 +90,7 @@ for (const slot of ['1', '2']) {
   if (slots[slot].mmproj) args.push('--mmproj', slots[slot].mmproj);
   if (env.MODEL_CONTEXT) args.push('--ctx-size', env.MODEL_CONTEXT);
   keepRunning(`qwen-${n}`, '/app/llama-server', args, {...BASE, CUDA_VISIBLE_DEVICES: String(n - 1), LLAMA_API_KEY: env.MODEL_API_KEY}, '/app');
+}
 }
 
 keepRunning('gateway', '/usr/local/bin/node', ['/opt/hub/gateway/index.js'], {...GATEWAY_ENV, DATA_DIR: DATA});
@@ -109,6 +113,17 @@ keepRunning('open-webui', '/opt/openwebui/bin/open-webui', ['serve', '--host', '
 });
 
 keepRunning('cloudflared', '/usr/bin/cloudflared', ['tunnel', '--no-autoupdate', 'run'], {...BASE, TUNNEL_TOKEN: env.TUNNEL_TOKEN});
+
+// The website, API and tunnel are up now; the models join once their files are ready.
+await setStatus('downloading models');
+try {
+  const slots = await prepareModels(manifest, MODELS, {onProgress: text => setStatus('downloading models', text)});
+  await setStatus('models starting', 'loading weights onto both GPUs (about a minute)');
+  startModels(slots);
+} catch (error) {
+  console.error(`[supervisor] model download failed: ${error.message}`);
+  await setStatus('download failed', `${error.message} — restart the instance to resume`);
+}
 
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
   stopping = true;

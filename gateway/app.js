@@ -5,6 +5,8 @@ import Fastify from 'fastify';
 import {once} from 'node:events';
 import {timingSafeEqual} from 'node:crypto';
 import {hashKey} from './clients.js';
+import {readFileSync} from 'node:fs';
+import {join} from 'node:path';
 import {Pool, leastLoaded, QueueFullError, QueueTimeoutError} from './queue.js';
 import {cleanChatRequest, RequestError} from './sanitize.js';
 
@@ -51,7 +53,12 @@ export function createApp({config, clients, ledger, fetcher = fetch, log = () =>
     return available(client).find(m => m.id === id) || null;
   }
 
-  app.get('/health', async () => ({ok: true}));
+  // Public: gateway up + the supervisor's startup phase (no secrets), so a download can be followed from outside.
+  app.get('/health', async () => {
+    let status = null;
+    try { status = JSON.parse(readFileSync(join(config.dataDir, 'status.json'), 'utf8')); } catch {}
+    return {ok: true, ...(status ? {startup: status} : {})};
+  });
 
   app.get('/v1/models', async req => ({
     object: 'list',
