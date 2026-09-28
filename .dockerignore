@@ -1,0 +1,9 @@
+node_modules
+.git
+.env
+.env.*
+data
+models
+agents
+tests
+*.log

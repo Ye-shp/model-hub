@@ -1,0 +1,23 @@
+{
+  "note": "Pinned files from prithivMLmods/Qwen3.8-27B-abliterated-GGUF (abliterated by huihui-ai). Both resident slots load the same weights plus the vision encoder (mmproj), each on its own GPU. To change a slot, add a file entry (repo, 40-char revision, file, size, sha256 from the Hugging Face API) and point the slot at it.",
+  "files": {
+    "qwen38-abliterated-q4km": {
+      "repo": "prithivMLmods/Qwen3.8-27B-abliterated-GGUF",
+      "revision": "80cb0d21c4340adae5fcc1d4f38d5cf61a69fa83",
+      "file": "Qwen3.8-27B-abliterated.Q4_K_M.gguf",
+      "size": 16547400512,
+      "sha256": "7d0400bc8f0ee6b968ef72d7263ce5152178ed08188e568173b13bbef783a6a2"
+    },
+    "qwen38-abliterated-mmproj-f16": {
+      "repo": "prithivMLmods/Qwen3.8-27B-abliterated-GGUF",
+      "revision": "80cb0d21c4340adae5fcc1d4f38d5cf61a69fa83",
+      "file": "Qwen3.8-27B-abliterated.mmproj-f16.gguf",
+      "size": 931146400,
+      "sha256": "42c8e06d7a450ec799fe9f34835b18d3760a6b5956f1c36a185971d25a1fddc5"
+    }
+  },
+  "slots": {
+    "1": {"model": "qwen38-abliterated-q4km", "mmproj": "qwen38-abliterated-mmproj-f16"},
+    "2": {"model": "qwen38-abliterated-q4km", "mmproj": "qwen38-abliterated-mmproj-f16"}
+  }
+}

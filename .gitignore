@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.*
+!.env.example
+data/
+models/
+*.log
+*.key
+agents/.env
+agents/.venv/
+agents/data/
+__pycache__/
