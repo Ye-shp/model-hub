@@ -3,10 +3,15 @@ node_modules/
 .env.*
 !.env.example
 data/
-models/
+models/*
+!models/catalog.json
 *.log
 *.key
 agents/.env
 agents/.venv/
 agents/data/
 __pycache__/
+*.db
+*.db-shm
+*.db-wal
+.venv/

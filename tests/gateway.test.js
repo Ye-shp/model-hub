@@ -133,13 +133,13 @@ test('streaming responses pass through as they are produced', async t => {
   assert.match(text, /\[DONE\]/);
 });
 
-test('slow non-streamed answers get early headers and whitespace keep-alives', async t => {
+test('non-streamed answers keep headers uncommitted until their real result', async t => {
   const {call, friend, up} = await setup(t, {KEEPALIVE_AFTER_MS: '1000'});
   up.state.handler = (entry, res) => setTimeout(() => { res.writeHead(200, {'content-type': 'application/json'}); res.end('{"choices":[{"message":{"content":"late"}}]}'); }, 1300);
   const res = await call(friend, '/v1/chat/completions', chat('qwen-1'));
   assert.equal(res.status, 200);
   const text = await res.text();
-  assert.match(text, /^ +\{/);
+  assert.match(text, /^\{/);
   assert.equal(JSON.parse(text).choices[0].message.content, 'late');
 });
 
@@ -237,4 +237,69 @@ test('the website key name is reserved', async t => {
   const {base} = await setup(t, {ADMIN_KEY: admin});
   const res = await fetch(`${base}/admin/keys`, {method: 'POST', headers: {authorization: `Bearer ${admin}`, 'content-type': 'application/json'}, body: JSON.stringify({name: 'open-webui'})});
   assert.equal(res.status, 400);
+});
+
+test('late non-streaming provider errors preserve their HTTP status', async t => {
+  const {call, friend, up} = await setup(t, {KEEPALIVE_AFTER_MS: '1000'});
+  up.state.handler = (_entry, res) => setTimeout(() => {
+    res.writeHead(400, {'content-type':'application/json'}); res.end('{"error":{"message":"context overflow"}}');
+  }, 1200);
+  const res = await call(friend, '/v1/chat/completions', chat('qwen-1'));
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error.message, /context overflow/);
+});
+
+test('streaming queued requests send headers and keep-alives before a GPU becomes free', async t => {
+  const {call, friend, up} = await setup(t, {KEEPALIVE_AFTER_MS:'1000'});
+  up.state.handler = (_entry, res) => setTimeout(() => {
+    res.writeHead(200, {'content-type':'text/event-stream'}); res.end('data: [DONE]\n\n');
+  }, 1400);
+  const first = await call(friend, '/v1/chat/completions', chat('qwen-1', 'one', {stream:true}));
+  const second = await call(friend, '/v1/chat/completions', chat('qwen-1', 'two', {stream:true}));
+  const reader = second.body.getReader();
+  const early = new TextDecoder().decode((await reader.read()).value);
+  assert.match(early, /: connected/);
+  let rest=''; for (;;) { const chunk=await reader.read(); if(chunk.done)break; rest+=new TextDecoder().decode(chunk.value); }
+  assert.match(rest, /: keep-alive/);
+  assert.match(rest, /\[DONE\]/);
+  await first.text();
+});
+
+test('heartbeat does not corrupt an upstream SSE event split across chunks', async t => {
+  const {call, friend, up} = await setup(t, {KEEPALIVE_AFTER_MS:'1000'});
+  up.state.handler = (_entry, res) => {
+    res.writeHead(200, {'content-type':'text/event-stream'});
+    res.write('data: {"choices":[{"delta":{"content":"');
+    setTimeout(() => res.end('hello"}}]}\n\ndata: [DONE]\n\n'), 1200);
+  };
+  const res=await call(friend, '/v1/chat/completions', chat('qwen-1','x',{stream:true}));
+  const events=(await res.text()).split('\n\n').filter(e=>e.startsWith('data: ')&&!e.includes('[DONE]'));
+  assert.equal(JSON.parse(events[0].slice(6)).choices[0].delta.content,'hello');
+});
+
+test('non-streaming deadline includes queue wait and frees queued entries', async t => {
+  const {call, friend, up} = await setup(t, {NONSTREAM_TIMEOUT_MS:'1000'});
+  up.state.handler = () => {};
+  const results=await Promise.all([call(friend,'/v1/chat/completions',chat('qwen-1')),call(friend,'/v1/chat/completions',chat('qwen-1'))]);
+  assert.deepEqual(results.map(r=>r.status),[504,504]);
+  await Promise.all(results.map(r=>r.text()));
+  const status=await (await call(friend,'/v1/status')).json();
+  assert.equal(status.models[0].running,0); assert.equal(status.models[0].waiting,0);
+});
+
+test('stream errors are explicit error events, not silently successful empty answers', async t => {
+  const {call, friend, up} = await setup(t);
+  up.state.handler=(_entry,res)=>{res.writeHead(400);res.end('{"error":{"message":"bad context"}}');};
+  const res=await call(friend,'/v1/chat/completions',chat('qwen-1','x',{stream:true}));
+  const body=await res.text(); assert.match(body,/"error"/); assert.match(body,/bad context/); assert.match(body,/\[DONE\]/);
+});
+
+test('usage metrics are scoped to the current API key and exclude prompt text', async t => {
+  const {call, friend, owner, up} = await setup(t);
+  up.state.handler=(_entry,res)=>{res.writeHead(200,{'content-type':'application/json'});res.end('{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}');};
+  await (await call(owner,'/v1/chat/completions',chat('qwen-1','PRIVATE-PROMPT'))).text();
+  const ownerStatus=await (await call(owner,'/v1/status')).json();
+  assert.equal(ownerStatus.metrics.models[0].completionTokens,5);
+  assert.ok(!JSON.stringify(ownerStatus).includes('PRIVATE-PROMPT'));
+  assert.deepEqual((await (await call(friend,'/v1/status')).json()).metrics.models,[]);
 });

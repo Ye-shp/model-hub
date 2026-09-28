@@ -1,2 +1,4 @@
 openai-agents==0.22.3
-pillow>=11
+pillow==12.3.0
+fastapi==0.141.1
+uvicorn==0.54.0

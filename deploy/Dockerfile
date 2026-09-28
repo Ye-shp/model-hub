@@ -32,6 +32,13 @@ COPY --from=node /build/node_modules ./node_modules
 COPY package.json ./
 COPY gateway/ ./gateway/
 COPY deploy/ ./deploy/
+COPY agents/requirements.txt /tmp/agent-requirements.txt
+RUN python3 -m venv /opt/agents \
+ && /opt/agents/bin/pip install --no-cache-dir -r /tmp/agent-requirements.txt
+COPY agents/ ./agents/
+COPY console/ ./console/
+COPY skills/ ./skills/
+COPY integrations/ ./integrations/
 
 # llama-server finds its own libraries in /app only via this path (or when started from /app).
 ENV DATA_DIR=/workspace/data MODEL_DIR=/workspace/models LD_LIBRARY_PATH=/app:/usr/local/cuda/lib64

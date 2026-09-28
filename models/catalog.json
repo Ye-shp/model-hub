@@ -1,0 +1,34 @@
+{
+  "checked_at": "2026-09-28",
+  "recommended_third_slot": {
+    "id": "black-forest-labs/FLUX.2-klein-4B",
+    "revision": "e7b7dc27f91deacad38e78976d1f2b499d76a294",
+    "kind": "image",
+    "license": "apache-2.0",
+    "source": "https://huggingface.co/black-forest-labs/FLUX.2-klein-4B",
+    "use": "Original covers, thumbnails, illustrations and visual concepts",
+    "memory": "Publisher reports approximately 13 GB VRAM with its recommended setup. Actual usage depends on resolution, runtime and offloading.",
+    "placement": "Separate optional image service. Do not auto-load beside either resident 27B model.",
+    "abliterated": false
+  },
+  "alternatives": [
+    {
+      "id": "Systran/faster-whisper-small",
+      "revision": "536b0662742c02347bc0e980a01041f333bce120",
+      "kind": "transcription",
+      "license": "mit",
+      "source": "https://huggingface.co/Systran/faster-whisper-small",
+      "use": "Turn supplied audio/video into searchable, timestamped project evidence",
+      "placement": "Optional CPU int8 worker. No GPU reservation; benchmark CPU speed and RAM before sustained use."
+    },
+    {
+      "id": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+      "revision": "85e237c12c027371202489a0ec509ded67b5e4b5",
+      "kind": "speech",
+      "license": "apache-2.0",
+      "source": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+      "use": "Multilingual narration using preset voices",
+      "placement": "Future optional service; runtime integration is not included in this version."
+    }
+  ]
+}

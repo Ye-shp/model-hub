@@ -49,7 +49,9 @@ export function readConfig(env = process.env) {
     host: env.GATEWAY_HOST || '127.0.0.1',
     maxQueue: int(env.QUEUE_MAX, 64, 1, 10000),
     maxWaitMs: int(env.QUEUE_MAX_WAIT_MS, 600000, 1000, 86400000),
-    timeoutMs: int(env.MODEL_TIMEOUT_MS, 1800000, 10000, 86400000),
+    timeoutMs: int(env.MODEL_TIMEOUT_MS, 1800000, 1000, 86400000),
+    // Non-streaming requests must finish before Cloudflare's idle timeout. Includes queue time.
+    nonStreamTimeoutMs: int(env.NONSTREAM_TIMEOUT_MS, 90000, 1000, 100000),
     keepaliveAfterMs: int(env.KEEPALIVE_AFTER_MS, 25000, 1000, 90000),
     maxOutputTokens: int(env.MAX_OUTPUT_TOKENS, 32768, 256, 262144),
     frontierMonthlyCalls: int(env.FRONTIER_MONTHLY_CALLS, 300, 0, 10000000),

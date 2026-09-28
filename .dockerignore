@@ -4,6 +4,11 @@ node_modules
 .env.*
 data
 models
-agents
+agents/.venv
+agents/.env
+agents/data
+**/__pycache__
+*.db
+*.key
 tests
 *.log

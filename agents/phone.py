@@ -43,7 +43,10 @@ class Phone:
             raise SystemExit("No phone found. Plug it in, allow USB debugging on the phone, then run: adb devices")
         if len(devices) > 1 and not self.serial:
             raise SystemExit(f"Several devices connected ({', '.join(devices)}). Set PHONE_SERIAL in agents/.env.")
-        return self.serial or devices[0]
+        if self.serial and self.serial not in devices:
+            raise RuntimeError("Selected device is unavailable or has not authorized adb")
+        self.serial = self.serial or devices[0]
+        return self.serial
 
     def size(self) -> tuple[int, int]:
         if not self._size:

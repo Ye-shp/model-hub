@@ -47,7 +47,7 @@ const setStatus = (phase, detail = '') => writeFile(STATUS, JSON.stringify({phas
 // your frontier API keys or the tunnel token.
 const BASE = Object.fromEntries(Object.entries(env).filter(([k]) =>
   ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TZ', 'LD_LIBRARY_PATH'].includes(k) || k.startsWith('NVIDIA_') || k.startsWith('CUDA_')));
-const GATEWAY_ENV = Object.fromEntries(Object.entries(env).filter(([k]) => !['TUNNEL_TOKEN', 'WEBUI_SECRET_KEY', 'HF_TOKEN'].includes(k)));
+const GATEWAY_ENV = Object.fromEntries(Object.entries(env).filter(([k]) => !['TUNNEL_TOKEN', 'WEBUI_SECRET_KEY', 'HF_TOKEN', 'CONSOLE_KEY'].includes(k)));
 
 const children = new Set();
 let stopping = false;
@@ -65,7 +65,7 @@ function keepRunning(name, command, args, childEnv, cwd = '/opt/hub') {
       if (stopping) return;
       failures = Date.now() - startedAt > 300000 ? 1 : failures + 1;
       const delay = Math.min(300, 5 * 2 ** (failures - 1));
-      console.error(`[supervisor] ${name} exited (code ${code}); restart ${failures} in ${delay}s${failures >= 3 ? ' — repeated failures: check the log above (out of GPU memory? try MODEL_CONTEXT=65536)' : ''}`);
+      console.error(`[supervisor] ${name} exited (code ${code}); restart ${failures} in ${delay}s${failures >= 3 ? ' — repeated failures: check the log above (out of GPU memory? try MODEL_CONTEXT=65536, or check nvidia-smi for another process on that GPU)' : ''}`);
       setTimeout(start, delay * 1000);
     });
   };
@@ -73,27 +73,44 @@ function keepRunning(name, command, args, childEnv, cwd = '/opt/hub') {
 }
 
 function startModels(slots) {
-for (const slot of ['1', '2']) {
-  const n = Number(slot);
-  const args = [
-    '--model', slots[slot].model, '--alias', `qwen-${n}`, '--host', '127.0.0.1', '--port', String(8000 + n),
-    // All layers stay on the GPU. llama.cpp then sizes the context to the memory that is left
-    // (never below 32K) unless MODEL_CONTEXT is set.
-    '--n-gpu-layers', 'all', '--fit', 'on', '--fit-target', env.FIT_MARGIN_MIB || '1536', '--fit-ctx', '32768',
-    '--parallel', env.MODEL_PARALLEL || '3', '--kv-unified',
-    '--cache-type-k', 'q8_0', '--cache-type-v', 'q8_0', '--flash-attn', 'on',
-    '--jinja', '--reasoning-format', 'deepseek',
-    '--reasoning-effort', env[`MODEL${n}_REASONING_EFFORT`] || (n === 1 ? 'medium' : 'low'),
-    '--reasoning-budget', env[`MODEL${n}_REASONING_BUDGET`] || '-1',
-    '--metrics',
-  ];
-  if (slots[slot].mmproj) args.push('--mmproj', slots[slot].mmproj);
-  if (env.MODEL_CONTEXT) args.push('--ctx-size', env.MODEL_CONTEXT);
-  keepRunning(`qwen-${n}`, '/app/llama-server', args, {...BASE, CUDA_VISIBLE_DEVICES: String(n - 1), LLAMA_API_KEY: env.MODEL_API_KEY}, '/app');
-}
+  for (const slot of ['1', '2']) {
+    const n = Number(slot);
+    const args = [
+      '--model', slots[slot].model, '--alias', `qwen-${n}`, '--host', '127.0.0.1', '--port', String(8000 + n),
+      // All layers stay on the GPU; llama.cpp sizes the context to the memory left (never below
+      // 32K) unless MODEL_CONTEXT is set. Measured: 134K per slot on a 3090, 262K on a V100 32GB.
+      '--n-gpu-layers', 'all', '--fit', 'on', '--fit-target', env.FIT_MARGIN_MIB || '1536', '--fit-ctx', '32768',
+      '--parallel', env.MODEL_PARALLEL || '3', '--kv-unified',
+      '--cache-type-k', 'q8_0', '--cache-type-v', 'q8_0', '--flash-attn', 'on',
+      '--jinja', '--reasoning-format', 'deepseek',
+      '--reasoning-effort', env[`MODEL${n}_REASONING_EFFORT`] || (n === 1 ? 'medium' : 'low'),
+      '--reasoning-budget', env[`MODEL${n}_REASONING_BUDGET`] || '-1',
+      '--metrics',
+    ];
+    if (slots[slot].mmproj) args.push('--mmproj', slots[slot].mmproj);
+    if (env.MODEL_CONTEXT) args.push('--ctx-size', env.MODEL_CONTEXT);
+    keepRunning(`qwen-${n}`, '/app/llama-server', args, {...BASE, CUDA_VISIBLE_DEVICES: String(n - 1), LLAMA_API_KEY: env.MODEL_API_KEY}, '/app');
+  }
 }
 
 keepRunning('gateway', '/usr/local/bin/node', ['/opt/hub/gateway/index.js'], {...GATEWAY_ENV, DATA_DIR: DATA});
+
+// Optional always-on CPU controller. Uses the resident models through the gateway.
+if (env.ENABLE_AGENT_CONSOLE === 'true') {
+  const file = join(DATA, 'agent-controller.key');
+  let key = await readFile(file, 'utf8').then(s => s.trim(), () => '');
+  const frontier = Boolean(env.AGENT_FRONTIER_MODEL);
+  const current = clients.list().find(c => c.name === 'agent-controller');
+  if (!key || !clients.authenticate(`Bearer ${key}`) || current?.frontier !== frontier) {
+    key = clients.add('agent-controller', {frontier});
+    await writeFile(file, key, {mode: 0o600});
+  }
+  keepRunning('agent-console', '/opt/agents/bin/python', ['/opt/hub/agents/console.py'], {
+    ...BASE, PYTHONUNBUFFERED: '1', HUB_URL: 'http://127.0.0.1:8080/v1', HUB_KEY: key,
+    HUB_DATA_DIR: join(DATA, 'agent-workspace'), FRONTIER_MODEL: env.AGENT_FRONTIER_MODEL || '',
+    CONSOLE_URL: env.CONSOLE_URL || '', CONSOLE_KEY: env.CONSOLE_KEY || '',
+  });
+}
 
 keepRunning('open-webui', '/opt/openwebui/bin/open-webui', ['serve', '--host', '127.0.0.1', '--port', '3000'], {
   ...BASE,

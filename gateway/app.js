@@ -5,10 +5,11 @@ import Fastify from 'fastify';
 import {once} from 'node:events';
 import {timingSafeEqual} from 'node:crypto';
 import {hashKey} from './clients.js';
-import {readFileSync} from 'node:fs';
-import {join} from 'node:path';
 import {Pool, leastLoaded, QueueFullError, QueueTimeoutError} from './queue.js';
 import {cleanChatRequest, RequestError} from './sanitize.js';
+import {Metrics} from './metrics.js';
+import {readFileSync} from 'node:fs';
+import {join} from 'node:path';
 
 const IMAGE_SIZES = new Set(['256x256', '512x512', '768x768', '1024x1024', '1024x1536', '1536x1024']);
 
@@ -23,6 +24,7 @@ export function createApp({config, clients, ledger, fetcher = fetch, log = () =>
   });
   const pools = new Map(config.models.map(m => [m.id, new Pool(m.id, m.capacity, config)]));
   const residents = config.models.filter(m => m.resident);
+  const metrics = new Metrics();
 
   const errorBody = (message, type) => ({error: {message, type}});
   const fail = (reply, status, message, type = 'invalid_request_error') => reply.code(status).send(errorBody(message, type));
@@ -72,13 +74,14 @@ export function createApp({config, clients, ledger, fetcher = fetch, log = () =>
     client: req.client.name,
     models: available(req.client).map(m => pools.get(m.id).status()),
     frontier: {callsThisMonth: ledger.used(), monthlyLimit: config.frontierMonthlyCalls},
+    metrics: {scope: 'this key; last 500 gateway requests; resets on restart', models: metrics.summary(req.client.name)},
   }));
 
   // Key management for the owner (ADMIN_KEY). Keys are returned once, on creation.
   app.get('/admin/keys', async () => ({keys: clients.list().map(({name, frontier, createdAt}) => ({name, frontier, createdAt}))}));
   app.post('/admin/keys', async (req, reply) => {
     const {name, frontier = false} = req.body || {};
-    if (name === 'open-webui') return fail(reply, 400, 'That name is reserved for the website’s own key.');
+    if (['open-webui', 'agent-controller'].includes(name)) return fail(reply, 400, 'That name is reserved for a built-in service key.');
     try { return {name, frontier: Boolean(frontier), key: clients.add(String(name ?? ''), {frontier: frontier === true})}; }
     catch (error) { return fail(reply, 400, error.message); }
   });
@@ -109,73 +112,90 @@ export function createApp({config, clients, ledger, fetcher = fetch, log = () =>
     const clientGone = new AbortController();
     res$.on('close', () => { if (!res$.writableFinished) clientGone.abort(new Error('Client disconnected')); });
 
-    let release;
-    try { release = await pools.get(model.id).acquire(clientGone.signal); }
-    catch (error) {
-      if (error instanceof QueueFullError || error instanceof QueueTimeoutError) return fail(reply, 503, `${model.id} is overloaded right now. Retry shortly.`, 'overloaded_error');
-      return reply.hijack();
-    }
-    if (model.frontier) {
-      try { await ledger.reserve(); }
-      catch { release(); return fail(reply, 429, 'The monthly frontier call allowance is used up.', 'rate_limit_error'); }
-    }
-
     reply.hijack();
-    let committed = false, status = 0, keepaliveTimer, keepaliveInterval;
-    const finish = () => { clearTimeout(keepaliveTimer); clearInterval(keepaliveInterval); release(); log({client: req.client.name, model: model.id, status, ms: Date.now() - started}); };
+    let committed = false, status = 0, release, usage, heartbeat;
+    const deadline = AbortSignal.timeout(stream ? config.timeoutMs : config.nonStreamTimeoutMs);
+    const signal = AbortSignal.any([clientGone.signal, deadline]);
+    const finish = () => {
+      clearInterval(heartbeat); release?.();
+      const entry = {client: req.client.name, model: model.id, status, ms: Date.now() - started, usage};
+      metrics.record(entry); log(entry);
+    };
     const head = (code, contentType) => {
       if (committed) return;
       committed = true; status = code;
       res$.writeHead(code, {'content-type': contentType, 'cache-control': 'no-store', 'x-accel-buffering': 'no'});
     };
-    const sendJson = (code, obj) => {
+    const sendError = (code, obj) => {
       if (res$.destroyed) return;
+      if (committed && stream) {
+        status = code;
+        res$.end(`data: ${JSON.stringify(obj)}\n\ndata: [DONE]\n\n`);
+        return;
+      }
       head(code, 'application/json');
       res$.end(JSON.stringify(obj));
     };
-
-    // Cloudflare closes proxied requests that send nothing for 100 seconds. For long
-    // non-streamed answers, send the headers early and keep the connection alive with
-    // whitespace, which JSON parsers ignore.
-    if (!stream) keepaliveTimer = setTimeout(() => {
-      head(200, 'application/json');
-      res$.write(' ');
-      keepaliveInterval = setInterval(() => res$.write(' '), 15000);
-    }, config.keepaliveAfterMs);
-
+    // SSE comments are legal keep-alives, including while waiting for a GPU slot.
+    // Non-streaming responses keep their real HTTP status and must finish inside Cloudflare's
+    // 100 s idle limit (NONSTREAM_TIMEOUT_MS). Long answers should stream.
+    if (stream) {
+      head(200, 'text/event-stream');
+      res$.write(': connected\n\n');
+      heartbeat = setInterval(() => { if (!res$.destroyed) res$.write(': keep-alive\n\n'); }, Math.min(config.keepaliveAfterMs, 15000));
+    }
     const headers = {'content-type': 'application/json'};
     if (model.key) headers.authorization = `Bearer ${model.key}`;
-    const deadline = AbortSignal.timeout(config.timeoutMs);
     try {
+      release = await pools.get(model.id).acquire(signal);
+      if (model.frontier) {
+        try { await ledger.reserve(); }
+        catch { return sendError(429, errorBody('The monthly frontier call allowance is used up.', 'rate_limit_error')); }
+      }
       const upstream = await fetcher(model.url + path, {
         method: 'POST', headers, body: JSON.stringify(body), redirect: 'error',
-        signal: AbortSignal.any([clientGone.signal, deadline]),
+        signal,
       });
       if (!upstream.ok) {
         const text = (await upstream.text()).slice(0, 4000);
         let message;
         try { const parsed = JSON.parse(text); message = parsed.error?.message || parsed.error || parsed.message; } catch {}
-        clearTimeout(keepaliveTimer);
-        return sendJson(upstream.status >= 500 ? 502 : upstream.status, errorBody(`${model.id}: ${typeof message === 'string' ? message : `HTTP ${upstream.status}`}`, 'upstream_error'));
+        return sendError(upstream.status >= 500 ? 502 : upstream.status, errorBody(`${model.id}: ${typeof message === 'string' ? message : `HTTP ${upstream.status}`}`, 'upstream_error'));
       }
-      clearTimeout(keepaliveTimer);
       if (stream) {
         head(200, upstream.headers.get('content-type') || 'text/event-stream');
+        const decoder = new TextDecoder();
+        let pending = '';
         for await (const chunk of upstream.body) {
           if (res$.destroyed) break;
-          if (!res$.write(chunk)) await once(res$, 'drain');
+          pending += decoder.decode(chunk, {stream: true});
+          // Only emit whole SSE events: a heartbeat between partial JSON chunks corrupts the stream.
+          let boundary;
+          while ((boundary = /\r?\n\r?\n/.exec(pending))) {
+            const event = pending.slice(0, boundary.index);
+            pending = pending.slice(boundary.index + boundary[0].length);
+            for (const line of event.split(/\r?\n/)) {
+              if (line.startsWith('data:')) try { const item = JSON.parse(line.slice(5)); if (item.usage) usage = item.usage; } catch {}
+            }
+            if (!res$.write(event + '\n\n')) await once(res$, 'drain', {signal});
+          }
+          if (pending.length > config.bodyLimit) throw new Error('Upstream event is too large');
         }
+        pending += decoder.decode();
+        if (pending.trim() && !res$.destroyed) res$.write(pending + '\n\n');
         res$.end();
       } else {
         const text = await upstream.text();
+        try { usage = JSON.parse(text).usage; } catch {}
         head(200, 'application/json');
         res$.end(text);
       }
     } catch (error) {
-      if (clientGone.signal.aborted) { res$.destroy(); return; }
-      if (deadline.aborted) return sendJson(504, errorBody(`${model.id} did not finish within the time limit.`, 'timeout_error'));
-      if (committed && stream) { res$.end(); return; }
-      sendJson(502, errorBody(`${model.id} is unreachable. It may still be loading.`, 'upstream_error'));
+      if (clientGone.signal.aborted) { status = 499; res$.destroy(); return; }
+      if (deadline.aborted) return sendError(504, errorBody(`${model.id} exceeded the total request deadline, including its queue wait.`, 'timeout_error'));
+      if (error instanceof QueueFullError || error instanceof QueueTimeoutError)
+        return sendError(503, errorBody(`${model.id} is busy. Retry shortly.`, 'overloaded_error'));
+      sendError(502, errorBody(`${model.id} is unreachable. It may still be loading.`, 'upstream_error'));
     } finally {
       finish();
     }

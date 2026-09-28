@@ -1,0 +1,6 @@
+{
+  "devices": [
+    {"serial": "YOUR_ADB_DEVICE_1", "platform": "tiktok", "project": "default", "posts": 20, "frames": 3, "seconds": 600},
+    {"serial": "YOUR_ADB_DEVICE_2", "platform": "instagram", "project": "default", "posts": 20, "frames": 3, "seconds": 600}
+  ]
+}
