@@ -52,6 +52,8 @@ export function readConfig(env = process.env) {
     timeoutMs: int(env.MODEL_TIMEOUT_MS, 1800000, 1000, 86400000),
     // Non-streaming requests must finish before Cloudflare's idle timeout. Includes queue time.
     nonStreamTimeoutMs: int(env.NONSTREAM_TIMEOUT_MS, 90000, 1000, 100000),
+    // Image generation, including its queue wait. Kept alive with whitespace (see app.js).
+    imageTimeoutMs: int(env.IMAGE_TIMEOUT_MS, 900000, 10000, 3600000),
     keepaliveAfterMs: int(env.KEEPALIVE_AFTER_MS, 25000, 1000, 90000),
     maxOutputTokens: int(env.MAX_OUTPUT_TOKENS, 32768, 256, 262144),
     frontierMonthlyCalls: int(env.FRONTIER_MONTHLY_CALLS, 300, 0, 10000000),

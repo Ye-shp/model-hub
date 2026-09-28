@@ -23,7 +23,7 @@ Nothing in this package has been deployed to your rental or pushed to GitHub. Th
 | Plans and attention | See saved steps, overdue worker heartbeats, interrupted jobs and results awaiting review |
 | Handoff exports | Carry the brief, decisions, source IDs, output references and next steps into another session |
 | Optional frontier advice | Up to two advisor calls per job when explicitly enabled, including resumed attempts |
-| Optional media | Image adapter for FLUX.2 Klein 4B; CPU transcription importer for supplied clips |
+| Image generation | Qwen-Image-2.1 with an abliterated text encoder on its own GPU box (non-commercial license); CPU transcription importer for supplied clips |
 | Phone preparation | Selected-device collection, multiple frames, evidence storage and bounded batches of up to ten connected devices |
 | Gateway improvements | Bounded queues, coherent streaming heartbeats, real error statuses, cancellation and private usage metrics |
 

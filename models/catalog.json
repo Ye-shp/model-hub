@@ -1,17 +1,42 @@
 {
   "checked_at": "2026-09-28",
   "recommended_third_slot": {
-    "id": "black-forest-labs/FLUX.2-klein-4B",
-    "revision": "e7b7dc27f91deacad38e78976d1f2b499d76a294",
+    "id": "Qwen/Qwen-Image-2.1",
+    "revision": "790c92633540aa0cb11d9abf19eb46d861714758",
     "kind": "image",
-    "license": "apache-2.0",
-    "source": "https://huggingface.co/black-forest-labs/FLUX.2-klein-4B",
-    "use": "Original covers, thumbnails, illustrations and visual concepts",
-    "memory": "Publisher reports approximately 13 GB VRAM with its recommended setup. Actual usage depends on resolution, runtime and offloading.",
-    "placement": "Separate optional image service. Do not auto-load beside either resident 27B model.",
-    "abliterated": false
+    "text_encoder": {
+      "id": "pottokao/Qwen-Image-2.1-Text-Encoder-Heretic",
+      "revision": "047e54342fc4bfcd2addd54049db9c90bb74731e",
+      "license": "apache-2.0",
+      "abliterated": true
+    },
+    "license": "qwen-research (non-commercial)",
+    "source": "https://huggingface.co/Qwen/Qwen-Image-2.1",
+    "use": "Covers, thumbnails, illustrations, text-in-image and transparent assets up to 2K",
+    "memory": "bf16: 14.2 GB transformer + 17.5 GB text encoder + 1.35 GB VAE. On 24 GB cards stages are offloaded to system RAM (~40 GB needed).",
+    "placement": "Own Ampere+ GPU box with its own tunnel (deploy/image/Dockerfile). Not on the V100 chat box.",
+    "abliterated": "text encoder only"
   },
   "alternatives": [
+    {
+      "id": "Qwen/Qwen-Image-2512",
+      "kind": "image",
+      "license": "apache-2.0",
+      "source": "https://huggingface.co/Qwen/Qwen-Image-2512",
+      "use": "Commercially licensed Qwen image model (December 2025) if Qwen-Image-2.1's research license is a problem"
+    },
+    {
+      "id": "black-forest-labs/FLUX.2-klein-4B",
+      "revision": "e7b7dc27f91deacad38e78976d1f2b499d76a294",
+      "kind": "image",
+      "license": "apache-2.0",
+      "source": "https://huggingface.co/black-forest-labs/FLUX.2-klein-4B",
+      "use": "Original covers, thumbnails, illustrations and visual concepts",
+      "memory": "Publisher reports approximately 13 GB VRAM with its recommended setup. Actual usage depends on resolution, runtime and offloading.",
+      "placement": "Separate optional image service. Do not auto-load beside either resident 27B model.",
+      "abliterated": false,
+      "note": "Previous choice (Apache-2.0, not abliterated). Adapter replaced by Qwen-Image-2.1."
+    },
     {
       "id": "Systran/faster-whisper-small",
       "revision": "536b0662742c02347bc0e980a01041f333bce120",

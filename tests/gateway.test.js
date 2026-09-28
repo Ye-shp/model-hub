@@ -36,8 +36,9 @@ async function setup(t, env = {}) {
     MODEL1_URL: `${up.url}/r1/v1`, MODEL2_URL: `${up.url}/r2/v1`,
     OPENAI_API_KEY: 'sk-test', OPENAI_MODELS: 'gpt-test', ...env,
   });
-  // Point the frontier entry at the fake server too.
+  // Point the frontier and image entries at the fake server too.
   for (const m of config.models) if (m.frontier) m.url = `${up.url}/openai/v1`;
+  for (const m of config.models) if (m.kind === 'image') m.url = `${up.url}/img/v1`;
   const clients = new ClientStore(dir);
   const friend = clients.add('friend');
   const owner = clients.add('owner', {frontier: true});
@@ -302,4 +303,29 @@ test('usage metrics are scoped to the current API key and exclude prompt text', 
   assert.equal(ownerStatus.metrics.models[0].completionTokens,5);
   assert.ok(!JSON.stringify(ownerStatus).includes('PRIVATE-PROMPT'));
   assert.deepEqual((await (await call(friend,'/v1/status')).json()).metrics.models,[]);
+});
+
+test('image requests reach the image slot with validated options only', async t => {
+  const {call, friend, up} = await setup(t, {MODEL3_URL: 'PLACEHOLDER', MODEL3_ID: 'qwen-image-2.1', MODEL3_KIND: 'image', MODEL3_API_KEY: 'img-key'});
+  up.state.handler = (_entry, res) => { res.writeHead(200, {'content-type': 'application/json'}); res.end('{"created":1,"data":[{"b64_json":"aGk="}]}'); };
+  const ok = await call(friend, '/v1/images/generations', {model: 'flex', prompt: 'reel cover', size: '1152x2048', steps: 20, seed: 7, negative_prompt: 'blurry', user: 'x', url: 'file:///etc/passwd'});
+  assert.equal(ok.status, 200);
+  assert.equal(JSON.parse(await ok.text()).data[0].b64_json, 'aGk=');
+  const sent = up.state.requests.at(-1);
+  assert.equal(sent.url, '/img/v1/images/generations');
+  assert.equal(sent.headers.authorization, 'Bearer img-key');
+  assert.deepEqual(sent.body, {model: 'qwen-image-2.1', prompt: 'reel cover', size: '1152x2048', n: 1, response_format: 'b64_json', negative_prompt: 'blurry', steps: 20, seed: 7});
+  assert.equal((await call(friend, '/v1/images/generations', {model: 'flex', prompt: 'x', size: '999x999'})).status, 400);
+  assert.equal((await call(friend, '/v1/images/generations', {model: 'flex', prompt: 'x', steps: 500})).status, 400);
+  assert.equal((await call(friend, '/v1/chat/completions', chat('flex'))).status, 400);
+});
+
+test('slow images keep the connection alive with whitespace and still parse as JSON', async t => {
+  const {call, friend, up} = await setup(t, {MODEL3_URL: 'PLACEHOLDER', MODEL3_ID: 'qwen-image-2.1', MODEL3_KIND: 'image', KEEPALIVE_AFTER_MS: '1000', NONSTREAM_TIMEOUT_MS: '1000'});
+  up.state.handler = (_entry, res) => setTimeout(() => { res.writeHead(200, {'content-type': 'application/json'}); res.end('{"data":[{"b64_json":"aGk="}]}'); }, 2500);
+  const res = await call(friend, '/v1/images/generations', {model: 'flex', prompt: 'slow'});
+  assert.equal(res.status, 200);
+  const text = await res.text();
+  assert.match(text, /^ +\{/);  // keep-alive spaces arrived before the body, beyond the 1 s chat limit
+  assert.equal(JSON.parse(text).data[0].b64_json, 'aGk=');
 });

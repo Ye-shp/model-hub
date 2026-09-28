@@ -173,7 +173,9 @@ def build_team(job: dict, client, gate: asyncio.Semaphore) -> Agent:
 
     @function_tool
     async def generate_image(prompt: str, size: str = "1024x1024") -> str:
-        """Generate and save an image through the configured flex slot. At most two per task."""
+        """Generate and save an image through the configured flex slot (Qwen-Image-2.1). At most two per task.
+        size: 1024x1024, 1024x1536, 1536x1024, 1152x2048 (9:16 for TikTok/Reels), 2048x1152 (16:9), or 2K finals
+        2048x2048, 1536x2752 (9:16), 2752x1536 (16:9). Quote any on-image text exactly in the prompt."""
         budget.active()
         if not job["allow_images"] or budget.images >= 2:
             raise ValueError("Image generation is disabled or its two-image allowance is exhausted")

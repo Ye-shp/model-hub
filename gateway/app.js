@@ -11,7 +11,9 @@ import {Metrics} from './metrics.js';
 import {readFileSync} from 'node:fs';
 import {join} from 'node:path';
 
-const IMAGE_SIZES = new Set(['256x256', '512x512', '768x768', '1024x1024', '1024x1536', '1536x1024']);
+// Sizes the Qwen-Image-2.1 service accepts (services/image_server.py): fast 1K sizes, then native 2K.
+const IMAGE_SIZES = new Set(['1024x1024', '1024x1536', '1536x1024', '1152x2048', '2048x1152',
+  '2048x2048', '1536x2752', '2752x1536', '1696x2528', '2528x1696']);
 
 export function createApp({config, clients, ledger, fetcher = fetch, log = () => {}}) {
   const app = Fastify({logger: false, bodyLimit: config.bodyLimit});
@@ -66,7 +68,10 @@ export function createApp({config, clients, ledger, fetcher = fetch, log = () =>
     object: 'list',
     data: [
       ...(residents.length ? [{id: 'qwen', object: 'model', owned_by: 'model-hub', description: 'Whichever resident Qwen is least busy'}] : []),
-      ...available(req.client).map(m => ({id: m.id, object: 'model', owned_by: m.frontier ? m.id.split('/')[0] : 'model-hub', kind: m.kind})),
+      // The website reaches the image model through its image-generation setting, not as a chat
+      // model, so it is left out of the website's chat list.
+      ...available(req.client).filter(m => !(req.client.name === 'open-webui' && m.kind === 'image'))
+        .map(m => ({id: m.id, object: 'model', owned_by: m.frontier ? m.id.split('/')[0] : 'model-hub', kind: m.kind})),
     ],
   }));
 
@@ -100,13 +105,20 @@ export function createApp({config, clients, ledger, fetcher = fetch, log = () =>
   app.post('/v1/images/generations', async (req, reply) => {
     const model = resolve(req.client, req.body?.model);
     if (!model || model.kind !== 'image') return fail(reply, 404, 'No image model is connected to the third slot.', 'not_found_error');
-    const {prompt, size = '1024x1024'} = req.body;
+    const {prompt, size = '1024x1024', negative_prompt: negative, steps, seed} = req.body;
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 8000) return fail(reply, 400, 'prompt must be 1-8000 characters.');
     if (!IMAGE_SIZES.has(size)) return fail(reply, 400, `size must be one of ${[...IMAGE_SIZES].join(', ')}.`);
-    return forward(req, reply, model, '/images/generations', {model: model.upstreamModel, prompt, size, n: 1, response_format: 'b64_json'}, false);
+    if (negative !== undefined && (typeof negative !== 'string' || negative.length > 4000)) return fail(reply, 400, 'negative_prompt must be a string up to 4000 characters.');
+    if (steps !== undefined && !(Number.isInteger(steps) && steps >= 8 && steps <= 60)) return fail(reply, 400, 'steps must be an integer from 8 to 60.');
+    if (seed !== undefined && !(Number.isInteger(seed) && seed >= 0 && seed <= 4294967295)) return fail(reply, 400, 'seed must be an integer from 0 to 4294967295.');
+    const body = {model: model.upstreamModel, prompt, size, n: 1, response_format: 'b64_json'};
+    if (negative) body.negative_prompt = negative;
+    if (steps !== undefined) body.steps = steps;
+    if (seed !== undefined) body.seed = seed;
+    return forward(req, reply, model, '/images/generations', body, false, {longRunning: true});
   });
 
-  async function forward(req, reply, model, path, body, stream) {
+  async function forward(req, reply, model, path, body, stream, {longRunning = false} = {}) {
     const started = Date.now();
     const res$ = reply.raw;
     const clientGone = new AbortController();
@@ -114,7 +126,7 @@ export function createApp({config, clients, ledger, fetcher = fetch, log = () =>
 
     reply.hijack();
     let committed = false, status = 0, release, usage, heartbeat;
-    const deadline = AbortSignal.timeout(stream ? config.timeoutMs : config.nonStreamTimeoutMs);
+    const deadline = AbortSignal.timeout(stream ? config.timeoutMs : longRunning ? config.imageTimeoutMs : config.nonStreamTimeoutMs);
     const signal = AbortSignal.any([clientGone.signal, deadline]);
     const finish = () => {
       clearInterval(heartbeat); release?.();
@@ -133,12 +145,22 @@ export function createApp({config, clients, ledger, fetcher = fetch, log = () =>
         res$.end(`data: ${JSON.stringify(obj)}\n\ndata: [DONE]\n\n`);
         return;
       }
+      if (!stream) clearInterval(heartbeat);
+      if (committed) status = code;  // headers already went out as 200 (long-running keep-alive)
       head(code, 'application/json');
       res$.end(JSON.stringify(obj));
     };
     // SSE comments are legal keep-alives, including while waiting for a GPU slot.
     // Non-streaming responses keep their real HTTP status and must finish inside Cloudflare's
     // 100 s idle limit (NONSTREAM_TIMEOUT_MS). Long answers should stream.
+    // Images (especially 2K) can take minutes: commit the headers early and send whitespace, which
+    // JSON parsers ignore, so Cloudflare's 100 s idle limit never cuts the response. A late failure
+    // then arrives as a JSON error body with status 200.
+    if (longRunning) heartbeat = setInterval(() => {
+      if (res$.destroyed) return;
+      head(200, 'application/json');
+      res$.write(' ');
+    }, Math.min(config.keepaliveAfterMs, 15000));
     if (stream) {
       head(200, 'text/event-stream');
       res$.write(': connected\n\n');
@@ -186,6 +208,7 @@ export function createApp({config, clients, ledger, fetcher = fetch, log = () =>
         res$.end();
       } else {
         const text = await upstream.text();
+        clearInterval(heartbeat);
         try { usage = JSON.parse(text).usage; } catch {}
         head(200, 'application/json');
         res$.end(text);

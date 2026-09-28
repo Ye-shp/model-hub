@@ -233,12 +233,25 @@ class WorkspaceTests(unittest.TestCase):
         spec=importlib.util.spec_from_file_location('image_server',ROOT/'services'/'image_server.py')
         module=importlib.util.module_from_spec(spec);sys.modules[spec.name]=module;spec.loader.exec_module(module)
         from PIL import Image
-        app=module.create_app(lambda prompt,w,h:Image.new('RGB',(8,8),'green'),"k"*40)
+        calls=[]
+        def render(prompt,w,h,**options):
+            calls.append((prompt,w,h,options)); return Image.new('RGB',(8,8),'green')
+        app=module.create_app(render,"k"*40)
+        auth={"Authorization":"Bearer "+"k"*40}
         with TestClient(app) as client:
             self.assertEqual(client.post('/v1/images/generations',json={"prompt":"test"}).status_code,401)
-            response=client.post('/v1/images/generations',headers={"Authorization":"Bearer "+"k"*40},json={"prompt":"test"})
+            response=client.post('/v1/images/generations',headers=auth,json={"prompt":"test"})
             self.assertEqual(response.status_code,200)
             self.assertTrue(response.json()['data'][0]['b64_json'])
+            tall=client.post('/v1/images/generations',headers=auth,json={"prompt":"reel cover","size":"1152x2048","steps":20,"seed":7})
+            self.assertEqual(tall.status_code,200)
+            self.assertEqual(calls[-1][1:3],(1152,2048)); self.assertEqual(calls[-1][3]["steps"],20); self.assertEqual(calls[-1][3]["seed"],7)
+            self.assertEqual(client.post('/v1/images/generations',headers=auth,json={"prompt":"x","size":"999x999"}).status_code,400)
+            self.assertEqual(client.post('/v1/images/generations',headers=auth,json={"prompt":"x","steps":500}).status_code,422)
+        loading=module.create_app(None,"k"*40)
+        with TestClient(loading) as client:
+            self.assertEqual(client.get('/health').json()["phase"],"starting")
+            self.assertEqual(client.post('/v1/images/generations',headers=auth,json={"prompt":"x"}).status_code,503)
 
 
 if __name__ == "__main__":

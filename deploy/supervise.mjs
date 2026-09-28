@@ -127,6 +127,12 @@ keepRunning('open-webui', '/opt/openwebui/bin/open-webui', ['serve', '--host', '
   OPENAI_API_BASE_URLS: 'http://127.0.0.1:8080/v1',
   OPENAI_API_KEYS: webuiKey,
   ANONYMIZED_TELEMETRY: 'false', DO_NOT_TRACK: 'true', SCARF_NO_ANALYTICS: 'true',
+  // With an image model in the third slot, the website's "Image" button uses it through the gateway.
+  ...(env.MODEL3_KIND === 'image' && env.MODEL3_URL ? {
+    ENABLE_IMAGE_GENERATION: 'true', IMAGE_GENERATION_ENGINE: 'openai', ENABLE_IMAGE_PROMPT_GENERATION: 'true',
+    IMAGES_OPENAI_API_BASE_URL: 'http://127.0.0.1:8080/v1', IMAGES_OPENAI_API_KEY: webuiKey,
+    IMAGE_GENERATION_MODEL: 'flex', IMAGE_SIZE: env.WEBUI_IMAGE_SIZE || '1024x1024',
+  } : {}),
 });
 
 keepRunning('cloudflared', '/usr/bin/cloudflared', ['tunnel', '--no-autoupdate', 'run'], {...BASE, TUNNEL_TOKEN: env.TUNNEL_TOKEN});
