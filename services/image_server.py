@@ -157,8 +157,9 @@ def create_app(renderer, key: str, status: Status | None = None) -> FastAPI:
             raise HTTPException(400, f"Use model {MODEL_ID}, n=1, b64_json and a size from: {', '.join(sorted(SIZES))}")
         if app.state.renderer is None:
             raise HTTPException(503, f"Image model is not ready yet ({status.phase}{': ' + status.detail if status.detail else ''})")
-        # One image at a time; the gateway queues the rest.
-        if not lock.acquire(blocking=False):
+        # One image at a time. Wait for the GPU rather than refusing: a render whose caller went away
+        # (e.g. a dropped connection) still finishes, and the next request should queue behind it.
+        if not lock.acquire(timeout=600):
             raise HTTPException(503, "Image worker is busy")
         width, height = map(int, body.size.split("x"))
         result: dict = {}
