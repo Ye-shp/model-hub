@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 MODEL_ID = "qwen-image-2.1"
@@ -92,14 +92,37 @@ class QwenImageRenderer:
             # 24 GB cards cannot hold the 17.5 GB encoder and the 14 GB transformer at once; each stage
             # moves to the GPU only while it runs.
             self.pipeline.enable_model_cpu_offload()
+        self.offload = total < 40 * 1024**3
         # Decode large (2K) images in tiles: a full-frame 2K decode needs ~5 GB more than a 24 GB card has left.
         self.pipeline.vae.enable_tiling()
+
+    def recover(self):
+        """After a failure (e.g. out of memory) the offload hooks can leave parts on the wrong device,
+        which breaks every later image. Put everything back where it belongs."""
+        torch = self.torch
+        if self.offload:
+            self.pipeline.remove_all_hooks()
+            for component in self.pipeline.components.values():
+                if isinstance(component, torch.nn.Module):
+                    component.to("cpu")
+            torch.cuda.empty_cache()
+            self.pipeline.enable_model_cpu_offload()
+        else:
+            torch.cuda.empty_cache()
 
     def __call__(self, prompt, width, height, steps=DEFAULT_STEPS, seed=None, negative_prompt=None):
         generator = self.torch.Generator("cpu").manual_seed(seed) if seed is not None else None
         extra = {"negative_prompt": negative_prompt, "true_cfg_scale": 4.0} if negative_prompt else {}
-        return self.pipeline(prompt=prompt, width=width, height=height, num_inference_steps=steps,
-                             generator=generator, **extra).images[0]
+        try:
+            return self.pipeline(prompt=prompt, width=width, height=height, num_inference_steps=steps,
+                                 generator=generator, **extra).images[0]
+        except Exception:
+            try:
+                self.recover()
+            except Exception as error:  # cannot trust the GPU state any more: restart (start.sh relaunches)
+                print(f"[image] recovery failed ({type(error).__name__}: {error}); restarting", flush=True)
+                os._exit(1)
+            raise
 
 
 def create_app(renderer, key: str, status: Status | None = None) -> FastAPI:
@@ -158,6 +181,11 @@ def create_app(renderer, key: str, status: Status | None = None) -> FastAPI:
                 finished.set()
 
         threading.Thread(target=render, daemon=True).start()
+        # Quick results (and quick failures) get a normal response with a real status code; only
+        # renders that take longer switch to the keep-alive stream below.
+        if finished.wait(20):
+            code = 200 if "data" in result["body"] else 500
+            return JSONResponse(result["body"], status_code=code)
 
         def respond():
             # Large images take minutes. Whitespace before the JSON keeps proxies (Cloudflare drops

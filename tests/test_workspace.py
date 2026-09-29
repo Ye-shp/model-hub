@@ -248,6 +248,11 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual(calls[-1][1:3],(1152,2048)); self.assertEqual(calls[-1][3]["steps"],20); self.assertEqual(calls[-1][3]["seed"],7)
             self.assertEqual(client.post('/v1/images/generations',headers=auth,json={"prompt":"x","size":"999x999"}).status_code,400)
             self.assertEqual(client.post('/v1/images/generations',headers=auth,json={"prompt":"x","steps":500}).status_code,422)
+        def broken(*_args,**_options): raise RuntimeError("out of memory")
+        with TestClient(module.create_app(broken,"k"*40)) as client:
+            failed=client.post('/v1/images/generations',headers=auth,json={"prompt":"x"})
+            self.assertEqual(failed.status_code,500)  # fast failures keep a real status, not a 200 with an error body
+            self.assertEqual(client.post('/v1/images/generations',headers=auth,json={"prompt":"x"}).status_code,500)  # lock was released
         loading=module.create_app(None,"k"*40)
         with TestClient(loading) as client:
             self.assertEqual(client.get('/health').json()["phase"],"starting")
