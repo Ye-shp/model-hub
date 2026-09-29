@@ -147,7 +147,8 @@ def build(job: dict, client, gate: asyncio.Semaphore, space: sandbox.Workspace) 
         Use it to run code, install packages, convert files, download things with curl, etc. Long-running
         commands: raise timeout_seconds (max 1800)."""
         budget.active()
-        log("tool", f"Running: {describe(command)}")
+        folder = str(space.dir)
+        log("tool", "Running: " + describe(command.replace("cd " + folder + " && ", "").replace(folder + "/", "")))
         result = await space.run(command, timeout=max(5, min(timeout_seconds, 1800)))
         head = "Timed out and was stopped" if result["timed_out"] else f"Exit code {result['exit_code']}"
         return head + "\n" + sandbox.trim(result["output"] or "(no output)")
