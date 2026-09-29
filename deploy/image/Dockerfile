@@ -3,8 +3,9 @@
 # Built by GitHub Actions alongside the main image; weights download on first boot (~33 GB).
 FROM python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e
 
+# gcc: Triton builds a small C launcher the first time a GPU kernel runs.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git \
+ && apt-get install -y --no-install-recommends ca-certificates curl git gcc libc6-dev \
  && rm -rf /var/lib/apt/lists/*
 
 # cloudflared 2026.9.3, checksum-verified (same release as the main box).

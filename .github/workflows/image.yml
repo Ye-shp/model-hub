@@ -2,6 +2,8 @@ name: Build GPU image
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
 
 permissions:
   contents: read
