@@ -209,6 +209,15 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         escalate.save_claude_token(body.token)
         return escalate.status()["claude"]
 
+    class CodeIn(BaseModel):
+        ref: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+    @app.post("/api/admin/code")
+    async def stage_code(body: CodeIn):
+        """Stage a GitHub commit of the hub's app code; the next instance restart runs it (see supervise.mjs)."""
+        import code_update
+        return await code_update.stage(body.ref)
+
     @app.post("/api/connections/codex")
     async def connect_codex():
         import escalate

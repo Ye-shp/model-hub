@@ -281,3 +281,23 @@ class OutOfTurnsTests(Base):
             with patch.object(hub, "async_client", return_value=client), patch.object(escalate, "available", return_value="off"):
                 return await cowork.run_job(job)
         self.assertEqual(asyncio.run(scenario()), "Lead got: Partial report: found A and B.")
+
+
+class CodeUpdateTests(unittest.TestCase):
+    def test_archive_extraction_keeps_only_app_folders_and_refuses_escapes(self):
+        import io, tarfile, code_update
+        def archive(entries):
+            data = io.BytesIO()
+            with tarfile.open(fileobj=data, mode="w:gz") as tar:
+                for name, content in entries:
+                    info = tarfile.TarInfo(name); info.size = len(content)
+                    tar.addfile(info, io.BytesIO(content))
+            return data.getvalue()
+        with tempfile.TemporaryDirectory() as folder:
+            count = code_update.extract(archive([("repo-abc/agents/console.py", b"x"), ("repo-abc/gateway/app.js", b"y"),
+                                                 ("repo-abc/README.md", b"z")]), Path(folder))
+            self.assertEqual(count, 1)
+            self.assertTrue((Path(folder) / "agents" / "console.py").is_file())
+            self.assertFalse((Path(folder) / "gateway").exists())
+            with self.assertRaises(ValueError):
+                code_update.extract(archive([("repo-abc/agents/../../../etc/x", b"bad")]), Path(folder))

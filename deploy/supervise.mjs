@@ -5,7 +5,7 @@
 //   agent-console: jobs, Qwen Cowork and its sandboxed workspaces (port 8787)
 //   cloudflared: the outbound tunnel; nothing listens on a public port
 import {spawn, execFileSync} from 'node:child_process';
-import {readFile, writeFile, mkdir, chmod} from 'node:fs/promises';
+import {readFile, writeFile, mkdir, chmod, access} from 'node:fs/promises';
 import {randomBytes} from 'node:crypto';
 import {join} from 'node:path';
 import {prepareModels} from './download.mjs';
@@ -18,6 +18,23 @@ const MODELS = env.MODEL_DIR || '/workspace/models';
 for (const name of ['MODEL_API_KEY', 'TUNNEL_TOKEN', 'ADMIN_KEY']) {
   if (!env[name] || env[name].length < 32) throw new Error(`${name} must be set to a random value of at least 32 characters.`);
 }
+// App code can be updated without rebuilding the image (which would wipe chats and re-download models):
+// the controller stages a GitHub commit into DATA/hub-code/<sha> and marks it active, then a plain restart
+// of the instance picks it up here. Covers agents/, integrations/, skills/, console/ and deploy/webui_*.
+// New Python packages or gateway changes still need a new image. HUB_CODE_OVERLAY=off ignores the overlay.
+const CODE_ROOT = join(DATA, 'hub-code');
+async function appDir() {
+  if (env.HUB_CODE_OVERLAY === 'off') return '/opt/hub';
+  try {
+    const sha = (await readFile(join(CODE_ROOT, 'active'), 'utf8')).trim();
+    if (!/^[0-9a-f]{40}$/.test(sha)) return '/opt/hub';
+    await access(join(CODE_ROOT, sha, 'agents', 'console.py'));
+    return join(CODE_ROOT, sha);
+  } catch { return '/opt/hub'; }
+}
+const APP = await appDir();
+console.log(`[supervisor] app code: ${APP}`);
+
 const gpus = execFileSync('nvidia-smi', ['--query-gpu=index,name,memory.total', '--format=csv,noheader'], {encoding: 'utf8'}).trim().split('\n');
 console.log(`GPUs:\n  ${gpus.join('\n  ')}`);
 if (gpus.length < 2) throw new Error('Two GPUs are required: one per resident model.');
@@ -109,12 +126,12 @@ if (env.ENABLE_AGENT_CONSOLE === 'true') {
     key = clients.add('agent-controller', {frontier});
     await writeFile(file, key, {mode: 0o600});
   }
-  keepRunning('agent-console', '/opt/agents/bin/python', ['/opt/hub/agents/console.py'], {
+  keepRunning('agent-console', '/opt/agents/bin/python', [join(APP, 'agents', 'console.py')], {
     ...BASE, PYTHONUNBUFFERED: '1', HUB_URL: 'http://127.0.0.1:8080/v1', HUB_KEY: key,
     HUB_DATA_DIR: join(DATA, 'agent-workspace'), FRONTIER_MODEL: env.AGENT_FRONTIER_MODEL || '',
     CONSOLE_URL: env.CONSOLE_URL || '', CONSOLE_KEY: env.CONSOLE_KEY || '',
     // Qwen Cowork: sandboxed workspaces, and sign-ins for handing work to Claude Code / Codex.
-    COWORK_ROOT: env.COWORK_ROOT || '/workspace/cowork',
+    COWORK_ROOT: env.COWORK_ROOT || '/workspace/cowork', HUB_CODE_DIR: CODE_ROOT,
     ...Object.fromEntries(['CLAUDE_CODE_OAUTH_TOKEN', 'CODEX_API_KEY', 'BRAVE_API_KEY', 'CLAUDE_MODEL', 'CODEX_MODEL',
       'CLAUDE_DAILY_TASKS', 'CODEX_DAILY_TASKS', 'ESCALATION_TIMEOUT', 'AGENT_SLOTS', 'AGENT_MODEL_CALLS']
       .filter(k => env[k]).map(k => [k, env[k]])),
@@ -127,7 +144,7 @@ if (env.ENABLE_AGENT_CONSOLE === 'true') {
 // site points at unix:/run/hub/webui.sock. WEBUI_TCP=true restores 127.0.0.1:3000.
 const WEBUI_SOCKET = env.WEBUI_TCP === 'true' ? null : (env.WEBUI_SOCKET || '/run/hub/webui.sock');
 keepRunning('open-webui', '/opt/openwebui/bin/python',
-  WEBUI_SOCKET ? ['/opt/hub/deploy/webui_serve.py', WEBUI_SOCKET] : ['/opt/openwebui/bin/open-webui', 'serve', '--host', '127.0.0.1', '--port', '3000'], {
+  WEBUI_SOCKET ? [join(APP, 'deploy', 'webui_serve.py'), WEBUI_SOCKET] : ['/opt/openwebui/bin/open-webui', 'serve', '--host', '127.0.0.1', '--port', '3000'], {
   ...BASE,
   DATA_DIR: join(DATA, 'open-webui'),
   HF_HOME: join(DATA, 'cache', 'huggingface'),
@@ -156,7 +173,7 @@ keepRunning('open-webui', '/opt/openwebui/bin/python',
 keepRunning('cloudflared', '/usr/bin/cloudflared', ['tunnel', '--no-autoupdate', 'run'], {...BASE, TUNNEL_TOKEN: env.TUNNEL_TOKEN});
 
 // Install Qwen Cowork and the agent teams into the chat site on every start (webui_install.mjs).
-installAgents({env, socket: WEBUI_SOCKET, dataDir: DATA, stopping: () => stopping})
+installAgents({env, socket: WEBUI_SOCKET, dataDir: DATA, integrations: join(APP, 'integrations'), stopping: () => stopping})
   .catch(error => console.error(`[supervisor] agent install failed: ${error.message}`));
 
 // The website, API and tunnel are up now; the models join once their files are ready.

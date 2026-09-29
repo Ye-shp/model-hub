@@ -222,6 +222,14 @@ class Pipe:
                     yield "\n".join(rows + ["", "To connect Claude Code: run `claude setup-token` on your computer, then send "
                                                  "`/connect claude <token>`. To connect Codex: send `/connect codex`."])
                     return
+                if command.startswith("/update-code"):
+                    parts = request_text.split()
+                    if tier != "owner" or len(parts) != 2:
+                        yield "Owner only: `/update-code <40-character commit sha>`."
+                        return
+                    staged = await self._call(client, "POST", "/api/admin/code", json={"ref": parts[1]})
+                    yield f"Staged `{staged['staged'][:12]}` ({staged['files']} files). Restart the instance (not recycle) to run it."
+                    return
                 if command.startswith("/connect claude"):
                     if tier != "owner":
                         yield "Only the owner can manage connections."
