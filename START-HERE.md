@@ -68,7 +68,7 @@ agents/.venv/Scripts/python agents/benchmark.py --concurrency 2 --tokens 512 --t
 
 Compare time to first answer and total duration. Do not assume six simultaneous slots are faster than two. Each GPU runs three slots sharing the largest context that fits (134K on a 3090, 262K on a V100 32GB), with unbounded thinking by default. The model weights and vision encoders remain Claude's pinned choices. Context fit and useful answer quality need live validation on your rental.
 
-The profiles allow up to 3, 6 or 10 minutes for the entire agent task. These are hard task deadlines, not promised completion times. A timeout retains saved progress and can be resumed explicitly. Repeated resumes can extend total work and spend.
+The profiles allow up to 5, 15 or 30 minutes (fast, balanced, deep) for the entire agent task. These are hard task deadlines, not promised completion times. A timeout retains saved progress and can be resumed explicitly. Repeated resumes can extend total work and spend.
 
 ## 4. Optional frontier advice and images
 

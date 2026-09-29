@@ -46,9 +46,11 @@ CREATE TABLE IF NOT EXISTS artifacts (
 PROFILES = {
     # Reasoning tokens count against max_tokens, so these leave room to think *and* write a full
     # tool call (e.g. save_report with a Markdown deliverable) without truncating its JSON.
-    "fast": {"seconds": 180, "turns": 6, "subturns": 3, "tokens": 4096, "effort": "low"},
-    "balanced": {"seconds": 360, "turns": 10, "subturns": 4, "tokens": 8192, "effort": "medium"},
-    "deep": {"seconds": 600, "turns": 16, "subturns": 6, "tokens": 12288, "effort": "medium"},
+    # Measured on the live hub: a 3-script content job with writer + critic needs 10-15 minutes at ~33 tok/s.
+    # Local models cost nothing per call, so these budgets bound time, not money.
+    "fast": {"seconds": 300, "turns": 8, "subturns": 3, "tokens": 4096, "effort": "low"},
+    "balanced": {"seconds": 900, "turns": 14, "subturns": 5, "tokens": 8192, "effort": "medium"},
+    "deep": {"seconds": 1800, "turns": 20, "subturns": 6, "tokens": 12288, "effort": "medium"},
 }
 
 

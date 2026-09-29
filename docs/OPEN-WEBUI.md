@@ -54,7 +54,7 @@ The Pipe sends your latest user message as the task brief; it does not silently 
 
 If a job completes during the chat wait, its answer is returned. Otherwise, the chat gives its ID and leaves it running in the background. Closing or cancelling the chat stream does not cancel the durable job; use `/hub cancel`. A lost submission response is ambiguous: inspect `/hub tasks` before submitting again. Retrying or regenerating a normal task message can create another job.
 
-The controller must remain running. Queued jobs persist across restarts; interrupted jobs require an explicit resume. Profiles limit each attempt to 3, 6 or 10 minutes. Resuming gives another attempt, while the per-job two-call frontier and two-image allowances remain consumed.
+The controller must remain running. Queued jobs persist across restarts; interrupted jobs require an explicit resume. Profiles limit each attempt to 5, 15 or 30 minutes (fast, balanced, deep). Resuming gives another attempt, while the per-job two-call frontier and two-image allowances remain consumed.
 
 ## 5. Invite people deliberately
 
