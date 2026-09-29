@@ -119,9 +119,14 @@ class Pipe:
 
     async def _deliver(self, client, artifacts, user, request, metadata, emit) -> str:
         """Copy the files the agent shared into the chat site so they show up (and download) in the chat."""
+        latest = {}
+        for artifact in artifacts:  # a file shared twice (e.g. regenerated) is delivered once, newest version
+            latest.pop(artifact["name"], None)
+            latest[artifact["name"]] = artifact
+        artifacts = list(latest.values())
         if not artifacts:
             return ""
-        lines, shown = ["", "**Files**"], []
+        lines, shown = ["", "", "**Files**"], []
         for artifact in artifacts:
             name, media = artifact["name"], artifact.get("media_type") or "application/octet-stream"
             try:
