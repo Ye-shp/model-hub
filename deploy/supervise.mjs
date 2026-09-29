@@ -137,6 +137,45 @@ keepRunning('open-webui', '/opt/openwebui/bin/open-webui', ['serve', '--host', '
 
 keepRunning('cloudflared', '/usr/bin/cloudflared', ['tunnel', '--no-autoupdate', 'run'], {...BASE, TUNNEL_TOKEN: env.TUNNEL_TOKEN});
 
+// Install the agent team into the chat site (Open WebUI "Pipe" function) on every start, because the
+// site's database lives on the container disk and a redeploy starts it empty. Signs in as OWNER_EMAIL
+// through the same trusted header Cloudflare Access sets, so that account is created (as the first
+// user, the site's admin) if it doesn't exist yet.
+async function installPipe() {
+  if (env.ENABLE_AGENT_CONSOLE !== 'true' || !env.OWNER_EMAIL) return;
+  const base = 'http://127.0.0.1:3000/api/v1';
+  const content = await readFile('/opt/hub/integrations/openwebui_pipe.py', 'utf8');
+  for (let attempt = 1; attempt <= 60 && !stopping; attempt++) {
+    try {
+      const consoleKey = env.CONSOLE_KEY || (await readFile(join(DATA, 'agent-workspace', 'console.key'), 'utf8')).trim();
+      const signin = await fetch(`${base}/auths/signin`, {method: 'POST', headers: {'content-type': 'application/json',
+        'Cf-Access-Authenticated-User-Email': env.OWNER_EMAIL}, body: JSON.stringify({email: env.OWNER_EMAIL, password: 'unused'})});
+      if (!signin.ok) throw new Error(`sign-in HTTP ${signin.status}`);
+      const {token, role} = await signin.json();
+      if (role !== 'admin') { console.error(`[supervisor] Pipe not installed: ${env.OWNER_EMAIL} is not the chat site's admin (role ${role})`); return; }
+      const headers = {authorization: `Bearer ${token}`, 'content-type': 'application/json'};
+      const form = {id: 'model_hub', name: 'Hub', content, meta: {description: 'Model Hub agent team: durable jobs with skills, subagents and project memory'}};
+      const existing = await fetch(`${base}/functions/id/model_hub`, {headers});
+      const found = existing.ok ? await existing.json() : null;
+      const saved = await fetch(`${base}/functions/${found ? 'id/model_hub/update' : 'create'}`, {method: 'POST', headers, body: JSON.stringify(form)});
+      if (!saved.ok) throw new Error(`saving the Pipe: HTTP ${saved.status} ${(await saved.text()).slice(0, 200)}`);
+      const valves = {CONTROLLER_URL: 'http://127.0.0.1:8787', OWNER_KEY: consoleKey, PROJECT_ID: env.PIPE_PROJECT || 'friends',
+        PROFILE: env.PIPE_PROFILE || 'balanced', ALLOWED_EMAILS: env.PIPE_ALLOWED_EMAILS || '',
+        ALLOW_IMAGES: env.MODEL3_KIND === 'image' && Boolean(env.MODEL3_URL), ALLOW_FRONTIER: env.PIPE_ALLOW_FRONTIER === 'true'};
+      const v = await fetch(`${base}/functions/id/model_hub/valves/update`, {method: 'POST', headers, body: JSON.stringify(valves)});
+      if (!v.ok) throw new Error(`Pipe settings: HTTP ${v.status} ${(await v.text()).slice(0, 200)}`);
+      const current = await (await fetch(`${base}/functions/id/model_hub`, {headers})).json();
+      if (!current.is_active) await fetch(`${base}/functions/id/model_hub/toggle`, {method: 'POST', headers});
+      console.log(`[supervisor] agent team installed in the chat site (${found ? 'updated' : 'created'}; project ${valves.PROJECT_ID})`);
+      return;
+    } catch (error) {
+      if (attempt % 6 === 1) console.log(`[supervisor] waiting to install the agent team in the chat site (${error.message})`);
+      await new Promise(r => setTimeout(r, 10000));
+    }
+  }
+}
+installPipe().catch(error => console.error(`[supervisor] Pipe install failed: ${error.message}`));
+
 // The website, API and tunnel are up now; the models join once their files are ready.
 await setStatus('downloading models');
 try {
