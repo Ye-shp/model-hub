@@ -55,6 +55,8 @@ def instructions(job: dict, space: sandbox.Workspace, helper: bool = False, esca
     if helper:
         return (f"You are a helper agent working for Qwen Cowork on one sub-task. Today is {today}.\n"
                 f"Workspace folder (shared with the lead agent): {space.dir}\n{TOOLBOX}\n\n"
+                f"You have about {PROFILES[job['profile']]['helper_turns']} steps: plan your searches, don't repeat near-identical "
+                "queries, and stop researching once you have enough to answer well. "
                 "Do the sub-task completely with your tools. Look up anything current on the web and keep source URLs. "
                 "Save substantial output to files in the workspace. Your final message goes back to the lead agent: "
                 "give the findings or result, the file paths you wrote, and sources. Never invent results or sources.")
@@ -106,6 +108,24 @@ def instructions(job: dict, space: sandbox.Workspace, helper: bool = False, esca
         "the user should decide or check. No step-by-step recap of your process.",
     ]
     return "\n".join(lines)
+
+
+WRAP_UP = ("You have used all your steps for this task. Do not call tools. Using only what you found and did above, "
+           "write your final report now: results, files written (paths), sources, and what is still missing.")
+
+
+def out_of_turns(client, gate, tokens: int, job_id: str):
+    """When an agent runs out of turns, keep its work: one last tool-free call writes the report."""
+    async def handler(data):
+        ws.event(job_id, "tool", "Out of steps; writing up what was done")
+        writer = Agent(name="wrap-up", model=hub.model("qwen", client, gate), instructions="Write the final report requested.",
+                       model_settings=ModelSettings(max_tokens=tokens, include_usage=True, extra_body={"reasoning_effort": "low"}))
+        try:
+            result = await Runner.run(writer, list(data.run_data.history) + [{"role": "user", "content": WRAP_UP}], max_turns=1)
+            return str(result.final_output)
+        except Exception as error:  # still return something useful rather than losing the run
+            return f"Stopped after using all steps (the write-up failed: {type(error).__name__})."
+    return {"max_turns": handler}
 
 
 def build(job: dict, client, gate: asyncio.Semaphore, space: sandbox.Workspace) -> Agent:
@@ -281,7 +301,8 @@ def build(job: dict, client, gate: asyncio.Semaphore, space: sandbox.Workspace) 
         shares this workspace. Call several times in one turn to work in parallel. Returns the helper's report."""
         budget.active()
         log("delegate", f"Helper started: {brief[:140]}")
-        result = await Runner.run(helper, brief, max_turns=profile["helper_turns"])
+        result = await Runner.run(helper, brief, max_turns=profile["helper_turns"],
+                                  error_handlers=out_of_turns(client, gate, profile["tokens"], job_id))
         log("delegate-done", f"Helper finished: {brief[:80]}")
         return sandbox.trim(str(result.final_output), 12000)
 
@@ -327,7 +348,8 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
     session = SQLiteSession(f"{job['id']}-attempt-{job['attempts']}", db_path=store.DATA / "sessions.db")
     try:
         async with asyncio.timeout(profile["seconds"]):
-            result = await Runner.run(build(job, client, gate, space), job["task"], max_turns=profile["turns"], session=session)
+            result = await Runner.run(build(job, client, gate, space), job["task"], max_turns=profile["turns"], session=session,
+                                      error_handlers=out_of_turns(client, gate, profile["tokens"], job["id"]))
             usage = result.context_wrapper.usage
             ws.event(job["id"], "usage", json.dumps({"requests": usage.requests, "input_tokens": usage.input_tokens,
                                                      "output_tokens": usage.output_tokens}))

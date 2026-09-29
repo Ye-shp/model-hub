@@ -256,3 +256,28 @@ class ConnectionTests(Base):
         escalate.save_claude_token("sk-ant-oat01-" + "a" * 40)
         self.assertEqual(oct(escalate.token_file().stat().st_mode & 0o777), "0o600")
         self.assertEqual(escalate.claude_env()["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat01-" + "a" * 40)
+
+
+class OutOfTurnsTests(Base):
+    def test_helper_that_runs_out_of_steps_still_reports_back(self):
+        def handler(request):
+            body = json.loads(request.content)
+            system = body["messages"][0]["content"]
+            last = body["messages"][-1]
+            if last["role"] == "user" and last["content"] == cowork.WRAP_UP:
+                return sse({"role": "assistant", "content": "Partial report: found A and B."}, "stop")
+            if system.startswith("You are a helper agent"):
+                return sse(calls(("list_files", {"path": "."})), "tool_calls")
+            tools = [m for m in body["messages"] if m["role"] == "tool"]
+            if not tools:
+                return sse(calls(("delegate", {"brief": "Research forever"})), "tool_calls")
+            return sse({"role": "assistant", "content": "Lead got: " + tools[-1]["content"]}, "stop")
+
+        async def scenario():
+            client = AsyncOpenAI(api_key="t", base_url="https://fake.invalid/v1",
+                                 http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+            ws.create_job("default", "Research", "cowork", "fast", thread="chat-turns")
+            job = ws.claim_job()
+            with patch.object(hub, "async_client", return_value=client), patch.object(escalate, "available", return_value="off"):
+                return await cowork.run_job(job)
+        self.assertEqual(asyncio.run(scenario()), "Lead got: Partial report: found A and B.")
