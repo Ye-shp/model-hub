@@ -5,6 +5,7 @@ import argparse
 import asyncio
 from contextlib import asynccontextmanager, suppress
 import hmac
+import json
 import os
 from pathlib import Path
 import secrets
@@ -15,6 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 import hub  # Reads agents/.env before the data directory is selected.
+import access as cf_access
 import store
 import workspace as ws
 import coordination
@@ -121,7 +123,11 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
             return JSONResponse({"error": "Unexpected hostname"}, status_code=403)
         if request.url.path.startswith("/api/"):
             supplied = request.headers.get("authorization", "")
-            if not hmac.compare_digest(supplied.encode(), ("Bearer " + token).encode()):
+            owner = hmac.compare_digest(supplied.encode(), ("Bearer " + token).encode())
+            if not owner and cf_access.configured() and request.headers.get("cf-access-jwt-assertion"):
+                # Signed in through Cloudflare Access as the owner: no key needed.
+                owner = await asyncio.to_thread(cf_access.verify, request.headers["cf-access-jwt-assertion"]) is not None
+            if not owner:
                 return JSONResponse({"error": "Paste your workspace owner key to unlock."}, status_code=401)
             origin = request.headers.get("origin")
             if origin and origin not in {public_url, f"http://{request.headers.get('host')}", f"https://{request.headers.get('host')}"}:
@@ -160,6 +166,101 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
             raise HTTPException(404, "Project not found")
         return {**ws.snapshot(project), "skills": catalog(), "profiles": ws.PROFILES, "attention": coordination.attention(project),
                 "configured": bool(hub.HUB_URL and hub.HUB_KEY), "frontier_configured": bool(hub.FRONTIER_MODEL)}
+
+    # ---- operations views: everything the agents do, across all projects ----
+    @app.get("/api/overview")
+    def overview():
+        import escalate
+        projects = ws.query("""SELECT p.id, p.name,
+            (SELECT COUNT(*) FROM jobs j WHERE j.project=p.id) AS tasks,
+            (SELECT COUNT(*) FROM jobs j WHERE j.project=p.id AND j.status IN ('queued','running')) AS active,
+            (SELECT COUNT(*) FROM notes n WHERE n.project=p.id) AS memories,
+            (SELECT COUNT(*) FROM artifacts a WHERE a.project=p.id) AS files FROM projects p ORDER BY p.created_at""")
+        people = ws.query("""SELECT COALESCE(NULLIF(j.requested_by,''),'console') AS who, COUNT(*) AS tasks,
+            SUM(j.status IN ('queued','running')) AS active, SUM(j.status='completed') AS completed,
+            SUM(j.status IN ('failed','interrupted')) AS failed, MAX(j.created_at) AS last_task,
+            GROUP_CONCAT(DISTINCT j.project) AS projects FROM jobs j GROUP BY who ORDER BY last_task DESC""")
+        tokens = {}
+        for row in ws.query("""SELECT COALESCE(NULLIF(j.requested_by,''),'console') AS who, e.detail FROM events e
+                               JOIN jobs j ON j.id=e.job_id WHERE e.kind='usage'"""):
+            try:
+                usage = json.loads(row["detail"])
+            except ValueError:
+                continue
+            total = tokens.setdefault(row["who"], {"input_tokens": 0, "output_tokens": 0, "model_calls": 0})
+            total["input_tokens"] += usage.get("input_tokens") or 0
+            total["output_tokens"] += usage.get("output_tokens") or 0
+            total["model_calls"] += usage.get("requests") or 0
+        for person in people:
+            person.update(tokens.get(person["who"], {"input_tokens": 0, "output_tokens": 0, "model_calls": 0}))
+        try:
+            connections = escalate.status()
+        except Exception as error:  # the sandbox users only exist on the hub box
+            connections = {"error": f"{type(error).__name__}: {error}"}
+        return {"projects": projects, "people": people, "connections": connections,
+                "escalations": ws.query("""SELECT e.detail, e.created_at, j.requested_by FROM events e JOIN jobs j ON j.id=e.job_id
+                                           WHERE e.kind IN ('escalation','escalation-done') ORDER BY e.id DESC LIMIT 30""")}
+
+    @app.get("/api/activity")
+    def activity(project: str = "all", limit: int = 100):
+        where, params = ("", ()) if project == "all" else ("WHERE j.project=?", (project,))
+        return {"jobs": ws.query(f"""SELECT j.id, j.project, p.name AS project_name, j.skill, j.profile, j.status, substr(j.task,1,400) AS task,
+            j.requested_by, j.thread, j.created_at, j.started_at, j.finished_at, j.error,
+            (SELECT COUNT(*) FROM events e WHERE e.job_id=j.id AND e.kind IN ('tool','delegate','escalation','image-request')) AS actions,
+            (SELECT COUNT(*) FROM artifacts a WHERE a.job_id=j.id) AS files
+            FROM jobs j JOIN projects p ON p.id=j.project {where} ORDER BY j.created_at DESC, j.rowid DESC LIMIT ?""",
+            (*params, max(1, min(limit, 500))))}
+
+    @app.get("/api/jobs/{job}/timeline")
+    def timeline(job: str):
+        rows = ws.query("SELECT * FROM jobs WHERE id=?", (job,))
+        if not rows:
+            raise HTTPException(404, "Task not found")
+        return {**rows[0], "plan": coordination.plan(job),
+                "events": ws.query("SELECT id,kind,detail,created_at FROM events WHERE job_id=? AND kind!='model' ORDER BY id LIMIT 2000", (job,)),
+                "model_calls": ws.query("SELECT COUNT(*) AS n FROM events WHERE job_id=? AND kind='model'", (job,))[0]["n"],
+                "artifacts": ws.query("SELECT id,name,media_type,created_at FROM artifacts WHERE job_id=? ORDER BY created_at,rowid", (job,))}
+
+    def chat_workspace(project: str, thread: str):
+        import cowork, sandbox
+        if not ws.project_exists(project):
+            raise HTTPException(404, "Project not found")
+        return sandbox.Workspace(cowork.tier_for({"project": project}), thread)
+
+    @app.get("/api/workspace/files")
+    def workspace_files(project: str, thread: str):
+        space = chat_workspace(project, thread)
+        if not space.dir.is_dir():
+            return {"folder": str(space.dir), "files": []}
+        files = []
+        for path in sorted(space.dir.rglob("*")):
+            if any(part in {".git", "node_modules", "__pycache__", ".venv"} for part in path.relative_to(space.dir).parts):
+                continue
+            if path.is_file() and not path.is_symlink():
+                files.append({"path": str(path.relative_to(space.dir)), "bytes": path.stat().st_size})
+            if len(files) >= 500:
+                break
+        return {"folder": str(space.dir), "files": files}
+
+    @app.get("/api/workspace/file")
+    def workspace_file(project: str, thread: str, path: str):
+        target = chat_workspace(project, thread).resolve(path)
+        if not target.is_file():
+            raise HTTPException(404, "File not found")
+        return FileResponse(target, filename=target.name, media_type="application/octet-stream")
+
+    @app.get("/api/memories")
+    def all_memories(project: str = "all", search: str = ""):
+        where, params = ("", ()) if project == "all" else ("AND n.project=?", (project,))
+        return {"memories": ws.query(f"""SELECT n.*, p.name AS project_name FROM notes n JOIN projects p ON p.id=n.project
+            WHERE (n.title LIKE ? OR n.content LIKE ?) {where} ORDER BY n.updated_at DESC, n.id DESC LIMIT 300""",
+            (f"%{search}%", f"%{search}%", *params))}
+
+    @app.post("/api/memories/{note}/delete")
+    def delete_memory(note: int):
+        with ws.connection() as db, db:
+            changed = db.execute("DELETE FROM notes WHERE id=?", (note,)).rowcount
+        return {"deleted": bool(changed)}
 
     @app.post("/api/projects", status_code=201)
     def new_project(body: ProjectIn):

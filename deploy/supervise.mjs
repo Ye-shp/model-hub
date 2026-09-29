@@ -9,7 +9,7 @@ import {readFile, writeFile, mkdir, chmod, access} from 'node:fs/promises';
 import {randomBytes} from 'node:crypto';
 import {join} from 'node:path';
 import {prepareModels} from './download.mjs';
-import {installAgents} from './webui_install.mjs';
+import {pathToFileURL} from 'node:url';
 import {ClientStore} from '../gateway/clients.js';
 
 const env = process.env;
@@ -132,6 +132,8 @@ if (env.ENABLE_AGENT_CONSOLE === 'true') {
     CONSOLE_URL: env.CONSOLE_URL || '', CONSOLE_KEY: env.CONSOLE_KEY || '',
     // Qwen Cowork: sandboxed workspaces, and sign-ins for handing work to Claude Code / Codex.
     COWORK_ROOT: env.COWORK_ROOT || '/workspace/cowork', HUB_CODE_DIR: CODE_ROOT,
+    // Opens console.<domain> without the owner key for the owner signed in through Cloudflare Access.
+    OWNER_EMAIL: env.OWNER_EMAIL || '', ACCESS_TEAM: env.ACCESS_TEAM || '', CONSOLE_ACCESS_AUD: env.CONSOLE_ACCESS_AUD || '',
     ...Object.fromEntries(['CLAUDE_CODE_OAUTH_TOKEN', 'CODEX_API_KEY', 'BRAVE_API_KEY', 'CLAUDE_MODEL', 'CODEX_MODEL',
       'CLAUDE_DAILY_TASKS', 'CODEX_DAILY_TASKS', 'ESCALATION_TIMEOUT', 'AGENT_SLOTS', 'AGENT_MODEL_CALLS']
       .filter(k => env[k]).map(k => [k, env[k]])),
@@ -173,6 +175,8 @@ keepRunning('open-webui', '/opt/openwebui/bin/python',
 keepRunning('cloudflared', '/usr/bin/cloudflared', ['tunnel', '--no-autoupdate', 'run'], {...BASE, TUNNEL_TOKEN: env.TUNNEL_TOKEN});
 
 // Install Qwen Cowork and the agent teams into the chat site on every start (webui_install.mjs).
+// Loaded from the active app code, so installer fixes also arrive with /update-code.
+const {installAgents} = await import(pathToFileURL(join(APP, 'deploy', 'webui_install.mjs')).href);
 installAgents({env, socket: WEBUI_SOCKET, dataDir: DATA, integrations: join(APP, 'integrations'), stopping: () => stopping})
   .catch(error => console.error(`[supervisor] agent install failed: ${error.message}`));
 

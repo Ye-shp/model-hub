@@ -55,7 +55,13 @@ export async function installAgents({env, socket, dataDir, integrations = '/opt/
         const found = (await call(`/functions/id/${fn.id}`, {headers})).ok;
         const saved = await call(`/functions/${found ? `id/${fn.id}/update` : 'create'}`, {method: 'POST', headers, body: JSON.stringify(form)});
         if (!saved.ok) throw new Error(`saving ${fn.id}: HTTP ${saved.status} ${saved.text.slice(0, 200)}`);
-        const v = await call(`/functions/id/${fn.id}/valves/update`, {method: 'POST', headers, body: JSON.stringify(fn.valves(consoleKey))});
+        // People added on the site (valves) are kept; the instance setting only adds to them.
+        const settings = fn.valves(consoleKey);
+        const stored = await call(`/functions/id/${fn.id}/valves`, {headers});
+        const before = stored.ok ? (stored.json() || {}) : {};
+        const emails = new Set([before.ALLOWED_EMAILS, settings.ALLOWED_EMAILS].join(',').split(',').map(e => e.trim().toLowerCase()).filter(Boolean));
+        settings.ALLOWED_EMAILS = [...emails].join(',');
+        const v = await call(`/functions/id/${fn.id}/valves/update`, {method: 'POST', headers, body: JSON.stringify(settings)});
         if (!v.ok) throw new Error(`${fn.id} settings: HTTP ${v.status} ${v.text.slice(0, 200)}`);
         const current = (await call(`/functions/id/${fn.id}`, {headers})).json();
         if (!current.is_active) await call(`/functions/id/${fn.id}/toggle`, {method: 'POST', headers});

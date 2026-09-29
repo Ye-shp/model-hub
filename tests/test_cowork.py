@@ -310,3 +310,55 @@ class CodeUpdateTests(unittest.TestCase):
             self.assertFalse((Path(folder) / "gateway").exists())
             with self.assertRaises(ValueError):
                 code_update.extract(archive([("repo-abc/agents/../../../etc/x", b"bad")]), Path(folder))
+
+
+class ConsoleOperationsTests(Base):
+    def test_owner_signed_in_through_access_needs_no_key_and_sees_everything(self):
+        import access, base64 as b64, json as js, time as tm
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding, rsa
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        numbers = key.public_key().public_numbers()
+        enc = lambda raw: b64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+        jwk = {"kid": "k1", "kty": "RSA", "n": enc(numbers.n.to_bytes(256, "big")), "e": enc(numbers.e.to_bytes(3, "big"))}
+        def token(email, aud="aud-console", exp=None):
+            head = enc(js.dumps({"alg": "RS256", "kid": "k1"}).encode())
+            body = enc(js.dumps({"aud": [aud], "email": email, "iss": "https://team.cloudflareaccess.com",
+                                 "iat": int(tm.time()), "exp": exp or int(tm.time()) + 600}).encode())
+            sig = key.sign(f"{head}.{body}".encode(), padding.PKCS1v15(), hashes.SHA256())
+            return f"{head}.{body}.{enc(sig)}"
+        with patch.multiple(access, TEAM="team", AUDIENCE="aud-console", OWNER="me@example.com"), \
+             patch.object(access, "_public_keys", return_value={"k1": jwk}):
+            self.assertIsNotNone(access.verify(token("Me@example.com")))
+            self.assertIsNone(access.verify(token("friend@example.com")))
+            self.assertIsNone(access.verify(token("me@example.com", aud="other-app")))
+            self.assertIsNone(access.verify(token("me@example.com", exp=int(tm.time()) - 5)))
+            forged = token("friend@example.com").split(".")
+            forged[1] = token("me@example.com").split(".")[1]
+            self.assertIsNone(access.verify(".".join(forged)))
+            client = TestClient(console.create_app("k" * 40, run_worker=False))
+            self.assertEqual(client.get("/api/overview").status_code, 401)
+            ok = client.get("/api/overview", headers={"Cf-Access-Jwt-Assertion": token("me@example.com")})
+            self.assertEqual(ok.status_code, 200, ok.text)
+            self.assertEqual(client.get("/api/overview", headers={"Cf-Access-Jwt-Assertion": token("friend@example.com")}).status_code, 401)
+        auth = {"Authorization": "Bearer " + "k" * 40}
+        mine = ws.create_job("default", "my task", "cowork", thread="chat-1", requested_by="me@example.com")
+        theirs = ws.create_job("friends", "friend task", "cowork", thread="chat-2", requested_by="friend@example.com")
+        ws.event(theirs, "tool", "Running: ls")
+        ws.event(theirs, "usage", json.dumps({"requests": 3, "input_tokens": 100, "output_tokens": 20}))
+        ws.save_note("friends", "Likes short hooks", "Under 3 seconds", "preference")
+        space = sandbox.Workspace("guest", "chat-2").prepare()
+        space.write_text("report.md", "# hi")
+        activity = client.get("/api/activity", headers=auth).json()["jobs"]
+        self.assertEqual({j["id"] for j in activity}, {mine, theirs})
+        people = {p["who"]: p for p in client.get("/api/overview", headers=auth).json()["people"]}
+        self.assertEqual((people["friend@example.com"]["tasks"], people["friend@example.com"]["input_tokens"]), (1, 100))
+        timeline = client.get(f"/api/jobs/{theirs}/timeline", headers=auth).json()
+        self.assertIn("tool", [e["kind"] for e in timeline["events"]])
+        files = client.get("/api/workspace/files", headers=auth, params={"project": "friends", "thread": "chat-2"}).json()["files"]
+        self.assertEqual(files, [{"path": "report.md", "bytes": 4}])
+        self.assertEqual(client.get("/api/workspace/file", headers=auth, params={"project": "friends", "thread": "chat-2", "path": "report.md"}).content, b"# hi")
+        self.assertEqual(client.get("/api/workspace/file", headers=auth, params={"project": "friends", "thread": "chat-2", "path": "../../../x"}).status_code, 400)
+        memories = client.get("/api/memories", headers=auth).json()["memories"]
+        self.assertEqual(memories[0]["project_name"], "Shared with invited friends")
+        self.assertTrue(client.post(f"/api/memories/{memories[0]['id']}/delete", headers=auth).json()["deleted"])
