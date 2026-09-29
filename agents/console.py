@@ -40,6 +40,14 @@ class JobIn(BaseModel):
     requested_by: str | None = Field(default=None, max_length=200)
 
 
+class TokenIn(BaseModel):
+    token: str = Field(min_length=20, max_length=400)
+
+
+class CodeIn(BaseModel):
+    ref: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+
 class UploadIn(BaseModel):
     project: str
     thread: str = Field(min_length=1, max_length=80)
@@ -200,17 +208,11 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         import escalate
         return escalate.status()
 
-    class TokenIn(BaseModel):
-        token: str = Field(min_length=20, max_length=400)
-
     @app.post("/api/connections/claude")
     def connect_claude(body: TokenIn):
         import escalate
         escalate.save_claude_token(body.token)
         return escalate.status()["claude"]
-
-    class CodeIn(BaseModel):
-        ref: str = Field(pattern=r"^[0-9a-f]{40}$")
 
     @app.post("/api/admin/code")
     async def stage_code(body: CodeIn):

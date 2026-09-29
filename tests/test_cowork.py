@@ -107,6 +107,15 @@ class ConcurrencyTests(Base):
         self.assertEqual(client.get(f"/api/jobs/{job}/events", headers=auth, params={"after": last}).json()["events"], [])
         self.assertEqual(ws.query("SELECT requested_by FROM jobs WHERE id=?", (job,))[0]["requested_by"], "me@example.com")
         self.assertIn("claude", client.get("/api/connections", headers=auth).json())
+        r = client.post("/api/connections/claude", headers=auth, json={"token": "sk-ant-oat01-" + "b" * 40})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["signed_in"])
+        self.assertEqual(client.post("/api/admin/code", headers=auth, json={"ref": "nothex"}).status_code, 400 if False else 422)
+        import code_update
+        async def fake_stage(ref): return {"staged": ref, "files": 1}
+        with patch.object(code_update, "stage", fake_stage):
+            r = client.post("/api/admin/code", headers=auth, json={"ref": "a" * 40})
+        self.assertEqual(r.json()["staged"], "a" * 40, r.text)
 
 
 def sse(delta, finish):
