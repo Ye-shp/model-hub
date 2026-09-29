@@ -1,13 +1,15 @@
 // Container entrypoint on the GPU rental. Starts and keeps alive:
 //   qwen-1 (GPU 0) and qwen-2 (GPU 1): llama-server with vision, large context, parallel slots
 //   gateway:    OpenAI-compatible API with per-client keys and queues (port 8080)
-//   open-webui: the chat website for you and invited friends (port 3000)
+//   open-webui: the chat website for you and invited friends (Unix socket /run/hub/webui.sock)
+//   agent-console: jobs, Qwen Cowork and its sandboxed workspaces (port 8787)
 //   cloudflared: the outbound tunnel; nothing listens on a public port
 import {spawn, execFileSync} from 'node:child_process';
-import {readFile, writeFile, mkdir} from 'node:fs/promises';
+import {readFile, writeFile, mkdir, chmod} from 'node:fs/promises';
 import {randomBytes} from 'node:crypto';
 import {join} from 'node:path';
 import {prepareModels} from './download.mjs';
+import {installAgents} from './webui_install.mjs';
 import {ClientStore} from '../gateway/clients.js';
 
 const env = process.env;
@@ -21,6 +23,8 @@ console.log(`GPUs:\n  ${gpus.join('\n  ')}`);
 if (gpus.length < 2) throw new Error('Two GPUs are required: one per resident model.');
 
 await mkdir(DATA, {recursive: true});
+// Keys and databases live here; Cowork's sandbox users must not be able to read them.
+await chmod(DATA, 0o700);
 // Secrets the container creates for itself on first boot and keeps on the volume.
 async function persistentSecret(file, make) {
   const path = join(DATA, file);
@@ -109,10 +113,21 @@ if (env.ENABLE_AGENT_CONSOLE === 'true') {
     ...BASE, PYTHONUNBUFFERED: '1', HUB_URL: 'http://127.0.0.1:8080/v1', HUB_KEY: key,
     HUB_DATA_DIR: join(DATA, 'agent-workspace'), FRONTIER_MODEL: env.AGENT_FRONTIER_MODEL || '',
     CONSOLE_URL: env.CONSOLE_URL || '', CONSOLE_KEY: env.CONSOLE_KEY || '',
+    // Qwen Cowork: sandboxed workspaces, and sign-ins for handing work to Claude Code / Codex.
+    COWORK_ROOT: env.COWORK_ROOT || '/workspace/cowork',
+    ...Object.fromEntries(['CLAUDE_CODE_OAUTH_TOKEN', 'CODEX_API_KEY', 'BRAVE_API_KEY', 'CLAUDE_MODEL', 'CODEX_MODEL',
+      'CLAUDE_DAILY_TASKS', 'CODEX_DAILY_TASKS', 'ESCALATION_TIMEOUT', 'AGENT_SLOTS', 'AGENT_MODEL_CALLS']
+      .filter(k => env[k]).map(k => [k, env[k]])),
+    // Claude Code bills an API key instead of your Claude plan when one is present, so only pass it on request.
+    ...(env.CLAUDE_USE_API_KEY === 'true' && env.ANTHROPIC_API_KEY ? {ANTHROPIC_API_KEY: env.ANTHROPIC_API_KEY} : {}),
   });
 }
 
-keepRunning('open-webui', '/opt/openwebui/bin/open-webui', ['serve', '--host', '127.0.0.1', '--port', '3000'], {
+// The chat site listens on a root-only Unix socket (see webui_serve.py); the tunnel's ingress for the
+// site points at unix:/run/hub/webui.sock. WEBUI_TCP=true restores 127.0.0.1:3000.
+const WEBUI_SOCKET = env.WEBUI_TCP === 'true' ? null : (env.WEBUI_SOCKET || '/run/hub/webui.sock');
+keepRunning('open-webui', '/opt/openwebui/bin/python',
+  WEBUI_SOCKET ? ['/opt/hub/deploy/webui_serve.py', WEBUI_SOCKET] : ['/opt/openwebui/bin/open-webui', 'serve', '--host', '127.0.0.1', '--port', '3000'], {
   ...BASE,
   DATA_DIR: join(DATA, 'open-webui'),
   HF_HOME: join(DATA, 'cache', 'huggingface'),
@@ -124,6 +139,9 @@ keepRunning('open-webui', '/opt/openwebui/bin/open-webui', ['serve', '--host', '
   DEFAULT_USER_ROLE: env.WEBUI_DEFAULT_ROLE || 'pending',
   ENABLE_OLLAMA_API: 'false',
   ENABLE_EVALUATION_ARENA_MODELS: 'false',
+  // New chats open on Qwen Cowork; chat titles and tags come from qwen-2 directly.
+  ...(env.ENABLE_AGENT_CONSOLE === 'true' ? {DEFAULT_MODELS: env.WEBUI_DEFAULT_MODEL || 'cowork'} : {}),
+  TASK_MODEL_EXTERNAL: env.WEBUI_TASK_MODEL || 'qwen-2',
   OPENAI_API_BASE_URLS: 'http://127.0.0.1:8080/v1',
   OPENAI_API_KEYS: webuiKey,
   ANONYMIZED_TELEMETRY: 'false', DO_NOT_TRACK: 'true', SCARF_NO_ANALYTICS: 'true',
@@ -137,44 +155,9 @@ keepRunning('open-webui', '/opt/openwebui/bin/open-webui', ['serve', '--host', '
 
 keepRunning('cloudflared', '/usr/bin/cloudflared', ['tunnel', '--no-autoupdate', 'run'], {...BASE, TUNNEL_TOKEN: env.TUNNEL_TOKEN});
 
-// Install the agent team into the chat site (Open WebUI "Pipe" function) on every start, because the
-// site's database lives on the container disk and a redeploy starts it empty. Signs in as OWNER_EMAIL
-// through the same trusted header Cloudflare Access sets, so that account is created (as the first
-// user, the site's admin) if it doesn't exist yet.
-async function installPipe() {
-  if (env.ENABLE_AGENT_CONSOLE !== 'true' || !env.OWNER_EMAIL) return;
-  const base = 'http://127.0.0.1:3000/api/v1';
-  const content = await readFile('/opt/hub/integrations/openwebui_pipe.py', 'utf8');
-  for (let attempt = 1; attempt <= 60 && !stopping; attempt++) {
-    try {
-      const consoleKey = env.CONSOLE_KEY || (await readFile(join(DATA, 'agent-workspace', 'console.key'), 'utf8')).trim();
-      const signin = await fetch(`${base}/auths/signin`, {method: 'POST', headers: {'content-type': 'application/json',
-        'Cf-Access-Authenticated-User-Email': env.OWNER_EMAIL}, body: JSON.stringify({email: env.OWNER_EMAIL, password: 'unused'})});
-      if (!signin.ok) throw new Error(`sign-in HTTP ${signin.status}`);
-      const {token, role} = await signin.json();
-      if (role !== 'admin') { console.error(`[supervisor] Pipe not installed: ${env.OWNER_EMAIL} is not the chat site's admin (role ${role})`); return; }
-      const headers = {authorization: `Bearer ${token}`, 'content-type': 'application/json'};
-      const form = {id: 'model_hub', name: 'Hub', content, meta: {description: 'Model Hub agent team: durable jobs with skills, subagents and project memory'}};
-      const existing = await fetch(`${base}/functions/id/model_hub`, {headers});
-      const found = existing.ok ? await existing.json() : null;
-      const saved = await fetch(`${base}/functions/${found ? 'id/model_hub/update' : 'create'}`, {method: 'POST', headers, body: JSON.stringify(form)});
-      if (!saved.ok) throw new Error(`saving the Pipe: HTTP ${saved.status} ${(await saved.text()).slice(0, 200)}`);
-      const valves = {CONTROLLER_URL: 'http://127.0.0.1:8787', OWNER_KEY: consoleKey, PROJECT_ID: env.PIPE_PROJECT || 'friends',
-        PROFILE: env.PIPE_PROFILE || 'balanced', ALLOWED_EMAILS: env.PIPE_ALLOWED_EMAILS || '',
-        ALLOW_IMAGES: env.MODEL3_KIND === 'image' && Boolean(env.MODEL3_URL), ALLOW_FRONTIER: env.PIPE_ALLOW_FRONTIER === 'true'};
-      const v = await fetch(`${base}/functions/id/model_hub/valves/update`, {method: 'POST', headers, body: JSON.stringify(valves)});
-      if (!v.ok) throw new Error(`Pipe settings: HTTP ${v.status} ${(await v.text()).slice(0, 200)}`);
-      const current = await (await fetch(`${base}/functions/id/model_hub`, {headers})).json();
-      if (!current.is_active) await fetch(`${base}/functions/id/model_hub/toggle`, {method: 'POST', headers});
-      console.log(`[supervisor] agent team installed in the chat site (${found ? 'updated' : 'created'}; project ${valves.PROJECT_ID})`);
-      return;
-    } catch (error) {
-      if (attempt % 6 === 1) console.log(`[supervisor] waiting to install the agent team in the chat site (${error.message})`);
-      await new Promise(r => setTimeout(r, 10000));
-    }
-  }
-}
-installPipe().catch(error => console.error(`[supervisor] Pipe install failed: ${error.message}`));
+// Install Qwen Cowork and the agent teams into the chat site on every start (webui_install.mjs).
+installAgents({env, socket: WEBUI_SOCKET, dataDir: DATA, stopping: () => stopping})
+  .catch(error => console.error(`[supervisor] agent install failed: ${error.message}`));
 
 // The website, API and tunnel are up now; the models join once their files are ready.
 await setStatus('downloading models');

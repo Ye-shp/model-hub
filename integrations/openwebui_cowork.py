@@ -1,0 +1,296 @@
+"""
+title: Qwen Cowork
+description: Type what you want done. Qwen plans it and does the work with a shell, files, the web, helper agents, images, and Claude Code or Codex when it needs them.
+author: Model Hub
+version: 1.0.0
+"""
+import asyncio
+import base64
+import io
+import json
+import re
+import time
+
+try:
+    import httpx2 as httpx
+except ImportError:
+    import httpx
+from pydantic import BaseModel, Field
+
+HELP = """**Qwen Cowork** — say what you want accomplished; it plans, works with its tools and hands back results and files.
+
+Each chat has its own workspace folder that persists, so follow-ups build on earlier files. Attach files and they land in `uploads/`.
+Pressing stop cancels the task.
+
+Owner commands: `/connections` (Claude Code / Codex status) · `/connect codex` (sign Codex in with your ChatGPT account)."""
+
+SKIP = {"model", "usage", "queued", "completed", "failed", "interrupted", "cancelled", "resumed", "frontier-call"}
+
+
+class Pipe:
+    class Valves(BaseModel):
+        CONTROLLER_URL: str = Field(default="http://127.0.0.1:8787", description="Agent controller, from the chat site's server")
+        OWNER_KEY: str = Field(default="", description="Controller owner key (set by the hub on start)")
+        ALLOWED_EMAILS: str = Field(default="", description="Comma-separated invited users; admins are always allowed")
+        OWNER_PROFILE: str = Field(default="balanced", description="fast (20 min), balanced (60 min) or deep (2 h) for admins")
+        GUEST_PROFILE: str = Field(default="balanced", description="Time budget for invited users")
+        ALLOW_IMAGES: bool = False
+        OWNER_ESCALATION: bool = Field(default=True, description="Let the owner's tasks hand work to Claude Code / Codex")
+        HISTORY_CHARACTERS: int = Field(default=60000, ge=2000, le=110000, description="How much of the chat is sent along")
+
+    def __init__(self):
+        self.valves = self.Valves()
+        self.file_handler = True  # the agent gets the raw attached files instead of Open WebUI's retrieval snippets
+
+    # ---- helpers ----
+    def _client(self):
+        return httpx.AsyncClient(base_url=self.valves.CONTROLLER_URL.rstrip("/"),
+                                 headers={"Authorization": "Bearer " + self.valves.OWNER_KEY}, timeout=60)
+
+    async def _call(self, client, method, path, **kwargs):
+        response = await client.request(method, path, **kwargs)
+        if response.status_code >= 400:
+            detail = ""
+            try:
+                detail = response.json().get("error") or response.json().get("detail") or ""
+            except ValueError:
+                pass
+            raise ValueError(f"Controller HTTP {response.status_code} {str(detail)[:200]}".strip())
+        return response.json()
+
+    def _tier(self, user: dict):
+        if user.get("role") == "admin":
+            return "owner"
+        allowed = {e.strip().lower() for e in self.valves.ALLOWED_EMAILS.split(",") if e.strip()}
+        return "guest" if (user.get("email") or "").lower() in allowed else None
+
+    @staticmethod
+    def _text(content) -> tuple[str, list[str]]:
+        """Message text and any inline images (data URLs)."""
+        if isinstance(content, str):
+            return content, []
+        texts, images = [], []
+        for part in content or []:
+            if part.get("type") == "text":
+                texts.append(part.get("text", ""))
+            elif part.get("type") == "image_url":
+                url = (part.get("image_url") or {}).get("url", "")
+                if url.startswith("data:image/"):
+                    images.append(url)
+        return "\n".join(texts), images
+
+    @staticmethod
+    def _thread(metadata: dict, chat_id) -> str:
+        raw = chat_id or (metadata or {}).get("chat_id") or (metadata or {}).get("session_id") or "chat"
+        return re.sub(r"[^A-Za-z0-9_-]", "-", str(raw))[:80] or "chat"
+
+    async def _status(self, emit, text: str, done: bool = False):
+        if emit:
+            await emit({"type": "status", "data": {"description": text[:200], "done": done}})
+
+    async def _upload_inputs(self, client, project, thread, files, images) -> list[str]:
+        saved = []
+        for index, url in enumerate(images, 1):
+            header, data = url.split(",", 1)
+            extension = header.split("/")[1].split(";")[0].replace("jpeg", "jpg")[:5]
+            result = await self._call(client, "POST", "/api/workspace/upload", json={
+                "project": project, "thread": thread, "name": f"pasted-image-{int(time.time())}-{index}.{extension}", "content_b64": data})
+            saved.append(result["path"])
+        for item in files or []:
+            try:
+                from open_webui.models.files import Files
+                from open_webui.storage.provider import Storage
+                identity = item.get("id") or (item.get("file") or {}).get("id")
+                record = await Files.get_file_by_id(identity) if identity else None
+                if not record:
+                    continue
+                with open(Storage.get_file(record.path), "rb") as handle:
+                    content = handle.read(60_000_001)
+                if len(content) > 60_000_000:
+                    saved.append(f"(skipped {record.filename}: larger than 60 MB)")
+                    continue
+                result = await self._call(client, "POST", "/api/workspace/upload", json={
+                    "project": project, "thread": thread, "name": record.filename, "content_b64": base64.b64encode(content).decode()})
+                saved.append(result["path"])
+            except Exception as error:  # one unreadable attachment shouldn't stop the task
+                saved.append(f"(could not attach {item.get('name', 'a file')}: {type(error).__name__})")
+        return saved
+
+    async def _deliver(self, client, artifacts, user, request, metadata, emit) -> str:
+        """Copy the files the agent shared into the chat site so they show up (and download) in the chat."""
+        if not artifacts:
+            return ""
+        lines, shown = ["", "**Files**"], []
+        for artifact in artifacts:
+            name, media = artifact["name"], artifact.get("media_type") or "application/octet-stream"
+            try:
+                response = await client.get(f"/api/artifacts/{artifact['id']}")
+                response.raise_for_status()
+                from fastapi import UploadFile
+                from open_webui.models.users import Users
+                from open_webui.routers.files import upload_file_handler
+                account = await Users.get_user_by_id(user["id"])
+                item = await upload_file_handler(request, file=UploadFile(file=io.BytesIO(response.content), filename=name,
+                                                                          headers={"content-type": media}),
+                                                 metadata={"chat_id": metadata.get("chat_id"), "message_id": metadata.get("message_id")},
+                                                 process=False, user=account)
+                url = request.app.url_path_for("get_file_content_by_id", id=item.id)
+                shown.append({"type": "image" if media.startswith("image/") else "file", "id": item.id, "url": url,
+                              "name": name, "content_type": media})
+                lines.append(f"- [{name}]({url})")
+            except Exception as error:
+                lines.append(f"- {name} (saved in the workspace; could not attach here: {type(error).__name__})")
+        if emit and shown:
+            try:
+                await emit({"type": "files", "data": {"files": shown}})
+            except Exception:
+                pass
+        return "\n".join(lines)
+
+    @staticmethod
+    def _plan_block(plan) -> str:
+        if not plan:
+            return ""
+        done = sum(1 for s in plan if s["status"] == "completed")
+        marks = {"completed": "✅", "in_progress": "▶️", "pending": "⬜"}
+        rows = "\n".join(f"{marks.get(s['status'], '⬜')} {s['title']}" for s in plan)
+        return f"<details>\n<summary>Task list ({done}/{len(plan)} done)</summary>\n\n{rows}\n</details>\n\n"
+
+    def _describe(self, event, plan) -> str | None:
+        kind, detail = event["kind"], event["detail"]
+        if kind in SKIP:
+            return None
+        if kind == "started":
+            return "Working…"
+        if kind == "plan":
+            active = next((s["title"] for s in plan if s["status"] == "in_progress"), None)
+            done = sum(1 for s in plan if s["status"] == "completed")
+            return f"[{done}/{len(plan)}] {active}" if active else f"Task list: {done}/{len(plan)} done"
+        if kind == "artifact":
+            try:
+                return "Shared " + json.loads(detail)["name"]
+            except (ValueError, KeyError):
+                return "Shared a file"
+        if kind == "escalation":
+            agent, _, task = detail.partition(":")
+            return f"{'Claude Code' if agent == 'claude' else 'Codex'} is working on:{task}"
+        return detail
+
+    # ---- entry point ----
+    async def pipe(self, body: dict, __user__: dict = None, __metadata__: dict = None, __files__: list = None,
+                   __event_emitter__=None, __task__: str = None, __request__=None, __chat_id__: str = None):
+        if __task__:  # titles, tags, follow-ups: never start work for these
+            yield "Cowork task"
+            return
+        user = __user__ or {}
+        tier = self._tier(user)
+        if not tier:
+            yield "Qwen Cowork is available to the site's administrators and invited users."
+            return
+        if len(self.valves.OWNER_KEY) < 32:
+            yield "Qwen Cowork isn't configured yet (missing controller key). Restart the hub or set the Pipe's valves."
+            return
+        messages = [m for m in body.get("messages", []) if m.get("role") in {"user", "assistant"}]
+        if not messages or messages[-1]["role"] != "user":
+            yield HELP
+            return
+        request_text, images = self._text(messages[-1].get("content"))
+        request_text = request_text.strip()
+        command = request_text.lower()
+        project = "default" if tier == "owner" else "friends"
+        thread = self._thread(__metadata__, __chat_id__)
+        emit = __event_emitter__
+        try:
+            async with self._client() as client:
+                if command in {"/help", "help"} or (not request_text and not images and not __files__):
+                    yield HELP
+                    return
+                if command in {"/connections", "/connect"}:
+                    if tier != "owner":
+                        yield "Only the owner can manage connections."
+                        return
+                    info = await self._call(client, "GET", "/api/connections")
+                    rows = [f"- **{'Claude Code' if k == 'claude' else 'Codex'}**: "
+                            f"{'connected' if v['signed_in'] else 'not connected'}{'' if v['installed'] else ' (not installed)'}; "
+                            f"{v['used_today']}/{v['daily_limit']} tasks in the last 24 h" for k, v in info.items()]
+                    yield "\n".join(rows + ["", "Claude Code signs in with `CLAUDE_CODE_OAUTH_TOKEN` in the instance settings; "
+                                                 "send `/connect codex` to sign Codex in."])
+                    return
+                if command == "/connect codex":
+                    if tier != "owner":
+                        yield "Only the owner can manage connections."
+                        return
+                    await self._status(emit, "Starting Codex sign-in…")
+                    login = await self._call(client, "POST", "/api/connections/codex")
+                    await self._status(emit, "Codex sign-in started", done=True)
+                    output = login.get("output", "").strip() or "(no output yet)"
+                    yield ("Open the link below, sign in with your ChatGPT account and enter the code. The box waits up to "
+                            "15 minutes; send `/connections` afterwards to confirm.\n\n```\n" + output[-2000:] + "\n```\n\n"
+                            "If it says device codes are disabled, enable *device code authorization for Codex* in "
+                            "ChatGPT → Settings → Security, then send `/connect codex` again.")
+                    return
+
+                await self._status(emit, "Preparing the workspace…")
+                attached = await self._upload_inputs(client, project, thread, __files__, images)
+                history, used = [], 0
+                for message in reversed(messages[:-1]):
+                    text, pictures = self._text(message.get("content"))
+                    text = re.sub(r"<details[\s\S]*?</details>", "", text).strip()
+                    entry = f"{message['role'].upper()}: {text}" + (" [image attached]" if pictures else "")
+                    if used + len(entry) > self.valves.HISTORY_CHARACTERS:
+                        history.append("(earlier messages omitted)")
+                        break
+                    history.append(entry)
+                    used += len(entry)
+                parts = []
+                if history:
+                    parts.append("CONVERSATION SO FAR (earlier turns of this chat):\n" + "\n\n".join(reversed(history)))
+                parts.append("CURRENT REQUEST:\n" + (request_text or "(see attached files)"))
+                if attached:
+                    parts.append("FILES THE USER JUST ATTACHED (in your workspace):\n" + "\n".join(f"- {p}" for p in attached))
+                profile = self.valves.OWNER_PROFILE if tier == "owner" else self.valves.GUEST_PROFILE
+                job = await self._call(client, "POST", "/api/jobs", json={
+                    "project": project, "task": "\n\n".join(parts), "skill": "cowork",
+                    "profile": profile if profile in {"fast", "balanced", "deep"} else "balanced",
+                    "allow_frontier": tier == "owner" and self.valves.OWNER_ESCALATION, "allow_images": self.valves.ALLOW_IMAGES,
+                    "thread": thread, "requested_by": user.get("email") or user.get("name") or ""})
+                identity = job["id"]
+                await self._status(emit, "Queued…")
+                after, plan, last_status, state = 0, [], "", None
+                last_keepalive = time.monotonic()
+                try:
+                    while True:
+                        state = await self._call(client, "GET", f"/api/jobs/{identity}/events", params={"after": after})
+                        plan = state.get("plan") or plan
+                        for event in state["events"]:
+                            after = max(after, event["id"])
+                            text = self._describe(event, plan)
+                            if text and text != last_status:
+                                await self._status(emit, text)
+                                last_status = text
+                        if state["status"] not in {"queued", "running"} and not state["events"]:
+                            break
+                        if time.monotonic() - last_keepalive > 15 and body.get("stream"):
+                            last_keepalive = time.monotonic()
+                            yield "data: " + json.dumps({"choices": [{"index": 0, "delta": {}, "finish_reason": None}]}) + "\n\n"
+                        await asyncio.sleep(1.5)
+                except asyncio.CancelledError:  # the user pressed stop
+                    try:
+                        async with self._client() as stopper:
+                            await stopper.post(f"/api/jobs/{identity}/cancel")
+                    except Exception:
+                        pass
+                    raise
+                files = await self._deliver(client, state.get("artifacts") or [], user, __request__, __metadata__ or {}, emit)
+                await self._status(emit, {"completed": "Done", "cancelled": "Stopped"}.get(state["status"], "Stopped early"), done=True)
+                if state["status"] == "completed":
+                    yield self._plan_block(plan) + (state.get("result") or "(no reply)") + files
+                elif state["status"] == "cancelled":
+                    yield "Stopped. Files made so far are still in this chat's workspace." + files
+                else:
+                    yield (self._plan_block(plan) + f"The task stopped before finishing: {state.get('error') or state['status']}\n\n"
+                           "Everything it made is still in this chat's workspace. Reply **continue** to pick up where it left off."
+                           + files)
+        except (httpx.HTTPError, ValueError, KeyError) as error:
+            await self._status(emit, "Could not reach the agent controller", done=True)
+            yield f"Could not reach the agent controller ({type(error).__name__}: {str(error)[:200]}). It may be restarting; try again in a minute."

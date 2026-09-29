@@ -25,12 +25,12 @@ IMAGE_SIZES = {"1024x1024", "1024x1536", "1536x1024", "1152x2048", "2048x1152",
                "2048x2048", "1536x2752", "2752x1536", "1696x2528", "2528x1696"}
 
 class CallBudget:
-    def __init__(self, job: dict):
+    def __init__(self, job: dict, limit: int | None = None):
         self.job = job
         self.calls = 0
         self.frontier = ws.query("SELECT COUNT(*) AS n FROM events WHERE job_id=? AND kind='frontier-call'", (job["id"],))[0]["n"]
         self.images = ws.query("SELECT COUNT(*) AS n FROM events WHERE job_id=? AND kind='image-request'", (job["id"],))[0]["n"]
-        self.limit = ws.PROFILES[job["profile"]]["turns"] * 2
+        self.limit = limit or ws.PROFILES[job["profile"]]["turns"] * 2
 
     def active(self):
         status = ws.query("SELECT status FROM jobs WHERE id=?", (self.job["id"],))
@@ -243,6 +243,9 @@ def build_team(job: dict, client, gate: asyncio.Semaphore) -> Agent:
 
 
 async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
+    if job["skill"] == "cowork":
+        import cowork
+        return await cowork.run_job(job, gate)
     gate = gate or asyncio.Semaphore(2)
     profile = ws.PROFILES[job["profile"]]
     client = hub.async_client()

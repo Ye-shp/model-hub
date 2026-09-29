@@ -69,6 +69,10 @@ def init() -> None:
         db.execute("INSERT OR IGNORE INTO projects VALUES (?,?,?,?)", ("default", "My workspace", "", store.now()))
         # Separate project for the Open WebUI Pipe, so invited friends never see the owner's own work.
         db.execute("INSERT OR IGNORE INTO projects VALUES (?,?,?,?)", ("friends", "Shared with invited friends", "", store.now()))
+        present = {r[1] for r in db.execute("PRAGMA table_info(jobs)")}
+        for name in ("thread", "requested_by"):  # added for Cowork chats; older databases gain them here
+            if name not in present:
+                db.execute(f"ALTER TABLE jobs ADD COLUMN {name} TEXT")
         db.commit()
     import coordination
     coordination.init()
@@ -161,17 +165,22 @@ def bounded_json(items: list[dict], limit: int = 12000) -> str:
                        "hint": "Request fewer/specific records if omitted is nonzero."}, ensure_ascii=False)
 
 
-def create_job(project: str, task: str, skill: str, profile: str = "balanced", allow_frontier: bool = False, allow_images: bool = False) -> str:
+def create_job(project: str, task: str, skill: str, profile: str = "balanced", allow_frontier: bool = False, allow_images: bool = False,
+               thread: str | None = None, requested_by: str | None = None) -> str:
     from skills import load_skill
     load_skill(skill)
     if profile not in PROFILES or not project_exists(project):
         raise ValueError("Unknown project or speed profile")
-    if not task.strip() or len(task) > 16000:
-        raise ValueError("Write a task up to 16000 characters")
+    limit = 120000 if skill == "cowork" else 16000  # Cowork tasks carry the chat so far
+    if not task.strip() or len(task) > limit:
+        raise ValueError(f"Write a task up to {limit} characters")
+    if thread is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", thread):
+        raise ValueError("Invalid thread")
     job = uuid.uuid4().hex
     with connection() as db, db:
-        db.execute("""INSERT INTO jobs(id,project,task,skill,profile,status,allow_frontier,allow_images,created_at)
-          VALUES (?,?,?,?,?,'queued',?,?,?)""", (job, project, task, skill, profile, int(allow_frontier), int(allow_images), store.now()))
+        db.execute("""INSERT INTO jobs(id,project,task,skill,profile,status,allow_frontier,allow_images,created_at,thread,requested_by)
+          VALUES (?,?,?,?,?,'queued',?,?,?,?,?)""", (job, project, task, skill, profile, int(allow_frontier), int(allow_images), store.now(),
+                                                   thread, (requested_by or "")[:200] or None))
     event(job, "queued", "Waiting for a worker")
     return job
 
@@ -184,9 +193,11 @@ def event(job: str, kind: str, detail: str) -> None:
 def claim_job() -> dict | None:
     with connection() as db, db:
         db.execute("BEGIN IMMEDIATE")
-        # One job per project at a time prevents two agents overwriting a project's decisions.
+        # One job per project at a time prevents two agents overwriting a project's decisions. Cowork chats
+        # each have their own thread (and folder), so different chats run side by side; one chat runs in order.
         row = db.execute("""SELECT * FROM jobs j WHERE status='queued' AND NOT EXISTS
-            (SELECT 1 FROM jobs r WHERE r.project=j.project AND r.status='running') ORDER BY created_at,rowid LIMIT 1""").fetchone()
+            (SELECT 1 FROM jobs r WHERE r.project=j.project AND IFNULL(r.thread,'')=IFNULL(j.thread,'') AND r.status='running')
+            ORDER BY created_at,rowid LIMIT 1""").fetchone()
         if not row:
             return None
         now = store.now()

@@ -50,10 +50,11 @@ async def execute(job: dict, gate: asyncio.Semaphore, runner):
         result = await task
         if ws.query("SELECT status FROM jobs WHERE id=?", (job["id"],))[0]["status"] != "running":
             return
-        artifact = ws.write_artifact(job["project"], job["id"], "task-result.md", result.encode())
-        ws.save_note(job["project"], f"Task {job['id'][:8]}",
-                     f"Completed: {job['task'][:1000]}\nResult artifact: {artifact['id']}\n{result[:3500]}",
-                     "checkpoint", [f"artifact:{artifact['id']}"])
+        if job["skill"] != "cowork":  # Cowork replies live in the chat; its files are shared explicitly
+            artifact = ws.write_artifact(job["project"], job["id"], "task-result.md", result.encode())
+            ws.save_note(job["project"], f"Task {job['id'][:8]}",
+                         f"Completed: {job['task'][:1000]}\nResult artifact: {artifact['id']}\n{result[:3500]}",
+                         "checkpoint", [f"artifact:{artifact['id']}"])
         ws.finish_job(job["id"], "completed", result=result)
     except asyncio.CancelledError:
         task.cancel()
@@ -72,8 +73,10 @@ async def execute(job: dict, gate: asyncio.Semaphore, runner):
         ws.finish_job(job["id"], "failed", error=f"{type(error).__name__}: {message[:1200]}")
 
 
-async def serve(runner, configured, slots: int = 1):
-    gate = asyncio.Semaphore(2)
+async def serve(runner, configured, slots: int | None = None):
+    # Jobs that run at once, and model calls in flight across all of them (each GPU serves 3 at a time).
+    slots = slots or int(os.environ.get("AGENT_SLOTS", "4"))
+    gate = asyncio.Semaphore(int(os.environ.get("AGENT_MODEL_CALLS", "6")))
     running = set()
     try:
         while True:

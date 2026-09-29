@@ -2,3 +2,6 @@ openai-agents==0.22.3
 pillow==12.3.0
 fastapi==0.141.1
 uvicorn==0.54.0
+ddgs==9.16.0
+trafilatura==2.2.0
+pypdf==6.19.0

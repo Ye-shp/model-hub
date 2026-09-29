@@ -31,11 +31,20 @@ class ProjectIn(BaseModel):
 
 class JobIn(BaseModel):
     project: str = "default"
-    task: str = Field(min_length=1, max_length=16000)
+    task: str = Field(min_length=1, max_length=120000)
     skill: str = "research-brief"
     profile: str = "balanced"
     allow_frontier: bool = False
     allow_images: bool = False
+    thread: str | None = Field(default=None, max_length=80)
+    requested_by: str | None = Field(default=None, max_length=200)
+
+
+class UploadIn(BaseModel):
+    project: str
+    thread: str = Field(min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=200)
+    content_b64: str
 
 
 class DocumentIn(BaseModel):
@@ -110,7 +119,8 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
             if origin and origin not in {public_url, f"http://{request.headers.get('host')}", f"https://{request.headers.get('host')}"}:
                 return JSONResponse({"error": "Unexpected origin"}, status_code=403)
             try:
-                if int(request.headers.get("content-length", "0")) > 3_000_000:
+                limit = 70_000_000 if request.url.path == "/api/workspace/upload" else 3_000_000
+                if int(request.headers.get("content-length", "0")) > limit:
                     return JSONResponse({"error": "Upload is too large"}, status_code=413)
             except ValueError:
                 return JSONResponse({"error": "Invalid content length"}, status_code=400)
@@ -149,7 +159,8 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
 
     @app.post("/api/jobs", status_code=201)
     def new_job(body: JobIn):
-        if body.allow_frontier and not hub.FRONTIER_MODEL:
+        # For Cowork, allow_frontier means "may hand work to Claude Code / Codex" (checked when it runs).
+        if body.allow_frontier and not hub.FRONTIER_MODEL and body.skill != "cowork":
             raise ValueError("Configure FRONTIER_MODEL before enabling paid advice")
         return {"id": ws.create_job(**body.model_dump())}
 
@@ -159,6 +170,40 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         if not rows:
             raise HTTPException(404, "Task not found")
         return {**rows[0], "plan": coordination.plan(job), "events": ws.query("SELECT * FROM events WHERE job_id=? ORDER BY id DESC LIMIT 100", (job,))}
+
+    @app.get("/api/jobs/{job}/events")
+    def job_events(job: str, after: int = 0):
+        rows = ws.query("SELECT status,result,error FROM jobs WHERE id=?", (job,))
+        if not rows:
+            raise HTTPException(404, "Task not found")
+        return {**rows[0], "plan": coordination.plan(job),
+                "events": ws.query("SELECT id,kind,detail,created_at FROM events WHERE job_id=? AND id>? ORDER BY id LIMIT 200", (job, after)),
+                "artifacts": ws.query("SELECT id,name,media_type FROM artifacts WHERE job_id=? ORDER BY created_at,rowid", (job,))}
+
+    @app.post("/api/workspace/upload", status_code=201)
+    def upload(body: UploadIn):
+        """A file the user attached in a Cowork chat, saved into that chat's workspace uploads/ folder."""
+        import base64, binascii, cowork, sandbox
+        if not ws.project_exists(body.project):
+            raise HTTPException(404, "Project not found")
+        try:
+            content = base64.b64decode(body.content_b64, validate=True)
+        except binascii.Error:
+            raise ValueError("content_b64 is not valid base64") from None
+        space = sandbox.Workspace(cowork.tier_for({"project": body.project}), body.thread).prepare()
+        name = Path(body.name).name.replace("\x00", "")[:200] or "upload"
+        target = space.write_bytes(f"uploads/{name}", content)
+        return {"path": space.relative(target), "bytes": len(content)}
+
+    @app.get("/api/connections")
+    def connections():
+        import escalate
+        return escalate.status()
+
+    @app.post("/api/connections/codex")
+    async def connect_codex():
+        import escalate
+        return await escalate.codex_login()
 
     @app.post("/api/jobs/{job}/review")
     def review(job: str):
