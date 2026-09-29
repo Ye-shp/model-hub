@@ -21,6 +21,7 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu13
 WORKDIR /opt/image
 COPY services/image_server.py ./
 COPY deploy/image/start.sh ./
-ENV IMAGE_MODEL_DIR=/workspace/image-models HF_HOME=/workspace/hf-cache PYTHONUNBUFFERED=1
+ENV IMAGE_MODEL_DIR=/workspace/image-models HF_HOME=/workspace/hf-cache PYTHONUNBUFFERED=1 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 HEALTHCHECK --interval=60s --timeout=10s --start-period=60m CMD ["curl", "-fsS", "http://127.0.0.1:8090/health"]
 ENTRYPOINT ["/bin/sh", "/opt/image/start.sh"]

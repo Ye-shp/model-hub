@@ -92,6 +92,8 @@ class QwenImageRenderer:
             # 24 GB cards cannot hold the 17.5 GB encoder and the 14 GB transformer at once; each stage
             # moves to the GPU only while it runs.
             self.pipeline.enable_model_cpu_offload()
+        # Decode large (2K) images in tiles: a full-frame 2K decode needs ~5 GB more than a 24 GB card has left.
+        self.pipeline.vae.enable_tiling()
 
     def __call__(self, prompt, width, height, steps=DEFAULT_STEPS, seed=None, negative_prompt=None):
         generator = self.torch.Generator("cpu").manual_seed(seed) if seed is not None else None
