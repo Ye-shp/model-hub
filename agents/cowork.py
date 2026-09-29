@@ -136,7 +136,9 @@ def build(job: dict, client, gate: asyncio.Semaphore, space: sandbox.Workspace) 
     images = {"count": 0}
 
     def log(kind: str, detail: str):
-        ws.event(job_id, kind, detail)
+        # Status lines read better without the long workspace path the model tends to repeat.
+        folder = str(space.dir)
+        ws.event(job_id, kind, detail.replace("cd " + folder + " && ", "").replace(folder + "/", "").replace(folder, "."))
 
     # ---- workspace ----
     @function_tool
