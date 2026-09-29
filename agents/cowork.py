@@ -49,7 +49,8 @@ def describe(command: str, limit: int = 90) -> str:
 
 
 def instructions(job: dict, space: sandbox.Workspace, helper: bool = False, escalation: list[str] | None = None) -> str:
-    today = datetime.now(timezone.utc).strftime("%A %d %B %Y")
+    now = datetime.now(timezone.utc)
+    today = f"{now:%A %d %B %Y} (it is {now.year}: search for {now.year} information, not earlier years, when asked about 'now')"
     shared = ("Deliverables: write them as files in the workspace (reports .md/.docx/.pdf, tables .csv/.xlsx, code, media) "
               "and call share_file for each file the user should receive. Don't paste whole files into your reply.")
     if helper:
