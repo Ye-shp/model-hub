@@ -200,6 +200,15 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         import escalate
         return escalate.status()
 
+    class TokenIn(BaseModel):
+        token: str = Field(min_length=20, max_length=400)
+
+    @app.post("/api/connections/claude")
+    def connect_claude(body: TokenIn):
+        import escalate
+        escalate.save_claude_token(body.token)
+        return escalate.status()["claude"]
+
     @app.post("/api/connections/codex")
     async def connect_codex():
         import escalate

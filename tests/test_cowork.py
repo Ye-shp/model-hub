@@ -247,3 +247,12 @@ class PipeTests(Base):
         self.assertEqual((job["project"], job["allow_frontier"]), ("friends", 0))
         reply, _, _ = self.collect({"messages": [{"role": "user", "content": "/connect codex"}]}, {"role": "user", "email": "friend@example.com"})
         self.assertIn("Only the owner", reply)
+
+
+class ConnectionTests(Base):
+    def test_claude_token_from_chat_is_validated_and_stored_privately(self):
+        with self.assertRaises(ValueError):
+            escalate.save_claude_token("not-a-token")
+        escalate.save_claude_token("sk-ant-oat01-" + "a" * 40)
+        self.assertEqual(oct(escalate.token_file().stat().st_mode & 0o777), "0o600")
+        self.assertEqual(escalate.claude_env()["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat01-" + "a" * 40)

@@ -22,7 +22,8 @@ HELP = """**Qwen Cowork** — say what you want accomplished; it plans, works wi
 Each chat has its own workspace folder that persists, so follow-ups build on earlier files. Attach files and they land in `uploads/`.
 Pressing stop cancels the task.
 
-Owner commands: `/connections` (Claude Code / Codex status) · `/connect codex` (sign Codex in with your ChatGPT account)."""
+Owner commands: `/connections` (Claude Code / Codex status) · `/connect claude TOKEN` (token from `claude setup-token`) ·
+`/connect codex` (sign Codex in with your ChatGPT account)."""
 
 SKIP = {"model", "usage", "queued", "completed", "failed", "interrupted", "cancelled", "resumed", "frontier-call"}
 
@@ -213,8 +214,21 @@ class Pipe:
                     rows = [f"- **{'Claude Code' if k == 'claude' else 'Codex'}**: "
                             f"{'connected' if v['signed_in'] else 'not connected'}{'' if v['installed'] else ' (not installed)'}; "
                             f"{v['used_today']}/{v['daily_limit']} tasks in the last 24 h" for k, v in info.items()]
-                    yield "\n".join(rows + ["", "Claude Code signs in with `CLAUDE_CODE_OAUTH_TOKEN` in the instance settings; "
-                                                 "send `/connect codex` to sign Codex in."])
+                    yield "\n".join(rows + ["", "To connect Claude Code: run `claude setup-token` on your computer, then send "
+                                                 "`/connect claude <token>`. To connect Codex: send `/connect codex`."])
+                    return
+                if command.startswith("/connect claude"):
+                    if tier != "owner":
+                        yield "Only the owner can manage connections."
+                        return
+                    token = request_text.split(None, 2)[2].strip() if len(request_text.split(None, 2)) == 3 else ""
+                    if not token:
+                        yield ("Run `claude setup-token` on a computer where you use Claude Code, then send "
+                               "`/connect claude <the sk-ant-… token it prints>`.")
+                        return
+                    info = await self._call(client, "POST", "/api/connections/claude", json={"token": token})
+                    yield ("Claude Code is connected. Cowork can now hand work to it. You can delete this message from the chat "
+                           "(the token is stored only on the box)." if info.get("signed_in") else "Saved, but Claude Code still isn't ready.")
                     return
                 if command == "/connect codex":
                     if tier != "owner":

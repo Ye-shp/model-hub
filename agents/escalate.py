@@ -35,8 +35,28 @@ def owner() -> Workspace:
     return Workspace("owner", "connections").prepare()
 
 
+def token_file():
+    import store
+    return store.DATA / "claude-token"
+
+
+def save_claude_token(token: str) -> None:
+    """Token from `claude setup-token`, sent with /connect claude. Kept root-only on the box's disk."""
+    token = token.strip()
+    if not re.fullmatch(r"sk-ant-[A-Za-z0-9_-]{20,300}", token):
+        raise ValueError("That doesn't look like a Claude token (it starts with sk-ant-)")
+    path = token_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(token)
+
+
 def claude_env() -> dict:
     env = {k: os.environ[k] for k in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY") if os.environ.get(k)}
+    saved = token_file()
+    if saved.is_file():  # a token sent from the chat wins over the instance setting (it is the newer one)
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = saved.read_text().strip()
     return {**QUIET, **env}
 
 
@@ -66,7 +86,7 @@ def available(kind: str) -> str | None:
     if not info["installed"]:
         return f"{kind} is not installed on this box"
     if not info["signed_in"]:
-        return {"claude": "Claude Code is not signed in (set CLAUDE_CODE_OAUTH_TOKEN in the instance settings)",
+        return {"claude": "Claude Code is not signed in (send /connect claude in the chat)",
                 "codex": "Codex is not signed in (send /connect codex in the chat)"}[kind]
     if info["used_today"] >= info["daily_limit"]:
         return f"{kind} daily limit reached ({info['daily_limit']} tasks per 24 hours)"
