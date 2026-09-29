@@ -16,6 +16,8 @@ keep() {  # name, command...: restart with a short backoff if it exits
 }
 
 # The tunnel gets only its token; the server never sees it.
-keep cloudflared env -i PATH="$PATH" HOME=/root TUNNEL_TOKEN="$TUNNEL_TOKEN" /usr/bin/cloudflared tunnel --no-autoupdate run &
+# HTTP/2 over TCP instead of the default QUIC: during a long render the QUIC connection hit
+# "timeout: no recent network activity" and dropped the request (seen on the live box).
+keep cloudflared env -i PATH="$PATH" HOME=/root TUNNEL_TOKEN="$TUNNEL_TOKEN" /usr/bin/cloudflared tunnel --no-autoupdate --protocol "${TUNNEL_PROTOCOL:-http2}" run &
 unset TUNNEL_TOKEN  # the background tunnel loop already has its copy
 keep image-server python /opt/image/image_server.py
