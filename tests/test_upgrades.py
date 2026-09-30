@@ -210,6 +210,10 @@ class AccountTests(Base):
 
 
 class PhoneTests(Base):
+    def tearDown(self):
+        phone_link.BRIDGE.__init__()  # don't leave a "connected" phone behind for other tests
+        super().tearDown()
+
     def test_bridge_round_trip_auth_and_guarded_taps(self):
         app = console.create_app("k" * 40, run_worker=False)
         client = TestClient(app)

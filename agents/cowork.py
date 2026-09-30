@@ -178,7 +178,7 @@ def current_request(task: str) -> str:
 
 def _attempt_summary(title: str, job: dict, events: list[dict], result: str = "") -> str:
     lines = [title, f"Status: {job['status']}" + (f" — {job['error']}" if job.get("error") else "")]
-    lines.append("Request: " + _cut(current_request(job["task"]).strip(), 1500))
+    lines.append("Request: " + _cut(current_request(job.get("task") or "").strip(), 1500))
     plan = coordination.plan(job["id"])
     if plan:
         marks = {"completed": "done", "in_progress": "was in progress", "pending": "not started"}
@@ -578,7 +578,7 @@ def build(job: dict, client, gate: asyncio.Semaphore, space: sandbox.Workspace, 
         import phone_link
         if phone_link.connected():
             phone = True
-            tools += phone_link.agent_tools(job, log, budget, current_request(job["task"]), client, gate)
+            tools += phone_link.agent_tools(job, log, budget, current_request(job.get("task") or ""), client, gate)
 
     escalation = []
     if space.is_owner and job["allow_frontier"]:
