@@ -58,5 +58,6 @@ export function readConfig(env = process.env) {
     maxOutputTokens: int(env.MAX_OUTPUT_TOKENS, 32768, 256, 262144),
     frontierMonthlyCalls: int(env.FRONTIER_MONTHLY_CALLS, 300, 0, 10000000),
     bodyLimit: int(env.BODY_LIMIT_BYTES, 33554432, 65536, 209715200),
+    controllerUrl: env.ENABLE_AGENT_CONSOLE === 'true' ? (env.CONTROLLER_URL || 'http://127.0.0.1:8787').replace(/\/$/, '') : '',
   };
 }

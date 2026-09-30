@@ -34,7 +34,7 @@ export function createApp({config, clients, ledger, fetcher = fetch, log = () =>
   const adminHash = config.adminKey ? hashKey(config.adminKey) : null;
   app.addHook('onRequest', async (req, reply) => {
     reply.header('cache-control', 'no-store');
-    if (req.url === '/health') return;
+    if (req.url === '/health' || req.url.startsWith('/bridge/')) return;  // the phone bridge has its own key (checked by the controller)
     if (req.url.startsWith('/admin/')) {
       const header = req.headers.authorization;
       const given = typeof header === 'string' && header.startsWith('Bearer ') ? hashKey(header.slice(7).trim()) : '';
@@ -91,6 +91,25 @@ export function createApp({config, clients, ledger, fetcher = fetch, log = () =>
     catch (error) { return fail(reply, 400, error.message); }
   });
   app.delete('/admin/keys/:name', async (req, reply) => (clients.remove(req.params.name) ? {removed: req.params.name} : fail(reply, 404, 'No key with that name.', 'not_found_error')));
+
+  // The phone bridge on the owner's PC reaches the agent controller through here (api.<domain> has no
+  // Cloudflare Access login). Only these two endpoints are passed through; the controller checks the bridge key.
+  for (const path of ['/bridge/poll', '/bridge/result']) {
+    app.post(path, async (req, reply) => {
+      if (!config.controllerUrl) return fail(reply, 404, 'The agent controller is not enabled on this hub.', 'not_found_error');
+      try {
+        const upstream = await fetcher(config.controllerUrl + path, {
+          method: 'POST', redirect: 'error', signal: AbortSignal.timeout(90000),
+          headers: {'content-type': 'application/json', authorization: String(req.headers.authorization || '')},
+          body: JSON.stringify(req.body ?? {}),
+        });
+        const text = await upstream.text();
+        return reply.code(upstream.status).header('content-type', 'application/json').send(text);
+      } catch {
+        return fail(reply, 502, 'The agent controller is not reachable right now.', 'upstream_error');
+      }
+    });
+  }
 
   app.post('/v1/chat/completions', async (req, reply) => {
     const model = resolve(req.client, req.body?.model);

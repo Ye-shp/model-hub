@@ -39,6 +39,22 @@ const gpus = execFileSync('nvidia-smi', ['--query-gpu=index,name,memory.total', 
 console.log(`GPUs:\n  ${gpus.join('\n  ')}`);
 if (gpus.length < 2) throw new Error('Two GPUs are required: one per resident model.');
 
+// Moving to a new box (see agents/migrate.py): with RESTORE_KEY set, wait for the old box to send its data
+// before anything creates keys or databases here. Only happens once per data folder (DATA/.restored).
+if (env.RESTORE_KEY) {
+  const restored = await access(join(DATA, '.restored')).then(() => true, () => false);
+  if (!restored) {
+    console.log(`[supervisor] waiting for the old box's data on port ${env.RESTORE_PORT || 9000} (RESTORE_KEY is set)`);
+    await new Promise(resolve => {
+      const child = spawn('/opt/agents/bin/python', [join(APP, 'agents', 'migrate.py'), 'receive'], {stdio: ['ignore', 'inherit', 'inherit'],
+        env: {PATH: env.PATH, RESTORE_KEY: env.RESTORE_KEY, RESTORE_PORT: env.RESTORE_PORT || '9000', DATA_DIR: DATA,
+              COWORK_ROOT: env.COWORK_ROOT || '/workspace/cowork', PYTHONUNBUFFERED: '1'}});
+      child.on('exit', code => { console.log(`[supervisor] restore finished (code ${code})`); resolve(); });
+      child.on('error', error => { console.error(`[supervisor] restore could not start: ${error.message}`); resolve(); });
+    });
+  }
+}
+
 await mkdir(DATA, {recursive: true});
 // Keys and databases live here; Cowork's sandbox users must not be able to read them.
 await chmod(DATA, 0o700);
@@ -68,7 +84,7 @@ const setStatus = (phase, detail = '') => writeFile(STATUS, JSON.stringify({phas
 // your frontier API keys or the tunnel token.
 const BASE = Object.fromEntries(Object.entries(env).filter(([k]) =>
   ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TZ', 'LD_LIBRARY_PATH'].includes(k) || k.startsWith('NVIDIA_') || k.startsWith('CUDA_')));
-const GATEWAY_ENV = Object.fromEntries(Object.entries(env).filter(([k]) => !['TUNNEL_TOKEN', 'WEBUI_SECRET_KEY', 'HF_TOKEN', 'CONSOLE_KEY'].includes(k)));
+const GATEWAY_ENV = Object.fromEntries(Object.entries(env).filter(([k]) => !['TUNNEL_TOKEN', 'WEBUI_SECRET_KEY', 'HF_TOKEN', 'CONSOLE_KEY', 'RESTORE_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'].includes(k)));
 
 const children = new Set();
 let stopping = false;
@@ -131,11 +147,15 @@ if (env.ENABLE_AGENT_CONSOLE === 'true') {
     HUB_DATA_DIR: join(DATA, 'agent-workspace'), FRONTIER_MODEL: env.AGENT_FRONTIER_MODEL || '',
     CONSOLE_URL: env.CONSOLE_URL || '', CONSOLE_KEY: env.CONSOLE_KEY || '',
     // Qwen Cowork: sandboxed workspaces, and sign-ins for handing work to Claude Code / Codex.
-    COWORK_ROOT: env.COWORK_ROOT || '/workspace/cowork', HUB_CODE_DIR: CODE_ROOT,
+    COWORK_ROOT: env.COWORK_ROOT || '/workspace/cowork', HUB_CODE_DIR: CODE_ROOT, HUB_ROOT_DATA_DIR: DATA, MODEL_DIR: MODELS,
+    // Shown on the console: the image box's health, and the address the phone bridge on the PC connects to.
+    MODEL3_URL: env.MODEL3_URL || '', BRIDGE_PUBLIC_URL: env.BRIDGE_PUBLIC_URL || (env.WEBUI_URL || '').replace('://hub.', '://api.'),
     // Opens console.<domain> without the owner key for the owner signed in through Cloudflare Access.
     OWNER_EMAIL: env.OWNER_EMAIL || '', ACCESS_TEAM: env.ACCESS_TEAM || '', CONSOLE_ACCESS_AUD: env.CONSOLE_ACCESS_AUD || '',
     ...Object.fromEntries(['CLAUDE_CODE_OAUTH_TOKEN', 'CODEX_API_KEY', 'BRAVE_API_KEY', 'CLAUDE_MODEL', 'CODEX_MODEL',
-      'CLAUDE_DAILY_TASKS', 'CODEX_DAILY_TASKS', 'ESCALATION_TIMEOUT', 'AGENT_SLOTS', 'AGENT_MODEL_CALLS']
+      'CLAUDE_DAILY_TASKS', 'CODEX_DAILY_TASKS', 'ESCALATION_TIMEOUT', 'AGENT_SLOTS', 'AGENT_MODEL_CALLS',
+      'COWORK_MIN_FREE_GB', 'COWORK_FRIEND_QUOTA_GB', 'COWORK_MAX_PHASES', 'COWORK_FRIEND_MAX_PHASES', 'COWORK_HELPER_MODEL',
+      'COWORK_CONTEXT_SOFT_CHARS', 'COWORK_CONTEXT_HARD_CHARS']
       .filter(k => env[k]).map(k => [k, env[k]])),
     // Claude Code bills an API key instead of your Claude plan when one is present, so only pass it on request.
     ...(env.CLAUDE_USE_API_KEY === 'true' && env.ANTHROPIC_API_KEY ? {ANTHROPIC_API_KEY: env.ANTHROPIC_API_KEY} : {}),
@@ -172,7 +192,9 @@ keepRunning('open-webui', '/opt/openwebui/bin/python',
   } : {}),
 });
 
-keepRunning('cloudflared', '/usr/bin/cloudflared', ['tunnel', '--no-autoupdate', 'run'], {...BASE, TUNNEL_TOKEN: env.TUNNEL_TOKEN});
+// HTTP/2 over TCP by default: on some rentals QUIC (UDP) keeps timing out and the tunnel drops for minutes.
+keepRunning('cloudflared', '/usr/bin/cloudflared', ['tunnel', '--no-autoupdate', '--protocol', env.TUNNEL_PROTOCOL || 'http2', 'run'],
+  {...BASE, TUNNEL_TOKEN: env.TUNNEL_TOKEN});
 
 // Install Qwen Cowork and the agent teams into the chat site on every start (webui_install.mjs).
 // Loaded from the active app code, so installer fixes also arrive with /update-code.

@@ -34,11 +34,6 @@ export async function installAgents({env, socket, dataDir, integrations = '/opt/
       valves: key => ({CONTROLLER_URL: 'http://127.0.0.1:8787', OWNER_KEY: key, ALLOWED_EMAILS: env.PIPE_ALLOWED_EMAILS || '',
         OWNER_PROFILE: env.COWORK_PROFILE || 'balanced', GUEST_PROFILE: env.COWORK_GUEST_PROFILE || 'balanced',
         ALLOW_IMAGES: imagesOn, OWNER_ESCALATION: env.COWORK_ESCALATION !== 'false'})},
-    {id: 'model_hub', name: 'Hub', file: 'openwebui_pipe.py',
-      description: 'Model Hub agent team: durable jobs with skills, subagents and project memory',
-      valves: key => ({CONTROLLER_URL: 'http://127.0.0.1:8787', OWNER_KEY: key, PROJECT_ID: env.PIPE_PROJECT || 'friends',
-        PROFILE: env.PIPE_PROFILE || 'balanced', ALLOWED_EMAILS: env.PIPE_ALLOWED_EMAILS || '',
-        ALLOW_IMAGES: imagesOn, ALLOW_FRONTIER: env.PIPE_ALLOW_FRONTIER === 'true'})},
   ];
   for (let attempt = 1; attempt <= attempts && !stopping(); attempt++) {
     try {
@@ -66,13 +61,27 @@ export async function installAgents({env, socket, dataDir, integrations = '/opt/
         const current = (await call(`/functions/id/${fn.id}`, {headers})).json();
         if (!current.is_active) await call(`/functions/id/${fn.id}/toggle`, {method: 'POST', headers});
       }
-      // Every signed-in user may pick these models (the Pipes themselves check who is invited).
-      const everyone = [{principal_type: 'user', principal_id: '*', permission: 'read'}];
-      for (const [id, name] of [['cowork', 'Qwen Cowork'], ['qwen-1', 'qwen-1'], ['qwen-2', 'qwen-2']]) {
-        const r = await call('/models/model/access/update', {method: 'POST', headers, body: JSON.stringify({id, name, access_grants: everyone})});
-        if (!r.ok) log.error(`[supervisor] could not share model ${id}: HTTP ${r.status} ${r.text.slice(0, 200)}`);
+      // The older "Hub · …" team models are retired: Qwen Cowork does all of it.
+      for (const retired of ['model_hub']) {
+        if ((await call(`/functions/id/${retired}`, {headers})).ok) {
+          const r = await call(`/functions/id/${retired}/delete`, {method: 'DELETE', headers});
+          log.log(`[supervisor] removed the retired ${retired} function (${r.ok ? 'ok' : `HTTP ${r.status}`})`);
+        }
       }
-      log.log('[supervisor] Qwen Cowork and the agent teams are installed in the chat site');
+      // The model list shows Qwen Cowork and plain "qwen" chat. qwen-1/qwen-2 stay usable (chat titles use
+      // qwen-2) but are hidden from the picker. The Pipe itself checks who is invited.
+      const everyone = [{principal_type: 'user', principal_id: '*', permission: 'read'}];
+      for (const [id, name, hidden] of [['cowork', 'Qwen Cowork', false], ['qwen', 'Qwen (chat)', false],
+                                        ['qwen-1', 'qwen-1', true], ['qwen-2', 'qwen-2', true]]) {
+        const r = await call('/models/model/access/update', {method: 'POST', headers, body: JSON.stringify({id, name, access_grants: everyone})});
+        if (!r.ok) { log.error(`[supervisor] could not share model ${id}: HTTP ${r.status} ${r.text.slice(0, 200)}`); continue; }
+        const model = r.json() || {};
+        if (Boolean(model.meta?.hidden) === hidden) continue;
+        const u = await call('/models/model/update', {method: 'POST', headers, body: JSON.stringify({
+          id, name: model.name || name, meta: {...(model.meta || {}), hidden}, params: model.params || {}})});
+        if (!u.ok) log.error(`[supervisor] could not ${hidden ? 'hide' : 'show'} model ${id}: HTTP ${u.status} ${u.text.slice(0, 200)}`);
+      }
+      log.log('[supervisor] Qwen Cowork is installed in the chat site');
       return;
     } catch (error) {
       if (attempt % 6 === 1) log.log(`[supervisor] waiting to install the agents in the chat site (${error.message})`);

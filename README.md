@@ -1,61 +1,63 @@
-# Model Hub v3 — Open WebUI + a durable agent team
+# Model Hub
 
-Local extension of Claude's v2 project for your two RTX 3090s. **Open WebUI remains the chat website**, including direct access to the resident models. A new Open WebUI Pipe adds project-aware team tasks. An optional owner panel manages documents, memory, outputs and background jobs.
-
-Nothing in this package has been deployed to your rental or pushed to GitHub. The original v2 archive is unchanged.
-
-## Start here
-
-1. [Start the controller and connect Open WebUI](START-HERE.md).
-2. [Install the Open WebUI Pipe](docs/OPEN-WEBUI.md).
-3. [Review what was adapted from AgentMatrix](docs/AGENTMATRIX-REVIEW.md).
-4. [Choose an optional third model](docs/THIRD-MODEL.md).
-5. [Plan the future server upgrade](docs/UPGRADE.md). Fresh-server instructions are in [Deployment](docs/DEPLOYMENT.md).
-
-## What it adds
-
-| Capability | What you can do |
-|---|---|
-| Open WebUI team models | Choose research, content, trends, planning, code review, decisions or visual production from the model selector |
-| Persistent projects | Import text, search evidence locally, retain preferences and decisions, save reports and original drafts |
-| Team execution | Lead, researcher, analyst, writer and critic share scoped tools and source references |
-| Resumable jobs | Queue, cancel, inspect or resume work; enforce time, turn and model-call allowances |
-| Plans and attention | See saved steps, overdue worker heartbeats, interrupted jobs and results awaiting review |
-| Handoff exports | Carry the brief, decisions, source IDs, output references and next steps into another session |
-| Optional frontier advice | Up to two advisor calls per job when explicitly enabled, including resumed attempts |
-| Image generation | Qwen-Image-2.1 with an abliterated text encoder on its own GPU box (non-commercial license); CPU transcription importer for supplied clips |
-| Phone preparation | Selected-device collection, multiple frames, evidence storage and bounded batches of up to ten connected devices |
-| Gateway improvements | Bounded queues, coherent streaming heartbeats, real error statuses, cancellation and private usage metrics |
-
-The controller is CPU software. It does not load another text model. It sends inference to the two existing resident models through your gateway.
+A self-hosted AI workspace on rented GPUs. Two abliterated Qwen3.8-27B models run around the clock, and **Qwen Cowork** turns them into an agent that does real work: it plans, uses a shell, files, the web, parallel helper agents, image generation, your Android phone, and hands hard parts to Claude Code or Codex.
 
 ```text
-You / invited users → Open WebUI → direct model chat → gateway → two resident GPUs
-                             └→ Hub team Pipe → controller → gateway
-                                                    ├→ projects, evidence, notes, jobs
-                                                    └→ optional frontier / image service
-Owner only → optional operations panel ──────────────┘
+You / invited friends ─▶ hub.handydandy.cc ── Cloudflare Access ─┐
+Owner only ────────────▶ console.handydandy.cc ─ Access ─────────┤  Cloudflare Tunnel (outbound only)
+Programs, phone bridge ─▶ api.handydandy.cc ── API / bridge key ─┤
+                                                                 ▼
+Chat box (Vast, 2× V100 32 GB)                                   Image box (Vast)
+  Open WebUI (chat site) ─▶ Qwen Cowork pipe ─▶ controller :8787   Qwen-Image-2.1 service
+  gateway :8080 ─▶ qwen-1 (GPU 0), qwen-2 (GPU 1), flex ───────────▶ img.handydandy.cc
 ```
 
-## Limits worth designing around
+## Using it
 
-Two 3090s do not make these models equivalent to frontier models. Retrieval, short delegated tasks, saved plans and checkpoints improve continuity; no mechanism here guarantees lossless unlimited context. Large histories can still exceed the model's context window. Use focused briefs and import source material instead of pasting everything into one prompt.
+Pick **Qwen Cowork** in the chat site's model list. (**Qwen (chat)** is the plain model with no tools.)
 
-The third image model requires capacity of its own if both 27B residents must stay loaded. The optional models are not downloaded by starting the normal controller. Frontier and third-slot charges are separate; call caps are not dollar caps.
+- **Just say what you want done.** Each chat has its own folder on the box, so follow-up messages build on earlier files. Attached files land in `uploads/`.
+- **Big projects:** ask for a plan first. Cowork keeps `plan.md` in the chat folder and does one phase per task. When a phase finishes, it can start the next one automatically in the same chat: up to 6 phases in a row for you, 2 for friends. After that, reply **continue**.
+- **Claude Code / Codex:** say "use Claude Code for …" to hand work over. If a hand-off fails, the task stops right away and reports what happened. `/connections` shows their status.
+- **If a task stops early** (time limit or failed hand-off), you still get a report. Reply **continue** and the next task gets a summary of what was done, so finished steps aren't redone.
+- **If the page reloads or loses contact**, send **status** to follow the task that's still running.
+- **Phone:** when the phone bridge is connected (see below), Cowork can look at and operate the phone and collect TikTok/Instagram posts. Taps that would post, send, comment, follow, like or buy are blocked unless your message approves them, for example "approved, post it".
 
-There is no autonomous social publishing, cloud-phone provisioning, live web search, arbitrary shell execution or video renderer in this version. Phone collection reads a sample of screenshots, not full video and audio. Code-review skills inspect supplied text without executing it.
+Behind the scenes:
 
-All users of a Pipe share its configured project. The owner panel key controls all projects. Use separate Pipe configurations and explicit invitations for different groups; this is not a full tenant-per-account system.
+- **Long runs:** old tool output is shortened before every model call, so long runs don't overflow the context.
+- **Helpers** always run on the second GPU.
+- **Disk:** new work is refused when disk space runs low, but deleting files still works.
+- **Friends:** each invited friend has their own sandbox user, folders and memory, with a 5 GB allowance.
 
-## Verify
+## Console (console.handydandy.cc)
 
-Use Node 22+ and Python 3.11+ with `agents/requirements.txt` installed:
+| Page | What it's for |
+|---|---|
+| Now | GPU load, model queues, disk space, image box; running tasks (with Stop) and recent tasks with their full step log |
+| Chats | Every chat folder with its size: browse and download files, delete old folders to free disk |
+| Memory | What Cowork has saved about you and your projects: edit or forget |
+| Phone | Bridge status, the setup command, a live screenshot, collected posts |
+| People | Who used what (tasks, tokens), Claude Code and Codex status, recent hand-offs |
+| System | Code version, disks, and progress when moving to a new box |
+
+## Phone bridge
+
+On the PC the phone is plugged into:
+
+1. Install Android platform-tools (adb) and Python 3.
+2. Turn on USB debugging on the phone and allow the prompt.
+3. Download `bridge.py` from the console's Phone page and run the command shown there (`python bridge.py --url https://api.handydandy.cc --key phb_…`).
+
+The bridge only makes outgoing HTTPS requests. The key only works for the bridge endpoints and can be replaced on the Phone page.
+
+## Operating it
+
+See [docs/OPERATIONS.md](docs/OPERATIONS.md): updating app code without losing data, shipping a new image, moving to a new box or a persistent volume, and rotating keys. [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) covers building everything from scratch, and [docs/THIRD-MODEL.md](docs/THIRD-MODEL.md) the image box.
+
+## Tests
 
 ```sh
-npm ci
-npm run check
-npm test
-python -m unittest discover -s tests -p 'test_*.py' -v
+npm ci && npm run check && npm test                              # gateway
+python -m unittest discover -s tests -p 'test_*.py'              # controller, Cowork, pipe, console, migration
 ```
-
-See [Validation](docs/VALIDATION.md) for actual local results and remaining live checks.

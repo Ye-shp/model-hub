@@ -1,4 +1,4 @@
-> Based on Claude v2 deployment instructions. With running GPUs, use the local quickstart first; do not rent another instance. Read UPGRADE.md before deploying v3.
+> Building a hub from nothing. The running hub uses 2× V100 32 GB for chat and a separate box for images (see THIRD-MODEL.md); day-to-day changes are in OPERATIONS.md. Hardware and prices below are from the original setup.
 
 # Model Hub
 

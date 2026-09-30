@@ -70,9 +70,11 @@ def init() -> None:
         # Separate project for the Open WebUI Pipe, so invited friends never see the owner's own work.
         db.execute("INSERT OR IGNORE INTO projects VALUES (?,?,?,?)", ("friends", "Shared with invited friends", "", store.now()))
         present = {r[1] for r in db.execute("PRAGMA table_info(jobs)")}
-        for name in ("thread", "requested_by"):  # added for Cowork chats; older databases gain them here
+        for name in ("thread", "requested_by", "parent"):  # added for Cowork chats; older databases gain them here
             if name not in present:
                 db.execute(f"ALTER TABLE jobs ADD COLUMN {name} TEXT")
+        db.execute("CREATE INDEX IF NOT EXISTS jobs_thread ON jobs(project, thread, created_at)")
+        db.execute("CREATE INDEX IF NOT EXISTS events_job ON events(job_id, id)")
         db.commit()
     import coordination
     coordination.init()
@@ -85,6 +87,15 @@ def query(sql: str, params: tuple = ()) -> list[dict]:
 
 def project_exists(project: str) -> bool:
     return bool(query("SELECT id FROM projects WHERE id=?", (project,)))
+
+
+def ensure_friend_project(email: str) -> str:
+    """Each invited friend has their own project (memory, files, collected posts), named after their account."""
+    import sandbox
+    project = sandbox.friend_account(email)
+    with connection() as db, db:
+        db.execute("INSERT OR IGNORE INTO projects VALUES (?,?,?,?)", (project, (email or "").strip().lower()[:120], "", store.now()))
+    return project
 
 
 def create_project(name: str, brief: str = "") -> str:
@@ -166,7 +177,7 @@ def bounded_json(items: list[dict], limit: int = 12000) -> str:
 
 
 def create_job(project: str, task: str, skill: str, profile: str = "balanced", allow_frontier: bool = False, allow_images: bool = False,
-               thread: str | None = None, requested_by: str | None = None) -> str:
+               thread: str | None = None, requested_by: str | None = None, parent: str | None = None) -> str:
     from skills import load_skill
     load_skill(skill)
     if profile not in PROFILES or not project_exists(project):
@@ -178,9 +189,9 @@ def create_job(project: str, task: str, skill: str, profile: str = "balanced", a
         raise ValueError("Invalid thread")
     job = uuid.uuid4().hex
     with connection() as db, db:
-        db.execute("""INSERT INTO jobs(id,project,task,skill,profile,status,allow_frontier,allow_images,created_at,thread,requested_by)
-          VALUES (?,?,?,?,?,'queued',?,?,?,?,?)""", (job, project, task, skill, profile, int(allow_frontier), int(allow_images), store.now(),
-                                                   thread, (requested_by or "")[:200] or None))
+        db.execute("""INSERT INTO jobs(id,project,task,skill,profile,status,allow_frontier,allow_images,created_at,thread,requested_by,parent)
+          VALUES (?,?,?,?,?,'queued',?,?,?,?,?,?)""", (job, project, task, skill, profile, int(allow_frontier), int(allow_images), store.now(),
+                                                     thread, (requested_by or "")[:200] or None, parent))
     event(job, "queued", "Waiting for a worker")
     return job
 

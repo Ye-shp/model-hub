@@ -1,26 +1,144 @@
 """Per-chat workspaces on the GPU box, and a shell that runs as an unprivileged user.
 
 Every Cowork chat gets its own folder. Commands the agent runs there execute as a separate Unix
-user ("cowork" for the owner, "guest" for invited friends) with no capabilities and resource
-limits, so they can't read the hub's keys, the chat site's database or another user's files.
+user with no capabilities and resource limits, so they can't read the hub's keys, the chat site's
+database or another person's files:
+  owner          -> "cowork"
+  friend-<id>    -> a Unix user of the same name, one per invited friend (created on first use)
+  guest          -> "guest", the older shared account for friends (kept for existing chats)
 The controller itself (root) does the file reads/writes, confined to the chat folder.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import mimetypes
 import os
 import re
 import shutil
 import signal
+import subprocess
+import threading
+import time
 from pathlib import Path
 
 ROOT = Path(os.environ.get("COWORK_ROOT", "/workspace/cowork"))
+# Fixed accounts. Tests may add "friend" here to run every friend account as one existing user.
 USERS = {"owner": os.environ.get("COWORK_OWNER_USER", "cowork"), "guest": os.environ.get("COWORK_GUEST_USER", "guest")}
 OUTPUT_LIMIT = 10_000  # characters of command output returned to the model
 READ_LIMIT = 12_000
 IS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
 EXTRA_PATH = os.environ.get("COWORK_EXTRA_PATH", "/opt/cli/bin")
+# Refuse new work when the disk is nearly full: a full disk once broke the chat site and the console.
+MIN_FREE_GB = float(os.environ.get("COWORK_MIN_FREE_GB", "4"))
+# Each friend's folders together may use this much (the owner is not limited).
+FRIEND_QUOTA_GB = float(os.environ.get("COWORK_FRIEND_QUOTA_GB", "5"))
+FRIEND_UID_START = 1600
+_user_lock = threading.Lock()
+
+
+def friend_account(email: str) -> str:
+    """Stable account name for an invited friend (also their Unix user name and project id)."""
+    email = (email or "").strip().lower()
+    if not email:
+        raise ValueError("A friend account needs an email address")
+    return "friend-" + hashlib.sha256(email.encode()).hexdigest()[:10]
+
+
+def is_account(name: str) -> bool:
+    return name in USERS or bool(re.fullmatch(r"friend-[0-9a-f]{10}", name or ""))
+
+
+def _registry() -> Path:
+    import store
+    return store.DATA / "sandbox-users.json"
+
+
+def unix_user(account: str) -> str:
+    """The Unix user for an account, creating a friend's user (with a stable UID) when it's missing."""
+    if account in USERS:
+        return USERS[account]
+    if not is_account(account):
+        raise ValueError("Unknown workspace account")
+    if "friend" in USERS:  # tests
+        return USERS["friend"]
+    if not IS_ROOT:
+        return account
+    import pwd
+    with _user_lock:
+        try:
+            pwd.getpwnam(account)
+            return account
+        except KeyError:
+            pass
+        path = _registry()
+        try:
+            uids = json.loads(path.read_text())
+        except (FileNotFoundError, ValueError):
+            uids = {}
+        uid = uids.get(account) or max([FRIEND_UID_START - 1, *uids.values()]) + 1
+        # The container's user list is rebuilt on a new image; the UID is kept so old files stay theirs.
+        subprocess.run(["useradd", "--uid", str(uid), "--no-create-home", "--shell", "/bin/bash", account],
+                       check=True, capture_output=True, timeout=30)
+        uids[account] = uid
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(uids, indent=1))
+        return account
+
+
+def free_gb(path: Path | None = None) -> float:
+    target = path or ROOT
+    while not target.exists() and target != target.parent:
+        target = target.parent
+    return shutil.disk_usage(target).free / 1024**3
+
+
+_sizes: dict[str, tuple[float, int]] = {}
+
+
+def folder_bytes(path: Path, max_age: float = 60) -> int:
+    """Total size of a folder (cached for a minute; du is fast but not free)."""
+    key = str(path)
+    cached = _sizes.get(key)
+    if cached and time.monotonic() - cached[0] < max_age:
+        return cached[1]
+    size = 0
+    try:
+        out = subprocess.run(["du", "-sb", str(path)], capture_output=True, text=True, timeout=20)
+        size = int(out.stdout.split()[0]) if out.stdout else 0
+    except (subprocess.TimeoutExpired, ValueError, IndexError, FileNotFoundError):
+        for folder, _, files in os.walk(path):
+            for name in files:
+                try:
+                    size += os.lstat(os.path.join(folder, name)).st_size
+                except OSError:
+                    pass
+    _sizes[key] = (time.monotonic(), size)
+    return size
+
+
+CLEANUP = re.compile(r"^(rm|rmdir|du|ls|df|find|cd|pwd)\b")
+
+
+def is_cleanup(command: str) -> bool:
+    """True for commands that only inspect or delete files (allowed even when the disk is full)."""
+    parts = [p.strip() for p in re.split(r"&&|\|\||;|\n", command) if p.strip()]
+    return bool(parts) and all(CLEANUP.match(p) for p in parts) and ">" not in command
+
+
+def space_problem(account: str) -> str | None:
+    """Why new work can't write to disk right now, or None."""
+    free = free_gb()
+    if free < MIN_FREE_GB:
+        return (f"The server's disk is nearly full ({free:.1f} GB free). Delete large files you no longer need "
+                "(for example with rm), or ask the owner to clear old chat folders in the console.")
+    if account.startswith("friend-") or account == "guest":
+        used = folder_bytes(ROOT / account) / 1024**3
+        if used > FRIEND_QUOTA_GB:
+            return (f"This account's files use {used:.1f} GB, over its {FRIEND_QUOTA_GB:g} GB allowance. "
+                    "Delete files you no longer need (rm) before creating more.")
+    return None
 
 
 def clean_thread(thread: str) -> str:
@@ -40,9 +158,11 @@ def trim(text: str, limit: int = OUTPUT_LIMIT) -> str:
 
 class Workspace:
     def __init__(self, tier: str, thread: str):
-        if tier not in USERS:
+        """tier is the account: "owner", "guest" or "friend-<id>"."""
+        if not is_account(tier):
             raise ValueError("Unknown workspace tier")
         self.tier, self.thread = tier, clean_thread(thread)
+        self.user = unix_user(tier)
         self.base = ROOT / tier
         self.home = self.base / "home"
         self.dir = self.base / "threads" / self.thread
@@ -50,10 +170,14 @@ class Workspace:
         if IS_ROOT:
             import pwd
             try:
-                entry = pwd.getpwnam(USERS[tier])
+                entry = pwd.getpwnam(self.user)
             except KeyError:
-                raise RuntimeError(f"Sandbox user {USERS[tier]!r} is missing; the shell is disabled") from None
+                raise RuntimeError(f"Sandbox user {self.user!r} is missing; the shell is disabled") from None
             self.uid, self.gid = entry.pw_uid, entry.pw_gid
+
+    @property
+    def is_owner(self) -> bool:
+        return self.tier == "owner"
 
     # ---- setup and ownership ----
     def prepare(self) -> "Workspace":
@@ -131,6 +255,9 @@ class Workspace:
 
     def write_bytes(self, path: str, content: bytes) -> Path:
         target = self.resolve(path)
+        problem = space_problem(self.tier)
+        if problem:
+            raise ValueError(problem)
         missing = []
         parent = target.parent
         while not parent.exists():
@@ -165,7 +292,7 @@ class Workspace:
         local = self.home / ".local"
         env = {
             "PATH": f"{local}/bin:{self.home}/.npm-global/bin:{EXTRA_PATH}:/usr/local/bin:/usr/bin:/bin",
-            "HOME": str(self.home), "USER": USERS[self.tier], "LOGNAME": USERS[self.tier],
+            "HOME": str(self.home), "USER": self.user, "LOGNAME": self.user,
             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TERM": "dumb", "TMPDIR": str(self.home / "tmp"),
             "PYTHONUNBUFFERED": "1", "PYTHONUSERBASE": str(local), "PIP_USER": "1", "PIP_BREAK_SYSTEM_PACKAGES": "1",
             "PIP_DISABLE_PIP_VERSION_CHECK": "1", "NPM_CONFIG_PREFIX": str(self.home / ".npm-global"), "MPLBACKEND": "Agg",
@@ -188,6 +315,10 @@ class Workspace:
                   cwd: Path | None = None) -> dict:
         if isinstance(command, str):
             command = ["bash", "-c", command]
+        problem = space_problem(self.tier)
+        # Deleting files must still work on a full disk, so only refuse commands that don't look like cleanup.
+        if problem and not is_cleanup(command[-1] if command[:2] == ["bash", "-c"] else ""):
+            return {"exit_code": None, "timed_out": False, "output": "Not run: " + problem}
         process = await asyncio.create_subprocess_exec(
             *self.argv(command, cpu_seconds=max(60, timeout * 4)), cwd=str(cwd or self.dir), env=self.env(extra_env),
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,

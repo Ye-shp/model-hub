@@ -20,12 +20,18 @@ from pydantic import BaseModel, Field
 HELP = """**Qwen Cowork** — say what you want accomplished; it plans, works with its tools and hands back results and files.
 
 Each chat has its own workspace folder that persists, so follow-ups build on earlier files. Attach files and they land in `uploads/`.
-Pressing stop cancels the task.
+Pressing stop cancels the task. Send `status` to follow a task that's still running (for example after the page reloaded).
+Big projects: ask for a plan first; Cowork keeps `plan.md` in the chat's folder and can run the next phase automatically.
 
 Owner commands: `/connections` (Claude Code / Codex status) · `/connect claude TOKEN` (token from `claude setup-token`) ·
 `/connect codex` (sign Codex in with your ChatGPT account)."""
 
-SKIP = {"model", "usage", "queued", "completed", "failed", "interrupted", "cancelled", "resumed", "frontier-call"}
+SKIP = {"model", "usage", "queued", "completed", "failed", "interrupted", "cancelled", "resumed", "frontier-call", "partial",
+        "next-phase"}
+
+
+class LostContact(Exception):
+    pass
 
 
 class Pipe:
@@ -38,6 +44,7 @@ class Pipe:
         ALLOW_IMAGES: bool = False
         OWNER_ESCALATION: bool = Field(default=True, description="Let the owner's tasks hand work to Claude Code / Codex")
         HISTORY_CHARACTERS: int = Field(default=60000, ge=2000, le=110000, description="How much of the chat is sent along")
+        RETRY_MINUTES: int = Field(default=15, ge=1, le=120, description="Keep retrying the controller this long before giving up")
 
     def __init__(self):
         self.valves = self.Valves()
@@ -89,13 +96,14 @@ class Pipe:
         if emit:
             await emit({"type": "status", "data": {"description": text[:200], "done": done}})
 
-    async def _upload_inputs(self, client, project, thread, files, images) -> list[str]:
+    async def _upload_inputs(self, client, project, thread, files, images, email: str = "") -> list[str]:
         saved = []
         for index, url in enumerate(images, 1):
             header, data = url.split(",", 1)
             extension = header.split("/")[1].split(";")[0].replace("jpeg", "jpg")[:5]
             result = await self._call(client, "POST", "/api/workspace/upload", json={
-                "project": project, "thread": thread, "name": f"pasted-image-{int(time.time())}-{index}.{extension}", "content_b64": data})
+                "project": project, "thread": thread, "name": f"pasted-image-{int(time.time())}-{index}.{extension}", "content_b64": data,
+                "requested_by": email})
             saved.append(result["path"])
         for item in files or []:
             try:
@@ -111,7 +119,8 @@ class Pipe:
                     saved.append(f"(skipped {record.filename}: larger than 60 MB)")
                     continue
                 result = await self._call(client, "POST", "/api/workspace/upload", json={
-                    "project": project, "thread": thread, "name": record.filename, "content_b64": base64.b64encode(content).decode()})
+                    "project": project, "thread": thread, "name": record.filename, "content_b64": base64.b64encode(content).decode(),
+                    "requested_by": email})
                 saved.append(result["path"])
             except Exception as error:  # one unreadable attachment shouldn't stop the task
                 saved.append(f"(could not attach {item.get('name', 'a file')}: {type(error).__name__})")
@@ -181,6 +190,78 @@ class Pipe:
             agent, _, task = detail.partition(":")
             return f"{'Claude Code' if agent == 'claude' else 'Codex'} is working on:{task}"
         return detail
+
+    async def _poll(self, client, identity: str, after: int, emit) -> dict:
+        """One check-in with the controller, retried through restarts and brief outages (up to RETRY_MINUTES)."""
+        failures, first = 0, None
+        while True:
+            try:
+                return await self._call(client, "GET", f"/api/jobs/{identity}/events", params={"after": after})
+            except (httpx.HTTPError, ValueError) as error:
+                if isinstance(error, ValueError) and "HTTP 404" in str(error):
+                    raise
+                failures += 1
+                first = first or time.monotonic()
+                if time.monotonic() - first > self.valves.RETRY_MINUTES * 60:
+                    raise LostContact(str(error)) from None
+                if failures == 2:
+                    await self._status(emit, "Reconnecting to the agent controller… (the task keeps running)")
+                await asyncio.sleep(min(2 * failures, 15))
+
+    async def _follow(self, client, identity: str, emit, body: dict, context: tuple):
+        """Stream a task's progress, then its result; keeps following automatic next phases."""
+        shown = 0
+        while identity:
+            after, plan, last_status, state = 0, [], "", None
+            last_keepalive = time.monotonic()
+            try:
+                while True:
+                    try:
+                        state = await self._poll(client, identity, after, emit)
+                    except LostContact as error:
+                        await self._status(emit, "Lost contact with the agent controller", done=True)
+                        yield ((f"\n\n---\n\n" if shown else "") +
+                               f"I lost contact with the agent controller ({str(error)[:150]}). The task may still be running on "
+                               "the box: send **status** in this chat to pick it up again.")
+                        return
+                    plan = state.get("plan") or plan
+                    for event in state["events"]:
+                        after = max(after, event["id"])
+                        text = self._describe(event, plan)
+                        if text and text != last_status:
+                            await self._status(emit, text)
+                            last_status = text
+                    if state["status"] not in {"queued", "running"} and not state["events"]:
+                        break
+                    if time.monotonic() - last_keepalive > 15 and body.get("stream"):
+                        last_keepalive = time.monotonic()
+                        yield "data: " + json.dumps({"choices": [{"index": 0, "delta": {}, "finish_reason": None}]}) + "\n\n"
+                    await asyncio.sleep(1.5)
+            except asyncio.CancelledError:  # the user pressed stop
+                try:
+                    async with self._client() as stopper:
+                        await stopper.post(f"/api/jobs/{identity}/cancel")
+                except Exception:
+                    pass
+                raise
+            user, request, metadata = context
+            files = await self._deliver(client, state.get("artifacts") or [], user, request, metadata or {}, emit)
+            if state["status"] == "completed":
+                text = self._plan_block(plan) + (state.get("result") or "(no reply)") + files
+            elif state["status"] == "cancelled":
+                text = "Stopped. Files made so far are still in this chat's workspace." + files
+            else:
+                text = (self._plan_block(plan) + f"The task stopped before finishing: {state.get('error') or state['status']}\n\n"
+                        "Everything it made is still in this chat's workspace. Reply **continue** to pick up where it left off."
+                        + files)
+            identity = state.get("next_job") if state["status"] == "completed" else None
+            if identity:
+                shown += 1
+                text += (f"\n\n---\n\n**Phase {shown + 1} started automatically** (from plan.md). It keeps going in this "
+                         "chat; press stop to end it.\n\n")
+                await self._status(emit, f"Phase {shown + 1} starting…")
+            yield text
+        await self._status(emit, {"completed": "Done", "cancelled": "Stopped"}.get(state["status"], "Stopped early"), done=True)
 
     # ---- entry point ----
     async def pipe(self, body: dict, __user__: dict = None, __metadata__: dict = None, __files__: list = None,
@@ -257,8 +338,19 @@ class Pipe:
                             "ChatGPT → Settings → Security, then send `/connect codex` again.")
                     return
 
+                if command in {"status", "/status", "continue watching"}:
+                    active = (await self._call(client, "GET", "/api/thread/active", params={
+                        "project": project, "thread": thread, "requested_by": user.get("email") or ""}))["job"]
+                    if not active:
+                        yield "Nothing is running in this chat right now."
+                        return
+                    await self._status(emit, "Following the task that's still running…")
+                    async for piece in self._follow(client, active["id"], emit, body, (user, __request__, __metadata__)):
+                        yield piece
+                    return
+
                 await self._status(emit, "Preparing the workspace…")
-                attached = await self._upload_inputs(client, project, thread, __files__, images)
+                attached = await self._upload_inputs(client, project, thread, __files__, images, user.get("email") or "")
                 history, used = [], 0
                 for message in reversed(messages[:-1]):
                     text, pictures = self._text(message.get("content"))
@@ -281,43 +373,9 @@ class Pipe:
                     "profile": profile if profile in {"fast", "balanced", "deep"} else "balanced",
                     "allow_frontier": tier == "owner" and self.valves.OWNER_ESCALATION, "allow_images": self.valves.ALLOW_IMAGES,
                     "thread": thread, "requested_by": user.get("email") or user.get("name") or ""})
-                identity = job["id"]
                 await self._status(emit, "Queued…")
-                after, plan, last_status, state = 0, [], "", None
-                last_keepalive = time.monotonic()
-                try:
-                    while True:
-                        state = await self._call(client, "GET", f"/api/jobs/{identity}/events", params={"after": after})
-                        plan = state.get("plan") or plan
-                        for event in state["events"]:
-                            after = max(after, event["id"])
-                            text = self._describe(event, plan)
-                            if text and text != last_status:
-                                await self._status(emit, text)
-                                last_status = text
-                        if state["status"] not in {"queued", "running"} and not state["events"]:
-                            break
-                        if time.monotonic() - last_keepalive > 15 and body.get("stream"):
-                            last_keepalive = time.monotonic()
-                            yield "data: " + json.dumps({"choices": [{"index": 0, "delta": {}, "finish_reason": None}]}) + "\n\n"
-                        await asyncio.sleep(1.5)
-                except asyncio.CancelledError:  # the user pressed stop
-                    try:
-                        async with self._client() as stopper:
-                            await stopper.post(f"/api/jobs/{identity}/cancel")
-                    except Exception:
-                        pass
-                    raise
-                files = await self._deliver(client, state.get("artifacts") or [], user, __request__, __metadata__ or {}, emit)
-                await self._status(emit, {"completed": "Done", "cancelled": "Stopped"}.get(state["status"], "Stopped early"), done=True)
-                if state["status"] == "completed":
-                    yield self._plan_block(plan) + (state.get("result") or "(no reply)") + files
-                elif state["status"] == "cancelled":
-                    yield "Stopped. Files made so far are still in this chat's workspace." + files
-                else:
-                    yield (self._plan_block(plan) + f"The task stopped before finishing: {state.get('error') or state['status']}\n\n"
-                           "Everything it made is still in this chat's workspace. Reply **continue** to pick up where it left off."
-                           + files)
+                async for piece in self._follow(client, job["id"], emit, body, (user, __request__, __metadata__)):
+                    yield piece
         except (httpx.HTTPError, ValueError, KeyError) as error:
             await self._status(emit, "Could not reach the agent controller", done=True)
             yield f"Could not reach the agent controller ({type(error).__name__}: {str(error)[:200]}). It may be restarting; try again in a minute."

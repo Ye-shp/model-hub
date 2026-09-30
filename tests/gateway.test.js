@@ -329,3 +329,24 @@ test('slow images keep the connection alive with whitespace and still parse as J
   assert.match(text, /^ +\{/);  // keep-alive spaces arrived before the body, beyond the 1 s chat limit
   assert.equal(JSON.parse(text).data[0].b64_json, 'aGk=');
 });
+
+test('the phone bridge reaches the controller through /bridge/* only, with its own key', async t => {
+  const {up, base, config} = await setup(t, {ENABLE_AGENT_CONSOLE: 'true'});
+  assert.equal(config.controllerUrl, 'http://127.0.0.1:8787');
+  config.controllerUrl = `${up.url}/ctl`;  // the fake server plays the controller
+  up.state.handler = (entry, res) => {
+    res.writeHead(entry.headers.authorization === 'Bearer phb_good' ? 200 : 401, {'content-type': 'application/json'});
+    res.end(JSON.stringify({path: entry.url, got: entry.body}));
+  };
+  const post = (path, key) => fetch(base + path, {method: 'POST', headers: {authorization: `Bearer ${key}`, 'content-type': 'application/json'},
+    body: JSON.stringify({device: 'abc'})});
+  let r = await post('/bridge/poll', 'phb_good');
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), {path: '/ctl/bridge/poll', got: {device: 'abc'}});
+  assert.equal((await post('/bridge/result', 'phb_bad')).status, 401);
+  assert.equal((await post('/bridge/other', 'phb_good')).status, 404);
+  config.controllerUrl = '';
+  assert.equal((await post('/bridge/poll', 'phb_good')).status, 404);
+  const plain = await setup(t);
+  assert.equal(plain.config.controllerUrl, '');
+});

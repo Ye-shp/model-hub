@@ -55,6 +55,23 @@ class UploadIn(BaseModel):
     thread: str = Field(min_length=1, max_length=80)
     name: str = Field(min_length=1, max_length=200)
     content_b64: str
+    requested_by: str | None = Field(default=None, max_length=200)
+
+
+class MemoryEdit(BaseModel):
+    title: str = Field(min_length=1, max_length=160)
+    content: str = Field(max_length=12000)
+    kind: str = "fact"
+
+
+class ChatRef(BaseModel):
+    account: str = Field(min_length=1, max_length=40)
+    thread: str = Field(min_length=1, max_length=80)
+
+
+class MigrateIn(BaseModel):
+    target: str = Field(pattern=r"^http://[0-9.]{7,15}:[0-9]{2,5}$")
+    key: str = Field(min_length=32, max_length=200)
 
 
 class DocumentIn(BaseModel):
@@ -89,6 +106,27 @@ def owner_key() -> str:
         return key
 
 
+def resolve_project(project: str, requested_by: str | None, thread: str | None = None) -> str:
+    """Invited friends each get their own project and sandbox account. The chat site sends project "friends"
+    and the friend's email; chats a friend started in the old shared folder move to their own account."""
+    if project != "friends" or not requested_by or "@" not in requested_by:
+        return project
+    import sandbox
+    friend = ws.ensure_friend_project(requested_by)
+    if thread:
+        old = sandbox.ROOT / "guest" / "threads" / sandbox.clean_thread(thread)
+        new = sandbox.ROOT / friend / "threads" / sandbox.clean_thread(thread)
+        if old.is_dir() and not new.exists():
+            space = sandbox.Workspace(friend, thread).prepare()
+            space.dir.rmdir()
+            old.rename(space.dir)
+            if sandbox.IS_ROOT:
+                for folder, dirs, files in os.walk(space.dir):
+                    for name in [folder, *(os.path.join(folder, n) for n in dirs + files)]:
+                        os.chown(name, space.uid, space.gid, follow_symlinks=False)
+    return friend
+
+
 def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> FastAPI:
     ws.init()
     token = key or owner_key()
@@ -121,7 +159,17 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         host = urlparse("http://" + request.headers.get("host", "")).hostname
         if host not in allowed_hosts:
             return JSONResponse({"error": "Unexpected hostname"}, status_code=403)
-        if request.url.path.startswith("/api/"):
+        if request.url.path.startswith("/bridge/"):
+            import phone_link
+            supplied = request.headers.get("authorization", "")
+            if not hmac.compare_digest(supplied.encode(), ("Bearer " + phone_link.key()).encode()):
+                return JSONResponse({"error": "Invalid bridge key"}, status_code=401)
+            try:
+                if int(request.headers.get("content-length", "0")) > 40_000_000:
+                    return JSONResponse({"error": "Too large"}, status_code=413)
+            except ValueError:
+                return JSONResponse({"error": "Invalid content length"}, status_code=400)
+        elif request.url.path.startswith("/api/"):
             supplied = request.headers.get("authorization", "")
             owner = hmac.compare_digest(supplied.encode(), ("Bearer " + token).encode())
             if not owner and cf_access.configured() and request.headers.get("cf-access-jwt-assertion"):
@@ -155,6 +203,11 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
     @app.get("/app.js")
     def js():
         return FileResponse(WEB / "app.js", media_type="application/javascript")
+
+    @app.get("/bridge.py")
+    def bridge_script():
+        """The phone bridge program for the owner's PC (no secrets in it; the key is entered when it's started)."""
+        return FileResponse(WEB / "bridge.py", filename="bridge.py", media_type="text/x-python")
 
     @app.get("/style.css")
     def css():
@@ -271,7 +324,9 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         # For Cowork, allow_frontier means "may hand work to Claude Code / Codex" (checked when it runs).
         if body.allow_frontier and not hub.FRONTIER_MODEL and body.skill != "cowork":
             raise ValueError("Configure FRONTIER_MODEL before enabling paid advice")
-        return {"id": ws.create_job(**body.model_dump())}
+        data = body.model_dump()
+        data["project"] = resolve_project(body.project, body.requested_by, body.thread)
+        return {"id": ws.create_job(**data)}
 
     @app.get("/api/jobs/{job}")
     def job_detail(job: str):
@@ -285,21 +340,31 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         rows = ws.query("SELECT status,result,error FROM jobs WHERE id=?", (job,))
         if not rows:
             raise HTTPException(404, "Task not found")
-        return {**rows[0], "plan": coordination.plan(job),
+        following = ws.query("SELECT id FROM jobs WHERE parent=? ORDER BY created_at LIMIT 1", (job,))
+        return {**rows[0], "plan": coordination.plan(job), "next_job": following[0]["id"] if following else None,
                 "events": ws.query("SELECT id,kind,detail,created_at FROM events WHERE job_id=? AND id>? ORDER BY id LIMIT 200", (job, after)),
                 "artifacts": ws.query("SELECT id,name,media_type FROM artifacts WHERE job_id=? ORDER BY created_at,rowid", (job,))}
+
+    @app.get("/api/thread/active")
+    def thread_active(project: str, thread: str, requested_by: str | None = None):
+        """The unfinished task of a chat (running or queued), so the chat site can follow it again."""
+        project = resolve_project(project, requested_by)
+        rows = ws.query("""SELECT id,status,created_at FROM jobs WHERE project=? AND thread=? AND status IN ('running','queued')
+                           ORDER BY (status='running') DESC, created_at LIMIT 1""", (project, thread))
+        return {"job": rows[0] if rows else None}
 
     @app.post("/api/workspace/upload", status_code=201)
     def upload(body: UploadIn):
         """A file the user attached in a Cowork chat, saved into that chat's workspace uploads/ folder."""
         import base64, binascii, cowork, sandbox
-        if not ws.project_exists(body.project):
+        project = resolve_project(body.project, body.requested_by, body.thread)
+        if not ws.project_exists(project):
             raise HTTPException(404, "Project not found")
         try:
             content = base64.b64decode(body.content_b64, validate=True)
         except binascii.Error:
             raise ValueError("content_b64 is not valid base64") from None
-        space = sandbox.Workspace(cowork.tier_for({"project": body.project}), body.thread).prepare()
+        space = sandbox.Workspace(cowork.tier_for({"project": project}), body.thread).prepare()
         name = Path(body.name).name.replace("\x00", "")[:200] or "upload"
         target = space.write_bytes(f"uploads/{name}", content)
         return {"path": space.relative(target), "bytes": len(content)}
@@ -366,7 +431,160 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
             raise HTTPException(404, "Artifact is unavailable")
         return FileResponse(path, filename=row["name"], media_type="application/octet-stream")
 
+    # ---- phone bridge (the PC program talks to these with the bridge key) ----
+    @app.post("/bridge/poll")
+    async def bridge_poll(request: Request):
+        import phone_link
+        info = await request.json()
+        return {"commands": await phone_link.poll(info if isinstance(info, dict) else {})}
+
+    @app.post("/bridge/result")
+    async def bridge_result(request: Request):
+        import phone_link
+        result = await request.json()
+        return {"accepted": phone_link.deliver(result if isinstance(result, dict) else {})}
+
+    @app.get("/api/phone")
+    def phone_state():
+        import phone_link
+        screen = dict(phone_link.BRIDGE.last_screen)
+        return {**phone_link.status(), "key": phone_link.key(), "bridge_url": os.environ.get("BRIDGE_PUBLIC_URL", ""),
+                "screen": screen or None,
+                "posts": ws.query("SELECT platform, COUNT(*) AS n, MAX(collected_at) AS last FROM posts GROUP BY platform")}
+
+    @app.post("/api/phone/key")
+    def phone_rotate():
+        import phone_link
+        return {"key": phone_link.rotate_key()}
+
+    @app.post("/api/phone/screen")
+    async def phone_screen_now():
+        import phone_link
+        try:
+            await phone_link.screen(client=None, describe=False)
+        except RuntimeError as error:
+            raise ValueError(str(error)) from None
+        return {"screen": phone_link.BRIDGE.last_screen}
+
+    # ---- health: GPUs, models, disk, image box, code version ----
+    @app.get("/api/health")
+    async def health():
+        import sandbox
+        return await asyncio.to_thread(system_health, sandbox)
+
+    # ---- chats: every chat folder, its size and tasks; delete to free disk ----
+    @app.get("/api/chats")
+    def chats():
+        import sandbox
+        found = []
+        names = {r["id"]: r["name"] for r in ws.query("SELECT id,name FROM projects")}
+        if sandbox.ROOT.is_dir():
+            for base in sorted(sandbox.ROOT.iterdir()):
+                if not base.is_dir() or not sandbox.is_account(base.name) or not (base / "threads").is_dir():
+                    continue
+                for folder in (base / "threads").iterdir():
+                    if not folder.is_dir():
+                        continue
+                    jobs = ws.query("""SELECT id,status,requested_by,substr(task,1,20000) AS task,created_at FROM jobs WHERE thread=?
+                                       ORDER BY created_at DESC LIMIT 1""", (folder.name,))
+                    count = ws.query("SELECT COUNT(*) AS n FROM jobs WHERE thread=?", (folder.name,))[0]["n"]
+                    last = jobs[0] if jobs else {}
+                    request = (last.get("task") or "").split("CURRENT REQUEST:\n", 1)[-1].strip()[:200]
+                    found.append({"account": base.name, "owner": names.get(base.name, "owner" if base.name == "owner" else base.name),
+                                  "thread": folder.name, "bytes": sandbox.folder_bytes(folder, max_age=300),
+                                  "modified": folder.stat().st_mtime, "tasks": count, "last_status": last.get("status"),
+                                  "last_request": request, "who": last.get("requested_by")})
+        found.sort(key=lambda c: c["modified"], reverse=True)
+        return {"chats": found, "free_gb": round(sandbox.free_gb(), 1)}
+
+    @app.post("/api/chats/delete")
+    def delete_chat(body: ChatRef):
+        import shutil as sh
+        import sandbox
+        if not sandbox.is_account(body.account):
+            raise ValueError("Unknown account")
+        folder = sandbox.ROOT / body.account / "threads" / sandbox.clean_thread(body.thread)
+        if ws.query("SELECT 1 FROM jobs WHERE thread=? AND status IN ('running','queued') LIMIT 1", (folder.name,)):
+            raise ValueError("A task is still running in this chat; stop it first")
+        if not folder.is_dir():
+            raise HTTPException(404, "Chat folder not found")
+        sh.rmtree(folder)
+        sandbox._sizes.clear()
+        return {"deleted": True, "free_gb": round(sandbox.free_gb(), 1)}
+
+    @app.post("/api/memories/{note}")
+    def edit_memory(note: int, body: MemoryEdit):
+        if body.kind not in {"fact", "decision", "preference", "checkpoint", "question"}:
+            raise ValueError("Unknown memory kind")
+        with ws.connection() as db, db:
+            changed = db.execute("UPDATE notes SET title=?,content=?,kind=?,updated_at=? WHERE id=?",
+                                 (body.title, body.content, body.kind, store.now(), note)).rowcount
+        if not changed:
+            raise HTTPException(404, "Memory not found")
+        return {"updated": True}
+
+    # ---- moving everything to a new server (see agents/migrate.py) ----
+    @app.post("/api/admin/migrate")
+    async def migrate_out(body: MigrateIn):
+        import migrate
+        if ws.query("SELECT 1 FROM jobs WHERE status='running' LIMIT 1"):
+            raise ValueError("A task is running; wait for it to finish (or stop it) before moving the data")
+        return migrate.start_send(body.target, body.key)
+
+    @app.get("/api/admin/migrate")
+    def migrate_status():
+        import migrate
+        return migrate.SEND
+
     return app
+
+
+def system_health(sandbox) -> dict:
+    """What the console's Now page shows about the box. Every part is best-effort."""
+    import shutil as sh
+    import subprocess
+    import urllib.request
+    report: dict = {"at": store.now()}
+    disks = {}
+    for label, path in (("data", store.DATA), ("chats", sandbox.ROOT), ("models", Path(os.environ.get("MODEL_DIR", "/workspace/models")))):
+        target = path
+        while not target.exists() and target != target.parent:
+            target = target.parent
+        usage = sh.disk_usage(target)
+        disks[label] = {"path": str(target), "total_gb": round(usage.total / 1024**3, 1), "free_gb": round(usage.free / 1024**3, 1),
+                        "used_pct": round(100 * usage.used / usage.total)}
+    report["disks"] = disks
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+                              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10).stdout
+        report["gpus"] = [dict(zip(("index", "name", "util", "mem_used", "mem_total", "temp"), [v.strip() for v in line.split(",")]))
+                          for line in out.strip().splitlines() if line.strip()]
+    except (OSError, subprocess.SubprocessError):
+        report["gpus"] = []
+    try:
+        req = urllib.request.Request(hub.HUB_URL + "/status", headers={"Authorization": "Bearer " + hub.HUB_KEY})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            report["models"] = json.loads(response.read())["models"]
+    except Exception as error:
+        report["models"] = {"error": type(error).__name__}
+    try:
+        report["startup"] = json.loads((store.DATA.parent / "status.json").read_text())
+    except (OSError, ValueError):
+        report["startup"] = None
+    image = os.environ.get("MODEL3_URL", "")
+    if image:
+        try:
+            with urllib.request.urlopen(image.rsplit("/v1", 1)[0] + "/health", timeout=6) as response:
+                report["image_box"] = {"ok": response.status == 200}
+        except Exception as error:
+            report["image_box"] = {"ok": False, "error": type(error).__name__}
+    code = os.environ.get("HUB_CODE_DIR", "")
+    try:
+        report["code"] = (Path(code) / "active").read_text().strip() if code else None
+    except OSError:
+        report["code"] = None
+    report["jobs"] = ws.query("SELECT status, COUNT(*) AS n FROM jobs WHERE status IN ('running','queued') GROUP BY status")
+    return report
 
 
 def main():

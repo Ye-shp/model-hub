@@ -30,7 +30,7 @@ class Base(unittest.TestCase):
         store.DATA = Path(self.temp.name) / "data"
         sandbox.ROOT = Path(self.temp.name) / "cowork"
         if sandbox.IS_ROOT:
-            sandbox.USERS.update(owner="nobody", guest="nobody")
+            sandbox.USERS.update(owner="nobody", guest="nobody", friend="nobody")
         ws.init()
 
     def tearDown(self):
@@ -253,7 +253,9 @@ class PipeTests(Base):
         self.assertIn("invited", reply)
         self.pipe.valves.ALLOWED_EMAILS = "friend@example.com"
         reply, _, job = self.collect(body, {"role": "user", "email": "Friend@example.com"})
-        self.assertEqual((job["project"], job["allow_frontier"]), ("friends", 0))
+        # Each friend has their own project and sandbox account.
+        self.assertEqual((job["project"], job["allow_frontier"]), (sandbox.friend_account("friend@example.com"), 0))
+        self.assertEqual(cowork.tier_for(job), job["project"])
         reply, _, _ = self.collect({"messages": [{"role": "user", "content": "/connect codex"}]}, {"role": "user", "email": "friend@example.com"})
         self.assertIn("Only the owner", reply)
 
