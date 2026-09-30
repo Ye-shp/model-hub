@@ -257,7 +257,10 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
     @app.get("/api/activity")
     def activity(project: str = "all", limit: int = 100):
         where, params = ("", ()) if project == "all" else ("WHERE j.project=?", (project,))
-        return {"jobs": ws.query(f"""SELECT j.id, j.project, p.name AS project_name, j.skill, j.profile, j.status, substr(j.task,1,400) AS task,
+        # Chat-site tasks carry the conversation first; show the request itself.
+        return {"jobs": ws.query(f"""SELECT j.id, j.project, p.name AS project_name, j.skill, j.profile, j.status,
+            CASE WHEN instr(j.task, 'CURRENT REQUEST:') > 0 THEN substr(j.task, instr(j.task, 'CURRENT REQUEST:') + 17, 400)
+                 ELSE substr(j.task, 1, 400) END AS task,
             j.requested_by, j.thread, j.created_at, j.started_at, j.finished_at, j.error,
             (SELECT COUNT(*) FROM events e WHERE e.job_id=j.id AND e.kind IN ('tool','delegate','escalation','image-request')) AS actions,
             (SELECT COUNT(*) FROM artifacts a WHERE a.job_id=j.id) AS files
