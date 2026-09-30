@@ -483,7 +483,7 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
                 if not base.is_dir() or not sandbox.is_account(base.name) or not (base / "threads").is_dir():
                     continue
                 for folder in (base / "threads").iterdir():
-                    if not folder.is_dir():
+                    if not folder.is_dir() or folder.name == "connections":  # Claude/Codex sign-in scratch space
                         continue
                     jobs = ws.query("""SELECT id,status,requested_by,substr(task,1,20000) AS task,created_at FROM jobs WHERE thread=?
                                        ORDER BY created_at DESC LIMIT 1""", (folder.name,))
