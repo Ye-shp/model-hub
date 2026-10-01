@@ -36,11 +36,27 @@ def ffprobe(path: Path) -> dict:
 
 def download(url: str, folder: Path) -> tuple[Path, dict]:
     import yt_dlp
-    options = {"outtmpl": str(folder / "video.%(ext)s"), "format": "mp4/bestvideo[height<=1080]+bestaudio/best",
-               "merge_output_format": "mp4", "quiet": True, "no_warnings": True, "noplaylist": True,
+    options = {"outtmpl": str(folder / "video.%(ext)s"), "format": "b[ext=mp4]/bv*[height<=1080]+ba/b",
+               "merge_output_format": "mp4", "quiet": True, "no_warnings": True, "noprogress": True, "noplaylist": True,
                "socket_timeout": 30, "retries": 2}
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
+    try:  # pass as a real Chrome browser: TikTok refuses plain requests from servers
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        options["impersonate"] = ImpersonateTarget.from_str("chrome")
+    except Exception:
+        pass
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except Exception as first:
+        if "impersonate" not in options:
+            raise
+        options.pop("impersonate")  # some sites/versions dislike it; try once without
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(url, download=True)
+        except Exception:
+            raise first from None
+    with yt_dlp.YoutubeDL({**options, "quiet": True}) as ydl:
         if info.get("_type") == "playlist" and info.get("entries"):
             info = info["entries"][0]
         path = Path(ydl.prepare_filename(info))

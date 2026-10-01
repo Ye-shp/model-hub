@@ -29,7 +29,8 @@ LAST30DAYS = HERE / "vendor" / "last30days" / "scripts" / "last30days.py"
 
 # Pinned, all free and open source (versions current as of October 2026).
 PACKAGES = [
-    "yt-dlp==2026.8.19",                 # download/inspect TikTok, Reels, Shorts, X videos and profiles
+    "yt-dlp[default,curl-cffi]>=2026.8.19",  # download/inspect videos; curl-cffi lets it pass as Chrome (TikTok needs it).
+                                         # Not pinned: sites change often, so it's upgraded weekly (refresh_ytdlp)
     "scenedetect==0.7.1",                # shot boundaries -> cut rate, one keyframe per shot
     "opencv-python-headless==5.0.0.93",  # needed by scenedetect
     "rapidocr==3.9.2",                   # on-screen text
@@ -42,7 +43,7 @@ PACKAGES = [
     "pytrends==4.9.2",                   # Google Trends
 ]
 WHISPER_REPO, WHISPER_REVISION = "Systran/faster-whisper-small", "536b0662742c02347bc0e980a01041f333bce120"
-VERSION = "1"  # bump to reinstall after changing PACKAGES
+VERSION = "2"  # bump to reinstall after changing PACKAGES
 
 STATE = {"state": "unknown", "detail": "", "at": 0.0}
 _lock = threading.Lock()
@@ -104,9 +105,26 @@ def install(force: bool = False) -> dict:
         return status()
 
 
+def refresh_ytdlp(max_age_days: float = 7) -> None:
+    """Upgrade yt-dlp when the installed copy is over a week old (TikTok/YouTube break old versions)."""
+    stamp = TOOLS_DIR / "ytdlp-updated"
+    try:
+        if stamp.is_file() and time.time() - stamp.stat().st_mtime < max_age_days * 86400:
+            return
+        run = subprocess.run([str(PYTHON), "-m", "pip", "install", "-q", "--no-cache-dir", "--disable-pip-version-check", "-U",
+                              "yt-dlp[default,curl-cffi]"], capture_output=True, text=True, timeout=600)
+        if run.returncode == 0:
+            stamp.write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def install_in_background() -> None:
-    if not ready():
-        threading.Thread(target=install, name="toolbox-install", daemon=True).start()
+    def work():
+        install()
+        if ready():
+            refresh_ytdlp()
+    threading.Thread(target=work, name="toolbox-install", daemon=True).start()
 
 
 def wait_ready(seconds: float = 900) -> None:

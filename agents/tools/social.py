@@ -214,6 +214,11 @@ def tiktok_profile(username: str, limit: int = 15) -> dict:
     url = f"https://www.tiktok.com/@{username.lstrip('@')}"
     options = {"quiet": True, "no_warnings": True, "skip_download": True, "playlistend": max(1, min(limit, 40)),
                "ignoreerrors": True, "socket_timeout": 30}
+    try:  # TikTok refuses plain requests from servers; pass as Chrome
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        options["impersonate"] = ImpersonateTarget.from_str("chrome")
+    except Exception:
+        pass
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=False)
     videos = []
