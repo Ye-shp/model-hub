@@ -54,6 +54,8 @@ The old box streams everything to the new one: databases are copied consistently
 | `COWORK_FRIEND_QUOTA_GB` | `5` | each invited friend's folder allowance |
 | `COWORK_MAX_PHASES` / `COWORK_FRIEND_MAX_PHASES` | `6` / `2` | automatic project phases in a row |
 | `COWORK_CONTEXT_SOFT_CHARS` / `_HARD_CHARS` | `120000` / `260000` | when old tool output starts being shortened |
+| `COWORK_LEAD_MODEL` / `COWORK_HELPER_MODEL` | `auto` | pin the lead or helpers to `qwen-1`/`qwen-2` instead of balancing |
+| `COWORK_MAX_PARALLEL_HELPERS` | `4` | helpers one `delegate_many` call may start |
 | `BRIDGE_PUBLIC_URL` | derived from `WEBUI_URL` (`hub.` → `api.`) | the address shown in the phone setup command |
 
 ## 5. Rotating keys

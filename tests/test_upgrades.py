@@ -343,3 +343,53 @@ class MigrateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GpuSplitTests(Base):
+    def test_leads_alternate_gpus_and_helpers_use_the_other_one(self):
+        self.assertEqual(cowork.assign_gpus("a"), ("qwen-1", "qwen-2"))
+        self.assertEqual(cowork.assign_gpus("b"), ("qwen-2", "qwen-1"))
+        cowork.release_gpus("a")
+        self.assertEqual(cowork.assign_gpus("c"), ("qwen-1", "qwen-2"))
+
+    def test_routine_steps_think_less(self):
+        read = [{"role": "user", "content": "x"}, {"type": "function_call", "call_id": "1", "name": "read_file", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "1", "output": "file text"}]
+        self.assertEqual(cowork.effort_for(read, "medium"), "low")
+        self.assertEqual(cowork.effort_for(read[:1], "medium"), "medium")  # planning
+        shell = [{"type": "function_call", "call_id": "2", "name": "run_shell", "arguments": "{}"},
+                 {"type": "function_call_output", "call_id": "2", "output": "Exit code 1\nTraceback"}]
+        self.assertEqual(cowork.effort_for(shell, "medium"), "medium")
+        failed_read = read[:2] + [{"type": "function_call_output", "call_id": "1", "output": "An error occurred: no such file"}]
+        self.assertEqual(cowork.effort_for(failed_read, "medium"), "medium")
+
+    def test_delegate_many_runs_helpers_in_parallel_on_both_gpus(self):
+        seen, active, peak = [], {"n": 0}, {"n": 0}
+        script = [calls(("delegate_many", {"briefs": ["Write a.md about apples", "Write b.md about bananas", "Write c.md about cherries"]})),
+                  {"role": "assistant", "content": "All three written."}]
+
+        async def handler(request):
+            body = json.loads(request.content)
+            if body["messages"][0]["content"].startswith("You are a helper agent"):
+                seen.append(body["model"])
+                active["n"] += 1
+                peak["n"] = max(peak["n"], active["n"])
+                await asyncio.sleep(0.2)
+                active["n"] -= 1
+                return sse({"role": "assistant", "content": "done " + body["messages"][-1]["content"][:12]}, "stop")
+            step = sum(1 for m in body["messages"] if m["role"] == "assistant")
+            delta = script[min(step, 1)]
+            efforts.append(body.get("reasoning_effort"))
+            return sse(delta, "tool_calls" if "tool_calls" in delta else "stop")
+        efforts = []
+
+        async def scenario():
+            ws.create_job("default", "CURRENT REQUEST:\nfruit", "cowork", "balanced", thread="chat-g")
+            job = ws.claim_job()
+            with patch.object(hub, "async_client", return_value=fake_client(handler)), patch.object(escalate, "available", return_value="off"):
+                return await cowork.run_job(job, asyncio.Semaphore(6))
+        self.assertEqual(asyncio.run(scenario()), "All three written.")
+        self.assertEqual(sorted(seen), ["qwen-1", "qwen-2", "qwen-2"])
+        self.assertGreaterEqual(peak["n"], 2)
+        self.assertEqual(cowork._leads, {})  # released when the task ended
+        self.assertEqual(efforts[0], "medium")

@@ -39,8 +39,80 @@ PROFILES = {
 }
 MAX_IMAGES = 8
 SHARE_LIMIT = 100 * 1024**2
-LEAD_MODEL = os.environ.get("COWORK_LEAD_MODEL", "qwen-1")
-HELPER_MODEL = os.environ.get("COWORK_HELPER_MODEL", "qwen-2")  # helpers use the other GPU
+RESIDENTS = ("qwen-1", "qwen-2")  # one per GPU
+# "auto" (default): each task's lead goes to the GPU with fewer leads right now, its helpers to the other one.
+LEAD_MODEL = os.environ.get("COWORK_LEAD_MODEL", "auto")
+HELPER_MODEL = os.environ.get("COWORK_HELPER_MODEL", "auto")
+MAX_PARALLEL_HELPERS = int(os.environ.get("COWORK_MAX_PARALLEL_HELPERS", "4"))
+_leads: dict[str, str] = {}  # job id -> resident leading it (all jobs run in this one controller process)
+
+
+def assign_gpus(job_id: str) -> tuple[str, str]:
+    """(lead, helper) models for a new task, balancing leads across the two GPUs."""
+    if LEAD_MODEL != "auto":
+        lead = LEAD_MODEL
+    else:
+        counts = {m: 0 for m in RESIDENTS}
+        for model in _leads.values():
+            counts[model] = counts.get(model, 0) + 1
+        lead = min(RESIDENTS, key=lambda m: (counts[m], RESIDENTS.index(m)))
+    helper = HELPER_MODEL if HELPER_MODEL != "auto" else next(m for m in RESIDENTS if m != lead) if lead in RESIDENTS else "qwen-2"
+    _leads[job_id] = lead
+    return lead, helper
+
+
+def release_gpus(job_id: str) -> None:
+    _leads.pop(job_id, None)
+
+
+# Tools that only look at things: the call right after them rarely needs long thinking.
+READ_ONLY = {"read_file", "list_files", "recall", "search_knowledge", "search_posts", "recent_posts", "topic_stats",
+             "web_search", "read_webpage", "update_plan", "phone_screen"}
+
+
+def _last_tool_names(items) -> set[str] | None:
+    """Names of the tools whose results end the input, or None when the input doesn't end with tool results."""
+    if not isinstance(items, list) or not items:
+        return None
+    names = {i.get("call_id"): i.get("name") for i in items if isinstance(i, dict) and i.get("type") == "function_call"}
+    tail = []
+    for item in reversed(items):
+        if isinstance(item, dict) and item.get("type") == "function_call_output":
+            tail.append(names.get(item.get("call_id"), ""))
+            continue
+        break
+    return set(tail) if tail else None
+
+
+def _failed(items) -> bool:
+    for item in reversed(items):
+        if not (isinstance(item, dict) and item.get("type") == "function_call_output"):
+            break
+        text = str(item.get("output", ""))[:200]
+        if text.startswith(("Timed out", "An error occurred")) or (text.startswith("Exit code") and not text.startswith("Exit code 0")):
+            return True
+    return False
+
+
+def effort_for(items, base: str) -> str:
+    """Think hard when planning, after errors and after work happened; think briefly after just looking at things."""
+    if base in ("none", "low"):
+        return base
+    tools = _last_tool_names(items)
+    if tools and tools <= READ_ONLY and not _failed(items):
+        return "low"
+    return base
+
+
+class AdaptiveModel(hub.StreamingModel):
+    """Lowers reasoning effort for routine steps (see effort_for)."""
+    async def get_response(self, system_instructions, input, model_settings, *args, **kwargs):
+        extra = dict(model_settings.extra_body or {})
+        base = extra.get("reasoning_effort")
+        if base:
+            extra["reasoning_effort"] = effort_for(input, base)
+            model_settings = model_settings.resolve(ModelSettings(extra_body=extra))
+        return await super().get_response(system_instructions, input, model_settings, *args, **kwargs)
 # Automatic phases in a row before a person has to say "continue".
 MAX_CHAIN = {"owner": int(os.environ.get("COWORK_MAX_PHASES", "6")), "friend": int(os.environ.get("COWORK_FRIEND_MAX_PHASES", "2"))}
 PLAN_FILE = "plan.md"
@@ -276,9 +348,9 @@ def instructions(job: dict, space: sandbox.Workspace, helper: bool = False, esca
         "turns are still there (list_files to see them). Files the user attached are in uploads/.",
         f"- {TOOLBOX}",
         "- web_search and read_webpage for anything current or factual you aren't sure of. Cite sources as markdown links.",
-        "- delegate runs a helper agent on the second GPU with the same shell, files and web tools. Several delegate "
-        "calls in one turn run at the same time: use this for independent research or production pieces. A helper "
-        "cannot see this conversation, so give it a complete, self-contained brief and tell it which file to write.",
+        "- Helpers: delegate runs one helper agent; delegate_many runs several at the same time (spread over both GPUs) "
+        "and returns all their reports. Helpers have the same shell, files and web tools and share this folder. A helper "
+        "cannot see this conversation, so give each a complete, self-contained brief and tell it which file to write.",
         "- Project memory (recall/remember) and the owner's collected TikTok/Instagram posts (search_posts, recent_posts, "
         "topic_stats) and imported documents (search_knowledge).",
         f"- This task has about {minutes} minutes and {PROFILES[job['profile']]['turns']} steps. Older tool results are "
@@ -323,6 +395,11 @@ def instructions(job: dict, space: sandbox.Workspace, helper: bool = False, esca
         "1. Quick questions and small talk: just answer, no tools needed.",
         "2. Real tasks: call update_plan first with 2-8 concrete steps, keep it updated as you go, and mark everything "
         "completed at the end.",
+        "   PARALLEL WORK: you run on one GPU and a second GPU sits idle unless you hand it work. Whenever two or more "
+        "steps don't depend on each other's results (separate files, documents, research questions, scripts, tests), hand "
+        "them to helpers in ONE delegate_many call instead of doing them yourself one by one, then review and integrate "
+        "what they produced. Do steps yourself only when they need this conversation's full context or a previous step's "
+        "result.",
         "3. Do the work, then verify it: run the code, open the file you made, re-check numbers and facts.",
         f"4. {shared}",
         "5. If something fails, read the error and fix it rather than giving up; if you truly can't, say exactly what failed.",
@@ -367,6 +444,10 @@ def build(job: dict, client, gate: asyncio.Semaphore, space: sandbox.Workspace, 
     budget = CallBudget(job, limit=profile["turns"] * 4)
     images = {"count": 0}
     state = state if state is not None else {}
+    if "lead" not in state:
+        state["lead"], state["helper"] = assign_gpus(job_id)
+    lead_model, helper_model = state["lead"], state["helper"]
+    state.setdefault("delegations", 0)
 
     def before(name: str):
         if state.get("stop"):
@@ -495,7 +576,13 @@ def build(job: dict, client, gate: asyncio.Semaphore, space: sandbox.Workspace, 
     def update_plan(steps: list[str], active_index: int, completed_indices: list[int]) -> str:
         """Show the user your task list: 1-12 short steps, the zero-based index of the step in progress
         (-1 for none) and the indices already completed."""
-        return json.dumps(coordination.update_plan(job_id, steps, active_index, completed_indices))
+        steps_now = coordination.update_plan(job_id, steps, active_index, completed_indices)
+        pending = [s["title"] for s in steps_now if s["status"] != "completed"]
+        reply = json.dumps(steps_now)
+        if len(pending) >= 3 and state["delegations"] == 0:
+            reply += ("\nReminder: the second GPU is idle. If any of these pending steps don't depend on each other, run "
+                      "them now as helpers in one delegate_many call instead of one by one.")
+        return reply
 
     @function_tool
     def queue_next_phase(brief: str) -> str:
@@ -552,24 +639,55 @@ def build(job: dict, client, gate: asyncio.Semaphore, space: sandbox.Workspace, 
         return ModelSettings(max_tokens=tokens, parallel_tool_calls=parallel, include_usage=True,
                              extra_body={"reasoning_effort": effort})
 
-    helper = Agent(name="helper", model=hub.model(HELPER_MODEL, client, gate, before),
-                   tools=workspace_tools + research_tools,
-                   model_settings=settings(profile["tokens"], "low" if profile["effort"] == "low" else "medium", False),
-                   instructions=instructions(job, space, helper=True))
+    def make_helper(model: str) -> Agent:
+        return Agent(name="helper", model=AdaptiveModel(model, client, gate, before),
+                     tools=workspace_tools + research_tools,
+                     model_settings=settings(profile["tokens"], "low" if profile["effort"] == "low" else "medium", False),
+                     instructions=instructions(job, space, helper=True))
+    helpers = {helper_model: make_helper(helper_model)}
+
+    async def run_helper(brief: str, model: str) -> str:
+        if model not in helpers:
+            helpers[model] = make_helper(model)
+        state["delegations"] += 1
+        log("delegate", f"Helper started on {model}: {brief[:140]}")
+        try:
+            result = await Runner.run(helpers[model], brief, max_turns=profile["helper_turns"], run_config=RUN_CONFIG,
+                                      error_handlers=out_of_turns(client, gate, profile["tokens"], job_id))
+            output = str(result.final_output)
+        except StopTask:
+            raise
+        except Exception as error:  # one failed helper shouldn't sink the others
+            output = f"Helper failed: {type(error).__name__}: {str(error)[:300]}"
+        log("delegate-done", f"Helper finished: {brief[:80]}")
+        return output
 
     @function_tool
     async def delegate(brief: str) -> str:
-        """Run a helper agent (second GPU) on a self-contained sub-task. It has the shell, files and web tools and
-        shares this workspace. Call several times in one turn to work in parallel. Returns the helper's report."""
+        """Run one helper agent (on the other GPU) on a self-contained sub-task. It has the shell, files and web tools
+        and shares this workspace. Returns the helper's report. For several independent pieces use delegate_many."""
         budget.active()
-        log("delegate", f"Helper started: {brief[:140]}")
-        result = await Runner.run(helper, brief, max_turns=profile["helper_turns"], run_config=RUN_CONFIG,
-                                  error_handlers=out_of_turns(client, gate, profile["tokens"], job_id))
-        log("delegate-done", f"Helper finished: {brief[:80]}")
-        return sandbox.trim(str(result.final_output), 12000)
+        return sandbox.trim(await run_helper(brief, helper_model), 12000)
+
+    @function_tool
+    async def delegate_many(briefs: list[str]) -> str:
+        """Run 2-4 helper agents at the same time, one per brief, spread over both GPUs (you wait while they work).
+        Each brief must be self-contained: goal, input files, the output file to write, what done looks like.
+        Returns every helper's report."""
+        budget.active()
+        briefs = [b.strip() for b in briefs if b and b.strip()]
+        if not briefs:
+            raise ValueError("Give at least one brief")
+        if len(briefs) > MAX_PARALLEL_HELPERS:
+            raise ValueError(f"At most {MAX_PARALLEL_HELPERS} helpers at once; group the work or call again for the rest")
+        # The lead waits during this call, so its GPU is free too: alternate helpers between the two GPUs.
+        order = [helper_model, lead_model] if lead_model in RESIDENTS and helper_model in RESIDENTS else [helper_model]
+        results = await asyncio.gather(*(run_helper(b, order[i % len(order)]) for i, b in enumerate(briefs)))
+        limit = max(3000, 24000 // len(briefs))
+        return "\n\n".join(f"### Helper {i + 1}: {b[:80]}\n{sandbox.trim(r, limit)}" for i, (b, r) in enumerate(zip(briefs, results)))
 
     tools = workspace_tools + [share_file] + research_tools + [recall, remember, recent_posts, topic_stats, update_plan,
-                                                               queue_next_phase, delegate]
+                                                               queue_next_phase, delegate, delegate_many]
     if job["allow_images"]:
         tools.append(generate_image)
 
@@ -615,7 +733,8 @@ def build(job: dict, client, gate: asyncio.Semaphore, space: sandbox.Workspace, 
             return await hand_off("codex", task)
         tools.append(ask_codex)
 
-    return Agent(name="cowork", model=hub.model(LEAD_MODEL, client, gate, before), tools=tools,
+    ws.event(job_id, "tool", f"Lead on {lead_model}, helpers on {helper_model}")
+    return Agent(name="cowork", model=AdaptiveModel(lead_model, client, gate, before), tools=tools,
                  model_settings=settings(profile["tokens"], profile["effort"], True),
                  instructions=instructions(job, space, escalation=escalation, plan_text=read_plan(space),
                                            history=recap(job), phone=phone))
@@ -681,5 +800,6 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
             ws.event(job["id"], "next-phase", nxt)
         return answer
     finally:
+        release_gpus(job["id"])
         session.close()
         await client.close()

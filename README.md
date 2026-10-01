@@ -26,7 +26,7 @@ Pick **Qwen Cowork** in the chat site's model list. (**Qwen (chat)** is the plai
 Behind the scenes:
 
 - **Long runs:** old tool output is shortened before every model call, so long runs don't overflow the context.
-- **Helpers** always run on the second GPU.
+- **Both GPUs:** each task's lead agent goes to the less busy GPU and its helpers to the other. Multi-part work is handed to several helpers at once (`delegate_many`), spread over both GPUs. Routine steps, like reading files or results, use short thinking; planning and fixing errors use full thinking.
 - **Disk:** new work is refused when disk space runs low, but deleting files still works.
 - **Friends:** each invited friend has their own sandbox user, folders and memory, with a 5 GB allowance.
 

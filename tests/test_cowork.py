@@ -32,6 +32,7 @@ class Base(unittest.TestCase):
         if sandbox.IS_ROOT:
             sandbox.USERS.update(owner="nobody", guest="nobody", friend="nobody")
         ws.init()
+        cowork._leads.clear()
 
     def tearDown(self):
         store.DATA, sandbox.ROOT = self.old[0], self.old[1]
