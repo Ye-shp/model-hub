@@ -111,6 +111,21 @@ export function createApp({config, clients, ledger, fetcher = fetch, log = () =>
     });
   }
 
+  // Files the controller is sending to the phone (one-time tokens; the controller checks the bridge key).
+  app.get('/bridge/file/:token', async (req, reply) => {
+    if (!config.controllerUrl) return fail(reply, 404, 'The agent controller is not enabled on this hub.', 'not_found_error');
+    try {
+      const upstream = await fetcher(`${config.controllerUrl}/bridge/file/${encodeURIComponent(req.params.token)}`, {
+        redirect: 'error', signal: AbortSignal.timeout(600000), headers: {authorization: String(req.headers.authorization || '')}});
+      reply.code(upstream.status).header('content-type', upstream.headers.get('content-type') || 'application/octet-stream');
+      if (upstream.headers.get('content-length')) reply.header('content-length', upstream.headers.get('content-length'));
+      const {Readable} = await import('node:stream');
+      return reply.send(upstream.body ? Readable.fromWeb(upstream.body) : '');
+    } catch {
+      return fail(reply, 502, 'The agent controller is not reachable right now.', 'upstream_error');
+    }
+  });
+
   app.post('/v1/chat/completions', async (req, reply) => {
     const model = resolve(req.client, req.body?.model);
     if (!model) return fail(reply, 404, 'Unknown model, or this key may not use it. See GET /v1/models.', 'not_found_error');

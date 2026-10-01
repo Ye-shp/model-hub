@@ -322,8 +322,25 @@ def chain_depth(job: dict) -> int:
 # ---------------------------------------------------------------------------------------------
 # Instructions
 # ---------------------------------------------------------------------------------------------
+RESEARCH_GUIDE = """RESEARCH, VIDEO AND SOCIAL TOOLS (free; pick them yourself whenever they fit)
+- analyze_video: whenever the user shares or mentions a specific TikTok/Reel/Short/X video (link or upload) or wants
+  to know why a video works. Returns hook, beats, CTA, pacing, sound and AI-tool fingerprint, from real measurements.
+- trend_research: "what's trending / what are people saying about X lately" — ranked posts from the last 30 days
+  across Reddit, X, YouTube, Hacker News, Polymarket, GitHub, Bluesky. Synthesise it; cite the posts.
+- google_trends: is interest in a keyword rising or falling; compare 2-5 keywords.
+- x_search / x_trends / x_user (owner only, needs X connected): live X posts, what's trending, an account's posts.
+- instagram_profile / tiktok_profile: a specific creator's recent posts and numbers. TikTok blocks this server often;
+  for TikTok research the phone (phone_collect) and your collected posts (recent_posts/topic_stats) are more reliable.
+- For a content task, a good order is: research what's working (trend_research, collected posts, x_search) →
+  analyze_video on 2-3 top examples → write the content. Run independent lookups in parallel with delegate_many.
+- Posting (owner only): draft_post saves a draft; publish_post only works after the user's own message approves that
+  draft's number ("approve post 7"). Never claim something was posted unless publish_post confirmed it. TikTok posts go
+  through the phone (the media is sent to its gallery, then you post with the phone tools). Post only to the user's own
+  connected accounts."""
+
+
 def instructions(job: dict, space: sandbox.Workspace, helper: bool = False, escalation: list[str] | None = None,
-                 plan_text: str = "", history: str = "", phone: bool = False) -> str:
+                 plan_text: str = "", history: str = "", phone: bool = False, research: str = "") -> str:
     now = datetime.now(timezone.utc)
     today = f"{now:%A %d %B %Y} (it is {now.year}: search for {now.year} information, not earlier years, when asked about 'now')"
     shared = ("Deliverables: write them as files in the workspace (reports .md/.docx/.pdf, tables .csv/.xlsx, code, media) "
@@ -376,6 +393,8 @@ def instructions(job: dict, space: sandbox.Workspace, helper: bool = False, esca
                   "or when the user asks for Claude or ChatGPT/Codex. Don't use them for things you can do yourself: they are "
                   "rate-limited. Give a complete brief (goal, files, constraints, what done looks like), then check what they "
                   "produced before reporting back. If a hand-off fails, the task stops and reports it."]
+    if research:
+        lines += ["", RESEARCH_GUIDE, research]
     lines += [
         "",
         "BIG PROJECTS",
@@ -639,9 +658,16 @@ def build(job: dict, client, gate: asyncio.Semaphore, space: sandbox.Workspace, 
         return ModelSettings(max_tokens=tokens, parallel_tool_calls=parallel, include_usage=True,
                              extra_body={"reasoning_effort": effort})
 
+    import research_tools as research_module
+    research_list, research_status = research_module.build_tools(job, space, client, gate, log, budget,
+                                                                 current_request(job.get("task") or ""), helper_model)
+    # Helpers get the lookups and video analysis too (so several videos/topics can be researched in parallel),
+    # never posting.
+    helper_research = [t for t in research_list if t.name not in {"draft_post", "publish_post", "list_posts"}]
+
     def make_helper(model: str) -> Agent:
         return Agent(name="helper", model=AdaptiveModel(model, client, gate, before),
-                     tools=workspace_tools + research_tools,
+                     tools=workspace_tools + research_tools + helper_research,
                      model_settings=settings(profile["tokens"], "low" if profile["effort"] == "low" else "medium", False),
                      instructions=instructions(job, space, helper=True))
     helpers = {helper_model: make_helper(helper_model)}
@@ -698,6 +724,8 @@ def build(job: dict, client, gate: asyncio.Semaphore, space: sandbox.Workspace, 
             phone = True
             tools += phone_link.agent_tools(job, log, budget, current_request(job.get("task") or ""), client, gate)
 
+    tools += research_list
+
     escalation = []
     if space.is_owner and job["allow_frontier"]:
         for kind in ("claude", "codex"):
@@ -737,7 +765,7 @@ def build(job: dict, client, gate: asyncio.Semaphore, space: sandbox.Workspace, 
     return Agent(name="cowork", model=AdaptiveModel(lead_model, client, gate, before), tools=tools,
                  model_settings=settings(profile["tokens"], profile["effort"], True),
                  instructions=instructions(job, space, escalation=escalation, plan_text=read_plan(space),
-                                           history=recap(job), phone=phone))
+                                           history=recap(job), phone=phone, research=research_status))
 
 
 async def wrap_up(client, gate, profile: dict, job: dict, session, reason: str) -> str:

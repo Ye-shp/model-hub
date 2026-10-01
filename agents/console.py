@@ -46,6 +46,11 @@ class TokenIn(BaseModel):
     token: str = Field(min_length=20, max_length=400)
 
 
+class SocialIn(BaseModel):
+    service: str = Field(min_length=1, max_length=40)
+    words: list[str] = Field(default_factory=list, max_length=8)
+
+
 class CodeIn(BaseModel):
     ref: str = Field(pattern=r"^[0-9a-f]{40}$")
 
@@ -142,6 +147,8 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
             yield
             return
         from crew import run_job
+        import toolbox
+        toolbox.install_in_background()  # free research/video/social tools, once (kept across restarts)
         with controller_lock():
             ws.recover_jobs()
             task = asyncio.create_task(serve(runner or run_job, lambda: bool(hub.HUB_URL and hub.HUB_KEY)))
@@ -377,6 +384,26 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         import escalate
         return escalate.status()
 
+    @app.get("/api/connections/social")
+    def social_connections():
+        import toolbox
+        return {"accounts": toolbox.connected(), "tools": toolbox.status(), "help": toolbox.HELP}
+
+    @app.post("/api/connections/social")
+    def connect_social(body: SocialIn):
+        import toolbox
+        service = body.service.lower()
+        if body.words == ["off"]:
+            return {"accounts": toolbox.forget(service)}
+        return {"accounts": toolbox.save_credentials(service, toolbox.parse_connect(service, body.words))}
+
+    @app.get("/api/posts")
+    def social_posts():
+        import research_tools
+        research_tools.init()
+        return {"posts": ws.query("SELECT id,platform,kind,status,caption,result,created_at,updated_at FROM social_posts "
+                                  "ORDER BY id DESC LIMIT 50")}
+
     @app.post("/api/connections/claude")
     def connect_claude(body: TokenIn):
         import escalate
@@ -446,6 +473,14 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         import phone_link
         result = await request.json()
         return {"accepted": phone_link.deliver(result if isinstance(result, dict) else {})}
+
+    @app.get("/bridge/file/{token}")
+    def bridge_file(token: str):
+        import phone_link
+        path = phone_link.FILES.get(token)
+        if not path:
+            raise HTTPException(404, "Unknown or expired file")
+        return FileResponse(path, filename=Path(path).name, media_type="application/octet-stream")
 
     @app.get("/api/phone")
     def phone_state():

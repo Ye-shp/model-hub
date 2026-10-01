@@ -25,7 +25,8 @@ from xml.etree import ElementTree
 
 import store
 
-COMMANDS = {"screenshot", "ui", "tap", "swipe", "text", "key", "open_app", "open_url", "info"}
+COMMANDS = {"screenshot", "ui", "tap", "swipe", "text", "key", "open_app", "open_url", "info", "push"}
+FILES: dict[str, str] = {}  # one-time download tokens for files being sent to the phone
 KEYS = {"back": "4", "home": "3", "enter": "66", "recents": "187", "delete": "67"}
 APPS = {"tiktok": ["com.zhiliaoapp.musically", "com.ss.android.ugc.trill"], "instagram": ["com.instagram.android"]}
 RISKY = re.compile(r"\b(post|posting|share|publish|upload|send|reply|comment|follow|subscribe|like|buy|purchase|pay|"
@@ -125,6 +126,20 @@ async def call(command: str, timeout: float = 60, **args) -> dict:
     if not result.get("ok"):
         raise RuntimeError(f"Phone {command} failed: {str(result.get('error'))[:300]}")
     return result
+
+
+async def push_file(path: str) -> dict:
+    """Put a video/image into the phone's gallery (DCIM/ModelHub). The bridge downloads it from /bridge/file/<token>."""
+    from pathlib import Path as _Path
+    target = _Path(path)
+    if not target.is_file():
+        raise ValueError(f"{path} is not a file")
+    token = secrets.token_urlsafe(24)
+    FILES[token] = str(target)
+    try:
+        return await call("push", timeout=900, url=f"/bridge/file/{token}", name=target.name, size=target.stat().st_size)
+    finally:
+        FILES.pop(token, None)
 
 
 # ---- reading the screen ----
@@ -319,7 +334,16 @@ def agent_tools(job: dict, log, budget, request_text: str, client, gate) -> list
         log("phone", f"Collecting {posts} {platform} posts")
         return json.dumps(await collect(job["project"], platform, posts, client, budget), ensure_ascii=False)
 
-    return [phone_screen, phone_tap, phone_swipe, phone_type, phone_key, phone_open, phone_collect]
+    @function_tool
+    async def phone_add_media(path: str) -> str:
+        """Copy a workspace video or image into the phone's gallery (album ModelHub) so it can be picked in an app."""
+        budget.active()
+        target = space.resolve(path)
+        log("phone", f"Sending {target.name} to the phone's gallery")
+        result = await push_file(str(target))
+        return f"On the phone at {result.get('path', 'DCIM/ModelHub/' + target.name)} (newest item in the gallery)."
+
+    return [phone_screen, phone_tap, phone_swipe, phone_type, phone_key, phone_open, phone_collect, phone_add_media]
 
 
 async def collect(project: str, platform: str, posts: int, client, budget=None) -> dict:

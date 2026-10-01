@@ -25,7 +25,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.0"
+VERSION = "1.1"
 DEFAULT_URL = "https://api.handydandy.cc"
 KEYS = {"4", "3", "66", "187", "67"}
 
@@ -127,6 +127,22 @@ class Phone:
                 return {"package": package}
         raise RuntimeError(f"Not installed: {', '.join(packages)}")
 
+    def push(self, url: str, name: str, base: str = "", key: str = "", **_):
+        """Download a file from the hub and put it in the phone's gallery (DCIM/ModelHub)."""
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:120] or "media"
+        local = os.path.join(os.path.expanduser("~"), ".modelhub-bridge", name)
+        os.makedirs(os.path.dirname(local), exist_ok=True)
+        req = urllib.request.Request(base.rstrip("/") + url, headers={"Authorization": "Bearer " + key,
+                                                                      "User-Agent": f"ModelHubPhoneBridge/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=600) as response, open(local, "wb") as handle:
+            shutil.copyfileobj(response, handle)
+        remote = f"/sdcard/DCIM/ModelHub/{name}"
+        self.shell("mkdir", "-p", "/sdcard/DCIM/ModelHub")
+        self.run("push", local, remote, timeout=600)
+        self.shell("am", "broadcast", "-a", "android.intent.action.MEDIA_SCANNER_SCAN_FILE", "-d", f"file://{remote}")
+        os.remove(local)
+        return {"path": remote}
+
     def open_url(self, url: str, **_):
         if not re.fullmatch(r"https?://[^\s'\"`;&|<>]+", url):
             raise ValueError("Only plain http(s) links can be opened")
@@ -159,7 +175,8 @@ def main():
     phone = Phone(args.adb, args.serial)
     handlers = {"screenshot": phone.screenshot, "ui": phone.ui, "tap": phone.tap, "swipe": phone.swipe,
                 "text": phone.text, "key": phone.key, "open_app": phone.open_app, "open_url": phone.open_url,
-                "info": lambda **_: phone.info()}
+                "info": lambda **_: phone.info(),
+                "push": lambda **kw: phone.push(base=args.url, key=args.key, **kw)}
     print(f"Phone bridge {VERSION} → {args.url}   (Ctrl+C to stop)")
     details, backoff, said = {}, 2, ""
     while True:

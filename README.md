@@ -21,6 +21,17 @@ Pick **Qwen Cowork** in the chat site's model list. (**Qwen (chat)** is the plai
 - **Claude Code / Codex:** say "use Claude Code for …" to hand work over. If a hand-off fails, the task stops right away and reports what happened. `/connections` shows their status.
 - **If a task stops early** (time limit or failed hand-off), you still get a report. Reply **continue** and the next task gets a summary of what was done, so finished steps aren't redone.
 - **If the page reloads or loses contact**, send **status** to follow the task that's still running.
+- **Research and video tools (free):** Cowork decides when to use these.
+  - `analyze_video` breaks down a TikTok, Reel, Short or X video (link or upload): hook, beats, CTA, cut rate, on-screen text, voiceover, sound, AI-tool fingerprint.
+  - `trend_research` covers the last 30 days on Reddit, X, YouTube, Hacker News, Polymarket, GitHub and Bluesky (the vendored [last30days](https://github.com/mvanhorn/last30days-skill) engine).
+  - `google_trends`, `x_search`, `x_trends`, `x_user`, `instagram_profile` and `tiktok_profile` are targeted lookups.
+
+  The tools install themselves into `/workspace/tools` on first start. TikTok and Instagram often block the rented server, so TikTok research leans on the phone.
+- **Accounts:** connect free accounts from any chat as the owner: `/connect x USERNAME auth_token=… ct0=…` (enables X search and posting), `/connect instagram USER_ID TOKEN` (Instagram API posting), `/connect bluesky HANDLE APP_PASSWORD`, `/connect github TOKEN`. `/connections` shows everything. Sign-in messages are never passed to the model.
+- **Posting:** Cowork drafts posts with `draft_post`. Nothing is published until you reply `approve post N`.
+  - X posts through your connected account.
+  - Instagram reels and stories go through the official API. Image posts need the next hub image.
+  - TikTok goes through the phone: the media lands in its gallery and Cowork posts it in the app.
 - **Phone:** when the phone bridge is connected (see below), Cowork can look at and operate the phone and collect TikTok/Instagram posts. Taps that would post, send, comment, follow, like or buy are blocked unless your message approves them, for example "approved, post it".
 
 Behind the scenes:

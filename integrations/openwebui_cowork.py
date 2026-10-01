@@ -23,8 +23,9 @@ Each chat has its own workspace folder that persists, so follow-ups build on ear
 Pressing stop cancels the task. Send `status` to follow a task that's still running (for example after the page reloaded).
 Big projects: ask for a plan first; Cowork keeps `plan.md` in the chat's folder and can run the next phase automatically.
 
-Owner commands: `/connections` (Claude Code / Codex status) · `/connect claude TOKEN` (token from `claude setup-token`) ·
-`/connect codex` (sign Codex in with your ChatGPT account)."""
+Owner commands: `/connections` (status of everything) · `/connect claude TOKEN` (token from `claude setup-token`) ·
+`/connect codex` · `/connect x USERNAME auth_token=… ct0=…` · `/connect instagram USER_ID ACCESS_TOKEN` ·
+`/connect bluesky HANDLE APP_PASSWORD` · `/connect github TOKEN`. Approve a drafted post with `approve post N`."""
 
 SKIP = {"model", "usage", "queued", "completed", "failed", "interrupted", "cancelled", "resumed", "frontier-call", "partial",
         "next-phase"}
@@ -300,8 +301,33 @@ class Pipe:
                     rows = [f"- **{'Claude Code' if k == 'claude' else 'Codex'}**: "
                             f"{'connected' if v['signed_in'] else 'not connected'}{'' if v['installed'] else ' (not installed)'}; "
                             f"{v['used_today']}/{v['daily_limit']} tasks in the last 24 h" for k, v in info.items()]
+                    social = await self._call(client, "GET", "/api/connections/social")
+                    names = {"x": "X", "instagram": "Instagram (posting)", "bluesky": "Bluesky", "github": "GitHub",
+                             "scrapecreators": "ScrapeCreators (optional)"}
+                    rows += [f"- **{names[k]}**: {'connected' + (' as @' + v['username'] if v.get('username') else '') if v['connected'] else 'not connected'}"
+                             for k, v in social["accounts"].items()]
+                    tools = social["tools"]
+                    rows.append(f"- **Research tools**: {tools['state']}" + (f" ({tools.get('detail')})" if tools.get("detail") else ""))
                     yield "\n".join(rows + ["", "To connect Claude Code: run `claude setup-token` on your computer, then send "
-                                                 "`/connect claude <token>`. To connect Codex: send `/connect codex`."])
+                                                 "`/connect claude <token>`. To connect Codex: send `/connect codex`.", ""] +
+                                     [f"- {social['help'][k]}" for k in social["help"]] +
+                                     ["", "Disconnect an account with `/connect <name> off`."])
+                    return
+                social_name = command.split()[1] if command.startswith("/connect ") and len(command.split()) > 1 else ""
+                if social_name in {"x", "twitter", "instagram", "ig", "bluesky", "github", "scrapecreators"}:
+                    if tier != "owner":
+                        yield "Only the owner can manage connections."
+                        return
+                    service = {"twitter": "x", "ig": "instagram"}.get(social_name, social_name)
+                    words = request_text.split()[2:]
+                    try:
+                        result = await self._call(client, "POST", "/api/connections/social", json={"service": service, "words": words})
+                    except ValueError as error:
+                        yield f"Not saved: {error}"
+                        return
+                    state = result["accounts"][service]
+                    yield (f"**{service}** is {'connected' if state['connected'] else 'disconnected'}. "
+                           + ("You can delete this message from the chat; the sign-in is stored only on the box." if state["connected"] else ""))
                     return
                 if command.startswith("/update-code"):
                     parts = request_text.split()
@@ -355,6 +381,8 @@ class Pipe:
                 for message in reversed(messages[:-1]):
                     text, pictures = self._text(message.get("content"))
                     text = re.sub(r"<details[\s\S]*?</details>", "", text).strip()
+                    if text.lower().startswith("/connect"):  # sign-ins never go to the model
+                        text = "(connection command, hidden)"
                     entry = f"{message['role'].upper()}: {text}" + (" [image attached]" if pictures else "")
                     if used + len(entry) > self.valves.HISTORY_CHARACTERS:
                         history.append("(earlier messages omitted)")

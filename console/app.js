@@ -230,6 +230,16 @@ async function loadPeople() {
   const c = o.connections || {};
   if (c.error) kv('connections', [['Status', c.error]]);
   else kv('connections', Object.entries(c).map(([k, v]) => [k === 'claude' ? 'Claude Code' : 'Codex', `${v.signed_in ? 'connected' : 'not connected'}${v.installed ? '' : ' (not installed)'} · ${v.used_today}/${v.daily_limit} today`]));
+  try {
+    const [social, posts] = await Promise.all([api('connections/social'), api('posts')]);
+    const names = {x: 'X', instagram: 'Instagram posting', bluesky: 'Bluesky', github: 'GitHub', scrapecreators: 'ScrapeCreators'};
+    kv('social', [['Research tools', social.tools.state + (social.tools.detail ? ' — ' + social.tools.detail.slice(0, 160) : '')],
+      ...Object.entries(social.accounts).map(([k, v]) => [names[k] || k, v.connected ? 'connected' + (v.username ? ' as @' + v.username : '') : 'not connected'])]);
+    if (!posts.posts.length) empty('posts', 'No drafts yet.');
+    else $('posts').replaceChildren(...posts.posts.map(p => { const it = el('div', undefined, 'item'); const l = el('div', undefined, 'line1');
+      l.append(el('span', `#${p.id} · ${p.platform}${p.kind ? ' ' + p.kind : ''}`, 'title'), badge(p.status, {published: 'completed', draft: 'queued', on_phone: 'running'}[p.status] || p.status));
+      it.append(l, el('div', p.caption.slice(0, 280), 'text'), el('div', ago(p.updated_at), 'meta')); return it; }));
+  } catch (e) { kv('social', [['Status', e.message]]); }
   if (!o.escalations.length) empty('handoffs', 'No hand-offs yet.');
   else $('handoffs').replaceChildren(...o.escalations.map(e => { const it = el('div', undefined, 'item'); it.append(el('div', e.detail, 'text'), el('div', `${e.requested_by || ''} · ${ago(e.created_at)}`, 'meta')); return it; }));
 }

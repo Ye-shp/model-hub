@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import re
 import time
 import unittest
 from unittest.mock import patch
@@ -393,3 +394,83 @@ class GpuSplitTests(Base):
         self.assertGreaterEqual(peak["n"], 2)
         self.assertEqual(cowork._leads, {})  # released when the task ended
         self.assertEqual(efforts[0], "medium")
+
+
+class ResearchToolTests(Base):
+    def test_connect_parsing_storage_and_secrecy(self):
+        import toolbox
+        values = toolbox.parse_connect("x", ["myname", "auth_token=abc", "ct0=def"])
+        self.assertEqual(values, {"auth_token": "abc", "ct0": "def", "username": "myname"})
+        with self.assertRaises(ValueError):
+            toolbox.save_credentials("x", {"username": "me"})
+        state = toolbox.save_credentials("x", values)
+        self.assertTrue(state["x"]["connected"])
+        self.assertEqual(oct((store.DATA / "social.json").stat().st_mode & 0o777), "0o600")
+        self.assertEqual(toolbox.social_env()["AUTH_TOKEN"], "abc")
+        self.assertFalse(toolbox.forget("x")["x"]["connected"])
+        client = TestClient(console.create_app("k" * 40, run_worker=False))
+        r = client.post("/api/connections/social", headers=AUTH, json={"service": "bluesky", "words": ["me.bsky.social", "pw-1"]})
+        self.assertTrue(r.json()["accounts"]["bluesky"]["connected"], r.text)
+        self.assertIn("help", client.get("/api/connections/social", headers=AUTH).json())
+
+    def test_posts_need_the_users_approval_of_that_draft(self):
+        import research_tools
+        self.assertTrue(research_tools.approved_post("approve post 7", 7))
+        self.assertTrue(research_tools.approved_post("ok, approved — post 12 go", 12))
+        self.assertFalse(research_tools.approved_post("approve post 17", 7))
+        self.assertFalse(research_tools.approved_post("draft a post about 7 hooks", 7))
+
+        space = sandbox.Workspace("owner", "chat-post").prepare()
+        space.write_text("caption.txt", "x")
+        job = {"id": "j" * 32, "project": "default", "profile": "fast", "allow_frontier": 0, "allow_images": 0,
+               "thread": "chat-post", "task": "CURRENT REQUEST:\nmake a post"}
+        ws.create_job("default", "x", "cowork", thread="chat-post")
+        calls_made = []
+
+        async def fake_social(command, args, timeout=240):
+            calls_made.append((command, args))
+            return {"ok": True, "id": "1", "url": "https://x.com/me/status/1"}
+
+        class Budget:
+            def active(self): pass
+            def before(self, name): pass
+
+        def tools_for(request):
+            tools, _ = research_tools.build_tools({**job, "task": "CURRENT REQUEST:\n" + request}, space, None, asyncio.Semaphore(1),
+                                                  lambda *a: None, Budget(), request, "qwen-2")
+            return {t.name: t for t in tools}
+
+        async def invoke(tool, args):
+            from agents.tool_context import ToolContext
+            ctx = ToolContext(context=None, tool_name=tool.name, tool_call_id="c1", tool_arguments=json.dumps(args))
+            return await tool.on_invoke_tool(ctx, json.dumps(args))
+
+        tools = tools_for("make a post")
+        self.assertTrue({"analyze_video", "trend_research", "x_search", "draft_post", "publish_post"} <= set(tools))
+        reply = asyncio.run(invoke(tools["draft_post"], {"platform": "x", "caption": "hello world"}))
+        post_id = int(re.search(r"#(\d+)", reply).group(1))
+        with patch.object(research_tools.toolbox, "run_social", fake_social):
+            refused = asyncio.run(invoke(tools["publish_post"], {"post_id": post_id}))
+            self.assertIn("Not approved", refused)
+            self.assertEqual(calls_made, [])
+            done = asyncio.run(invoke(tools_for(f"approve post {post_id}")["publish_post"], {"post_id": post_id}))
+        self.assertIn("x.com/me/status/1", done)
+        self.assertEqual(calls_made[0][0], "x_post")
+        self.assertEqual(ws.query("SELECT status FROM social_posts WHERE id=?", (post_id,))[0]["status"], "published")
+        guest = sandbox.Workspace(sandbox.friend_account("f@x.com"), "t").prepare()
+        friend_tools, _ = research_tools.build_tools({**job, "project": guest.tier}, guest, None, asyncio.Semaphore(1),
+                                                     lambda *a: None, Budget(), "", "qwen-2")
+        names = {t.name for t in friend_tools}
+        self.assertIn("analyze_video", names)
+        self.assertFalse(names & {"x_search", "draft_post", "publish_post"})
+
+    def test_video_report_facts_include_measurements(self):
+        import research_tools
+        text = research_tools.facts({"source": "u", "video": {"duration": 9.0, "width": 720, "height": 1280, "fps": 25, "has_audio": True},
+                                     "shots": {"count": 3, "cuts_per_second": 0.22, "average_shot_seconds": 3.0, "first_cut_at": 3.0,
+                                               "list": [[0, 3], [3, 6], [6, 9]]},
+                                     "on_screen_text": [{"at": 0.0, "text": "WAIT FOR IT"}],
+                                     "transcript": {"language": "en", "words": 3, "speech_seconds": 2, "segments": [{"start": 0, "end": 2, "text": "Stop scrolling now"}]},
+                                     "sound": {"title": "Song", "artist": "Band"}})
+        for expected in ("cuts per second: 0.22", "WAIT FOR IT", "Stop scrolling now", "Song — Band"):
+            self.assertIn(expected, text)
