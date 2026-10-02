@@ -16,7 +16,7 @@ Two abliterated Qwen3.8-27B models running 24/7 on two rented RTX 3090s, with:
 Friends / you ─▶ hub.YOUR-DOMAIN ─(Cloudflare login)─┐
 Laptop agents / phone ─▶ api.YOUR-DOMAIN ─(API key)──┤ Cloudflare Tunnel (outbound only)
                                                      ▼
-Vast rental: Open WebUI :3000 ─▶ Gateway :8080 ─▶ qwen-1 (GPU 0)
+Vast rental: Open WebUI (Unix socket) ─▶ Gateway :8080 ─▶ qwen-1 (GPU 0)
                                      │         └─▶ qwen-2 (GPU 1)
                                      └─▶ optional third slot / Claude / GPT
 ```
@@ -51,8 +51,13 @@ Vast rental: Open WebUI :3000 ─▶ Gateway :8080 ─▶ qwen-1 (GPU 0)
 
    | Hostname | Service | Extra setting |
    |---|---|---|
-   | `hub.YOUR-DOMAIN` | `http://127.0.0.1:3000` | Additional settings → Access → **Protect with Access** on, with your team name and the AUD tag from step 3 |
+   | `hub.YOUR-DOMAIN` | `unix:/run/hub/webui.sock` | Additional settings → Access → **Protect with Access** on, with your team name and the AUD tag from step 3 |
    | `api.YOUR-DOMAIN` | `http://127.0.0.1:8080` | none; every request needs an API key |
+
+   Keep the hub origin on the root-only Unix socket. Open WebUI trusts the email header supplied by
+   Cloudflare Access; a loopback TCP origin would also be reachable by unprivileged Cowork shells.
+   `deploy/webui_serve.py` uses HTTP polling for Socket.IO because cloudflared's HTTP/2 tunnel
+   cannot forward WebSocket upgrades to a Unix-socket origin reliably.
 
 ## 4. Make your secrets
 
