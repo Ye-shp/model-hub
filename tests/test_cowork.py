@@ -26,16 +26,19 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         os.chmod(self.temp.name, 0o755)  # the sandbox user must be able to reach its folder
-        self.old = (store.DATA, sandbox.ROOT, dict(sandbox.USERS))
+        import toolbox
+        self.old = (store.DATA, sandbox.ROOT, dict(sandbox.USERS), toolbox.TOOLS_DIR)
         store.DATA = Path(self.temp.name) / "data"
         sandbox.ROOT = Path(self.temp.name) / "cowork"
+        toolbox.TOOLS_DIR = Path(self.temp.name) / "tools"  # never the real /workspace/tools (absent on CI runners)
         if sandbox.IS_ROOT:
             sandbox.USERS.update(owner="nobody", guest="nobody", friend="nobody")
         ws.init()
         cowork._leads.clear()
 
     def tearDown(self):
-        store.DATA, sandbox.ROOT = self.old[0], self.old[1]
+        import toolbox
+        store.DATA, sandbox.ROOT, toolbox.TOOLS_DIR = self.old[0], self.old[1], self.old[3]
         sandbox.USERS.clear(); sandbox.USERS.update(self.old[2])
         self.temp.cleanup()
 
