@@ -65,3 +65,17 @@ The old box streams everything to the new one: databases are copied consistently
 - **Claude Code:** `claude setup-token` on your computer, then `/connect claude <token>` in a Cowork chat.
 - **Phone bridge:** New key on the console's Phone page, then restart `bridge.py` with it.
 - **Vast API key and the GitHub token for ghcr pulls:** create new ones in their dashboards, update the template's docker login, and delete the old ones.
+
+## 6. Telegram
+
+1. In Telegram, message **@BotFather**, send `/newbot`, and copy the token it gives you.
+2. In any Qwen Cowork chat, as the owner: `/connect telegram <token>`. The reply shows a pairing code.
+3. Open the bot and send `/start <code>`. From then on only that Telegram account can use it; strangers get no answer.
+
+Send it TikToks, Reels, X posts or threads, Reddit threads, YouTube links or a video file (up to 20 MB). It replies at
+once with the platform, then Cowork studies the post and its top comments (`study_link`) and saves anything useful about
+UGC, go-to-market and growth to the owner project's knowledge base, which every Cowork chat searches. Anything else is a
+normal Cowork request. `/new` starts a fresh conversation, `/status` shows what's running, `/connect telegram off`
+disconnects. The bot polls Telegram from the box, so no tunnel route is needed. Comments: TikTok, Reddit and X (with
+`/connect x`) work without other sign-ins; Instagram only shows comments to signed-in accounts, so Reels are studied
+from the video and caption alone.
