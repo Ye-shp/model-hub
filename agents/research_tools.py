@@ -2,6 +2,8 @@
 
   analyze_video     a TikTok/Reel/Short/X link or uploaded file -> hook, beats, CTA, pacing, sound, AI-tool fingerprint
   trend_research    last 30 days across Reddit, X, YouTube, Hacker News, Polymarket, GitHub, Bluesky (last30days engine)
+  study_link        one post (TikTok, Reel, X thread, Reddit thread, YouTube, article) + its top comments -> the useful
+                    UGC / go-to-market know-how, saved to the project's knowledge base (see study.py); list_knowledge
   x_search/x_trends/x_user, instagram_profile, tiktok_profile, google_trends   targeted lookups
   draft_post / publish_post / list_posts   posting to X, Instagram or TikTok (via the phone) — only after the user
                                            approves a specific draft in their own message
@@ -151,6 +153,22 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
         return json.dumps(result, ensure_ascii=False)[:14000]
 
     # ---- video analysis ----
+    async def probe(source: str, max_frames: int = 12, folder: str = "video-analysis"):
+        """Measure a video (link or workspace file) in the sandbox: (report, output folder, error or None)."""
+        target = source if source.startswith(("http://", "https://")) else str(space.resolve(source))
+        out = space.resolve(f"{folder}/{slug(source.rsplit('/', 1)[-1] or source)}-{time.strftime('%H%M%S')}")
+        await asyncio.to_thread(toolbox.wait_ready)
+        command = [str(toolbox.PYTHON), str(script("video_probe.py")), target, str(out), "--frames",
+                   str(max(4, min(max_frames, 16))), "--whisper", str(toolbox.WHISPER_DIR)]
+        result = await space.run(command, timeout=900)
+        report_path = out / "analysis.json"
+        if not report_path.is_file():
+            return None, out, "video analysis failed: " + result["output"][-1500:]
+        report = json.loads(report_path.read_text())
+        if not report.get("frames"):
+            return report, out, "couldn't get the video: " + json.dumps(report.get("errors", {}))[:1000]
+        return report, out, None
+
     @function_tool
     async def analyze_video(source: str, max_frames: int = 12) -> str:
         """Analyse a short-form video: a TikTok / Instagram Reel / YouTube Short / X video link, or a video file in the
@@ -158,22 +176,10 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
         identifies the song/sound, pulls the post's stats, then breaks down hook, beats, CTA, emotional peak, pacing and
         AI-tool fingerprint. Saves frames and report.md under video-analysis/. Takes 1-4 minutes."""
         budget.active()
-        if source.startswith(("http://", "https://")):
-            target = source
-        else:
-            target = str(space.resolve(source))
-        out = space.resolve(f"video-analysis/{slug(source.rsplit('/', 1)[-1] or source)}-{time.strftime('%H%M%S')}")
         log("tool", f"Analysing video: {source[:120]}")
-        await asyncio.to_thread(toolbox.wait_ready)
-        command = [str(toolbox.PYTHON), str(script("video_probe.py")), target, str(out), "--frames",
-                   str(max(4, min(max_frames, 16))), "--whisper", str(toolbox.WHISPER_DIR)]
-        result = await space.run(command, timeout=900)
-        report_path = out / "analysis.json"
-        if not report_path.is_file():
-            return "Video analysis failed:\n" + result["output"][-2000:]
-        report = json.loads(report_path.read_text())
-        if not report.get("frames"):
-            return "Couldn't get the video: " + json.dumps(report.get("errors", {}))[:1500]
+        report, out, error = await probe(source, max_frames)
+        if error:
+            return error[:1].upper() + error[1:2000]
         content = [{"type": "text", "text": ANALYSIS_PROMPT + "\n\nMEASUREMENTS\n" + facts(report)}]
         for frame in report["frames"][:16]:
             content.append({"type": "text", "text": f"Keyframe at {frame['at']} s:"})
@@ -246,7 +252,53 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
         saved = space.write_text(f"research/{slug(topic)}-{time.strftime('%Y%m%d-%H%M')}.md", text)
         return text[:16000] + f"\n\n({saved}. Synthesise this into findings with sources; don't paste it whole.)"
 
-    tools = [analyze_video, trend_research]
+    # ---- studying posts into the knowledge base ----
+    @function_tool
+    async def study_link(source: str, save: str = "auto") -> str:
+        """Study one post the user sent: a TikTok, Instagram Reel or post, X post or thread, Reddit thread, YouTube
+        video or Short, LinkedIn/Threads post, article, or a video file in the workspace (uploads/…). Says which platform
+        it is, reads what it says (thread text, or the video's transcript, on-screen text and caption) and its most-liked
+        comments, and extracts every useful UGC / go-to-market / growth / content tactic. Useful findings are saved to
+        this project's knowledge base, where search_knowledge finds them in every future chat. save: auto (save when it's
+        actionable know-how) | always | never. A link studied before returns the saved notes unless save='always'.
+        Takes 1-4 minutes for videos. Study several links in parallel with delegate_many."""
+        import study
+        budget.active()
+        folder = f"study/{slug(source.rsplit('/', 1)[-1] or source)}-{time.strftime('%H%M%S')}"
+
+        async def run_social(command: str, args: dict) -> dict:
+            return await toolbox.run_social(command, args, 300)
+
+        async def ask(content: list) -> str:
+            budget.before(helper_model)
+            async with gate:
+                response = await client.chat.completions.create(
+                    model=helper_model, messages=[{"role": "user", "content": content}], max_tokens=5000,
+                    temperature=0.3, extra_body={"reasoning_effort": "medium"})
+            return response.choices[0].message.content or ""
+
+        async def video(src: str):
+            report, _, error = await probe(src, 10, folder)
+            return report, error
+
+        try:
+            result = await study.study(
+                source.strip(), project, probe=video, social=run_social, ask=ask, small_jpeg=small_jpeg, facts=facts, log=log,
+                x_signed_in=owner and links.get("x", {}).get("connected", False), save=save if save in {"auto", "always", "never"} else "auto",
+                write_file=lambda text: space.write_text(f"{folder}/notes.md", text))
+        except (RuntimeError, ValueError, LookupError) as error:
+            return f"Couldn't study this link: {error}"
+        return study.reply(result) + (f"\n\n(Full notes and the material read: {folder}/notes.md)" if not result["already"] else "")
+
+    @function_tool
+    def list_knowledge(category: str = "", limit: int = 40) -> str:
+        """Posts already studied into this project's knowledge base, newest first, with their source links. category:
+        optional filter (ugc, gtm, growth, content, ads, sales, product, creator-business). Use search_knowledge to
+        search their contents."""
+        import study
+        return json.dumps(study.index(project, category, limit), ensure_ascii=False)
+
+    tools = [analyze_video, trend_research, study_link, list_knowledge]
 
     # ---- lookups ----
     @function_tool

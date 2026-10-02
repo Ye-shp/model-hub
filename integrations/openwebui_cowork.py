@@ -25,7 +25,8 @@ Big projects: ask for a plan first; Cowork keeps `plan.md` in the chat's folder 
 
 Owner commands: `/connections` (status of everything) · `/connect claude TOKEN` (token from `claude setup-token`) ·
 `/connect codex` · `/connect x USERNAME auth_token=… ct0=…` · `/connect instagram USER_ID ACCESS_TOKEN` ·
-`/connect bluesky HANDLE APP_PASSWORD` · `/connect github TOKEN`. Approve a drafted post with `approve post N`."""
+`/connect bluesky HANDLE APP_PASSWORD` · `/connect github TOKEN` · `/connect telegram BOT_TOKEN` (use Cowork from
+Telegram). Approve a drafted post with `approve post N`."""
 
 SKIP = {"model", "usage", "queued", "completed", "failed", "interrupted", "cancelled", "resumed", "frontier-call", "partial",
         "next-phase"}
@@ -308,10 +309,38 @@ class Pipe:
                              for k, v in social["accounts"].items()]
                     tools = social["tools"]
                     rows.append(f"- **Research tools**: {tools['state']}" + (f" ({tools.get('detail')})" if tools.get("detail") else ""))
+                    try:
+                        telegram = await self._call(client, "GET", "/api/connections/telegram")
+                        rows.append("- **Telegram**: " + (("@" + str(telegram["bot"]) + (" (paired)" if telegram["paired"] else
+                                                                                        " (waiting for /start <code>)"))
+                                                          if telegram["connected"] else "not connected (`/connect telegram <bot token>`)"))
+                    except (httpx.HTTPError, ValueError, KeyError):
+                        pass
                     yield "\n".join(rows + ["", "To connect Claude Code: run `claude setup-token` on your computer, then send "
                                                  "`/connect claude <token>`. To connect Codex: send `/connect codex`.", ""] +
                                      [f"- {social['help'][k]}" for k in social["help"]] +
                                      ["", "Disconnect an account with `/connect <name> off`."])
+                    return
+                if command.startswith("/connect telegram"):
+                    if tier != "owner":
+                        yield "Only the owner can manage connections."
+                        return
+                    words = request_text.split()
+                    if len(words) != 3:
+                        yield ("Make a bot with **@BotFather** in Telegram (`/newbot`), then send `/connect telegram <the token "
+                               "it gives you>`. Send `/connect telegram off` to disconnect it.")
+                        return
+                    try:
+                        state = await self._call(client, "POST", "/api/connections/telegram", json={"token": words[2]})
+                    except ValueError as error:
+                        yield f"Not connected: {error}"
+                        return
+                    if not state["connected"]:
+                        yield "Telegram is disconnected."
+                        return
+                    yield (f"Telegram bot **@{state['bot']}** is connected. Open https://t.me/{state['bot']} and send:\n\n"
+                           f"`/start {state['pairing_code']}`\n\nOnly the Telegram account that sends this code can use the bot. "
+                           "You can delete this message from the chat; the token is stored only on the box.")
                     return
                 social_name = command.split()[1] if command.startswith("/connect ") and len(command.split()) > 1 else ""
                 if social_name in {"x", "twitter", "instagram", "ig", "bluesky", "github", "scrapecreators"}:

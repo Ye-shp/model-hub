@@ -51,6 +51,10 @@ class SocialIn(BaseModel):
     words: list[str] = Field(default_factory=list, max_length=8)
 
 
+class TelegramIn(BaseModel):
+    token: str = Field(min_length=3, max_length=120)  # a @BotFather token, or "off"
+
+
 class CodeIn(BaseModel):
     ref: str = Field(pattern=r"^[0-9a-f]{40}$")
 
@@ -149,15 +153,18 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         from crew import run_job
         import toolbox
         toolbox.install_in_background()  # free research/video/social tools, once (kept across restarts)
+        import telegram_bot
         with controller_lock():
             ws.recover_jobs()
             task = asyncio.create_task(serve(runner or run_job, lambda: bool(hub.HUB_URL and hub.HUB_KEY)))
+            telegram = asyncio.create_task(telegram_bot.serve())  # idle until /connect telegram
             try:
                 yield
             finally:
-                task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
+                for running in (task, telegram):
+                    running.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await running
 
     app = FastAPI(title="Model Hub workspace", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -396,6 +403,21 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         if body.words == ["off"]:
             return {"accounts": toolbox.forget(service)}
         return {"accounts": toolbox.save_credentials(service, toolbox.parse_connect(service, body.words))}
+
+    @app.get("/api/connections/telegram")
+    def telegram_status():
+        import telegram_bot
+        return telegram_bot.status()
+
+    @app.post("/api/connections/telegram")
+    async def connect_telegram(body: TelegramIn):
+        import telegram_bot
+        if body.token.strip().lower() == "off":
+            return telegram_bot.disconnect()
+        try:
+            return await telegram_bot.connect(body.token)
+        except RuntimeError as error:  # Telegram refused the token
+            raise ValueError(str(error)) from None
 
     @app.get("/api/posts")
     def social_posts():
