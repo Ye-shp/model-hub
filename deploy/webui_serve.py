@@ -3,12 +3,16 @@
 The chat site trusts the sign-in email header that Cloudflare Access adds, so anything that can open a
 connection to it could claim to be anyone. A socket in a root-only folder can be reached by the tunnel
 (root) but not by the Cowork agent's shell, which runs as an unprivileged user on the same box.
-Same settings as `open-webui serve` otherwise.
+Socket.IO uses HTTP polling because cloudflared's HTTP/2 tunnel cannot forward WebSocket upgrades to
+this Unix-socket origin.
 """
 import os
 import sys
 
 os.environ["FROM_INIT_PY"] = "true"
+# This runs before Open WebUI imports its environment settings. Keep the root-only socket: binding
+# WebUI to loopback TCP would let a Cowork shell forge Cloudflare's trusted email header.
+os.environ["ENABLE_WEBSOCKET_SUPPORT"] = "false"
 socket_path = sys.argv[1]
 os.makedirs(os.path.dirname(socket_path), mode=0o700, exist_ok=True)
 os.chmod(os.path.dirname(socket_path), 0o700)
