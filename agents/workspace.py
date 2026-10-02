@@ -4,10 +4,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import struct
 import uuid
 from pathlib import Path
 from contextlib import contextmanager
 
+import semantic
 import store
 
 SCHEMA = """
@@ -40,6 +42,10 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE TABLE IF NOT EXISTS artifacts (
   id TEXT PRIMARY KEY, project TEXT NOT NULL, job_id TEXT, name TEXT NOT NULL,
   path TEXT NOT NULL UNIQUE, media_type TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS embeddings (
+  source TEXT NOT NULL, row_id INTEGER NOT NULL, dim INTEGER NOT NULL, vector BLOB, created_at TEXT NOT NULL,
+  PRIMARY KEY (source, row_id)
 );
 """
 
@@ -119,12 +125,114 @@ def save_note(project: str, title: str, content: str, kind: str = "fact", source
           ON CONFLICT(project,title) DO UPDATE SET content=excluded.content,kind=excluded.kind,
           sources=excluded.sources,updated_at=excluded.updated_at""",
                    (project, title, content, kind, json.dumps(sources or []), store.now()))
-        return db.execute("SELECT id FROM notes WHERE project=? AND title=?", (project, title)).fetchone()[0]
+        note = db.execute("SELECT id FROM notes WHERE project=? AND title=?", (project, title)).fetchone()[0]
+    embed_note(note, project, f"{title}\n{content}")
+    return note
+
+
+def _pack(vector: list[float]) -> bytes:
+    return struct.pack("<" + "f" * len(vector), *vector)
+
+
+def _unpack(blob: bytes, dim: int) -> list[float]:
+    return list(struct.unpack("<" + "f" * dim, blob))
+
+
+def _store_vectors(items: list[tuple[str, int, list[float]]]) -> None:
+    with connection() as db, db:
+        db.executemany("INSERT OR REPLACE INTO embeddings(source,row_id,dim,vector,created_at) VALUES (?,?,?,?,?)",
+                       [(source, row_id, len(vec), _pack(vec), store.now()) for source, row_id, vec in items])
+
+
+def _embed_texts(texts: list[str]) -> list[list[float]] | None:
+    """Vectors for texts, or None when embedding fails or returns the wrong shape. Never raises."""
+    try:
+        vecs = semantic.embed(texts)
+        if vecs and len(vecs) == len(texts) and all(vecs):
+            return vecs
+    except Exception:
+        pass
+    return None
+
+
+def embed_note(note_id: int, project: str, text: str) -> bool:
+    """Store a note's vector (replacing any older one). False if embedding is unavailable."""
+    try:
+        vecs = _embed_texts([text])
+        if not vecs:
+            return False
+        _store_vectors([(f"note:{note_id}", note_id, vecs[0])])
+        return True
+    except Exception:
+        return False
+
+
+def embed_chunk(project: str, document_id: str, chunk_no: int, text: str) -> bool:
+    """Store one knowledge chunk's vector. False if embedding is unavailable."""
+    return embed_chunks(project, document_id, [(chunk_no, text)]) > 0
+
+
+def embed_chunks(project: str, document_id: str, items: list[tuple[int, str]]) -> int:
+    """Embed (chunk_no, text) pairs in one call and store them; returns how many were stored."""
+    try:
+        vecs = _embed_texts([text for _, text in items])
+        if not vecs:
+            return 0
+        _store_vectors([(f"chunk:{project}:{document_id}:{no}", no, vec) for (no, _), vec in zip(items, vecs)])
+        return len(vecs)
+    except Exception:
+        return 0
+
+
+def vectors(project: str, kind: str = "note", dim: int | None = None) -> dict[str, list[float]]:
+    """Stored vectors of a project keyed by source ('note:<id>' or 'chunk:<project>:<doc>:<n>').
+    Only the newest dimension is returned (or `dim` if given); rows of other dimensions are skipped."""
+    if kind == "note":
+        rows = query("SELECT e.source,e.dim,e.vector,e.created_at FROM embeddings e JOIN notes n ON e.source='note:'||n.id "
+                     "WHERE n.project=?", (project,))
+    else:
+        prefix = f"chunk:{project}:"
+        rows = query("SELECT source,dim,vector,created_at FROM embeddings WHERE substr(source,1,?)=?", (len(prefix), prefix))
+    rows = [r for r in rows if r["vector"] is not None]
+    if not rows:
+        return {}
+    if dim is None:
+        dim = max(rows, key=lambda r: r["created_at"])["dim"]
+    out = {}
+    for r in rows:
+        if r["dim"] == dim and len(r["vector"]) == 4 * dim:
+            out[r["source"]] = _unpack(r["vector"], dim)
+    return out
+
+
+def _rank_score(rank: int) -> float:
+    """Keyword/BM25 component: 1-based rank 1 -> 1.0, then 1/rank, so better ranks score higher."""
+    return 1.0 / rank
+
+
+def _mix(cos: float, keyword: float, vector_weight: float) -> float:
+    return vector_weight * (cos + 1) / 2 + (1 - vector_weight) * keyword
 
 
 def memories(project: str, search: str = "", limit: int = 10) -> list[dict]:
-    return query("SELECT * FROM notes WHERE project=? AND (title LIKE ? OR content LIKE ?) ORDER BY updated_at DESC, id DESC LIMIT ?",
-                 (project, f"%{search}%", f"%{search}%", max(1, min(limit, 30))))
+    limit = max(1, min(limit, 30))
+    like = ("SELECT * FROM notes WHERE project=? AND (title LIKE ? OR content LIKE ?) ORDER BY updated_at DESC, id DESC LIMIT ?",
+            (project, f"%{search}%", f"%{search}%", limit))
+    if not search:
+        return query(*like)
+    qvec = (_embed_texts([search]) or [None])[0]
+    if qvec is None:
+        return query(*like)
+    hits = {r["id"]: i for i, r in enumerate(query("SELECT id FROM notes WHERE project=? AND (title LIKE ? OR content LIKE ?) "
+                                                    "ORDER BY updated_at DESC, id DESC", like[1][:3]), 1)}
+    stored = vectors(project, "note", dim=len(qvec))
+    notes = query("SELECT * FROM notes WHERE project=? ORDER BY updated_at DESC, id DESC", (project,))
+    scored = []
+    for position, note in enumerate(notes):
+        cos = semantic.cosine(qvec, stored[f"note:{note['id']}"]) if f"note:{note['id']}" in stored else -1.0
+        keyword = _rank_score(hits[note["id"]]) if note["id"] in hits else 0.0
+        scored.append((-_mix(cos, keyword, 0.6), position, note))
+    return [note for _, _, note in sorted(scored, key=lambda t: t[:2])[:limit]]
 
 
 def chunks(text: str, size: int = 1800, overlap: int = 200):
@@ -144,9 +252,11 @@ def ingest(project: str, title: str, text: str, source: str = "user supplied") -
             return {"id": existing[0], "duplicate": True}
         doc = uuid.uuid4().hex
         db.execute("INSERT INTO documents VALUES (?,?,?,?,?,?)", (doc, project, title, source, digest, store.now()))
-        for number, text_chunk in enumerate(chunks(text), 1):
+        pieces = list(enumerate(chunks(text), 1))
+        for number, text_chunk in pieces:
             db.execute("INSERT INTO knowledge(project,document_id,title,source,chunk_no,content) VALUES (?,?,?,?,?,?)",
                        (project, doc, title, source, number, text_chunk))
+    embed_chunks(project, doc, pieces)
     return {"id": doc, "duplicate": False}
 
 
@@ -154,9 +264,30 @@ def search(project: str, terms: str, limit: int = 6) -> list[dict]:
     words = re.findall(r"\w+", terms, re.UNICODE)[:20]
     if not words:
         return []
+    limit = max(1, min(limit, 12))
     match = " OR ".join('"' + w.replace('"', '""') + '"' for w in words)
-    return query("SELECT document_id, title, source, chunk_no, content FROM knowledge WHERE knowledge MATCH ? AND project=? ORDER BY rank LIMIT ?",
-                 (match, project, max(1, min(limit, 12))))
+    rows = query("SELECT document_id, title, source, chunk_no, content FROM knowledge WHERE knowledge MATCH ? AND project=? ORDER BY rank LIMIT ?",
+                 (match, project, limit))
+    qvec = (_embed_texts([terms]) or [None])[0]
+    if qvec is None:
+        return rows
+    stored = vectors(project, "chunk", dim=len(qvec))
+    if rows:  # FTS5 stays the candidate generator: reorder its hits, never drop one
+        scored = []
+        for rank, row in enumerate(rows, 1):
+            vec = stored.get(f"chunk:{project}:{row['document_id']}:{row['chunk_no']}")
+            cos = semantic.cosine(qvec, vec) if vec else -1.0
+            mixed = _mix(cos, _rank_score(rank), 0.5)
+            scored.append((-mixed, rank, {**row, "score": round(mixed, 6)}))
+        return [row for _, _, row in sorted(scored, key=lambda t: t[:2])]
+    top = sorted(((semantic.cosine(qvec, vec), key) for key, vec in stored.items()), reverse=True)[:limit]
+    out = []
+    for cos, key in top:
+        doc, number = key[len(f"chunk:{project}:"):].rsplit(":", 1)
+        found = document_chunk(project, doc, int(number))
+        if found:
+            out.append({**found[0], "score": round((cos + 1) / 2, 6)})
+    return out
 
 
 def document_chunk(project: str, document_id: str, chunk_no: int) -> list[dict]:
