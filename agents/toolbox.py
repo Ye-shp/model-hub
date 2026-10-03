@@ -150,6 +150,7 @@ def wait_ready(seconds: float = 900) -> None:
 SERVICES = {
     "x": ("username", "auth_token", "ct0"),
     "instagram": ("user_id", "access_token"),
+    "tiktok": ("account_id", "access_token"),
     "bluesky": ("handle", "app_password"),
     "github": ("token",),
     "scrapecreators": ("key",),
@@ -158,6 +159,8 @@ HELP = {
     "x": "`/connect x <your X username> auth_token=<…> ct0=<…>` (the two cookies from x.com: browser dev tools → Application → Cookies)",
     "instagram": "`/connect instagram <Instagram user id> <long-lived access token>` (a free Meta developer app with the Instagram API, "
                  "professional account)",
+    "tiktok": "`/connect tiktok <OAuth open_id> <access token>` (an authorized TikTok developer app with video.list and "
+              "user.info.basic scopes; the account ID is open_id, not your username; this enables metrics, not publishing)",
     "bluesky": "`/connect bluesky <handle> <app password>` (Bluesky → Settings → App passwords)",
     "github": "`/connect github <token>` (a free fine-grained token with no permissions is enough)",
     "scrapecreators": "`/connect scrapecreators <key>` (optional: their free key has 100 calls in total, for TikTok/Instagram search)",

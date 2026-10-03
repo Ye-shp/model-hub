@@ -1,4 +1,4 @@
-// Model Hub control room: live tasks, box health, chat folders, memory, phone bridge, people, system.
+// Model Hub control room: live tasks, health, folders, memory, audience, phone, people, system.
 'use strict';
 const $ = id => document.getElementById(id);
 let token = '';
@@ -197,6 +197,291 @@ async function loadMemory() {
   }));
 }
 
+// ---------- AUDIENCE ----------
+const audience = {selected: null, project: 'default', request: 0, exportURL: null};
+const audienceMetricLabels = {
+  views: 'Views', likes: 'Likes', comments: 'Comments', shares: 'Shares', saves: 'Saves',
+  reach: 'People reached', average_watch_seconds: 'Average watch (seconds)',
+  completion_rate: 'Completed viewing (%)', followers: 'Followers', conversions: 'Conversions',
+};
+function audienceProject() { return $('audience-project').value.trim() || 'default'; }
+function audienceQuery(project = audienceProject()) { return 'project=' + encodeURIComponent(project); }
+function clearAudienceExport() {
+  if (audience.exportURL) URL.revokeObjectURL(audience.exportURL);
+  audience.exportURL = null;
+  $('audience-export-report').replaceChildren();
+}
+function audienceText(value) {
+  if (value === null || value === undefined || value === '') return '—';
+  if (typeof value === 'object') return value.label || value.level || JSON.stringify(value);
+  return String(value);
+}
+function audienceTime(value) {
+  if (!value) return '—';
+  const date = new Date(typeof value === 'number' ? value * 1000 : value);
+  return Number.isNaN(date.getTime()) ? audienceText(value) : date.toLocaleString();
+}
+function audienceLocalTime() {
+  const date = new Date();
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+}
+function audienceISO(value) {
+  const date = new Date(value);
+  if (!value || Number.isNaN(date.getTime())) throw Error('Enter a valid date and time.');
+  return date.toISOString();
+}
+function audienceLink(value) {
+  try {
+    const url = new URL(value);
+    if (!['https:', 'http:'].includes(url.protocol)) return el('span', audienceText(value));
+    const link = el('a', 'Open post'); link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer';
+    return link;
+  } catch { return el('span', audienceText(value)); }
+}
+function audienceInfo(pairs) {
+  const box = el('div', undefined, 'kv audience-info');
+  for (const [key, value] of pairs) {
+    box.append(el('div', key, 'k'));
+    const cell = el('div', undefined, 'v');
+    if (value instanceof Node) cell.append(value); else cell.textContent = audienceText(value);
+    box.append(cell);
+  }
+  return box;
+}
+function audienceField(form, name, label, type = 'text', value = '', options = {}) {
+  const wrap = el('label', label, options.wide ? 'form-wide' : '');
+  const field = el(type === 'textarea' ? 'textarea' : type === 'select' ? 'select' : 'input');
+  field.name = name;
+  if (type === 'select') for (const [val, title] of options.choices || []) {
+    const option = el('option', title); option.value = val; field.append(option);
+  }
+  else if (type !== 'textarea') field.type = type;
+  field.value = value ?? '';
+  for (const key of ['required', 'min', 'max', 'step', 'maxLength', 'placeholder', 'pattern']) {
+    if (options[key] !== undefined) field[key] = options[key];
+  }
+  wrap.append(field); form.append(wrap); return field;
+}
+function audienceForm(title, fields, action, buttonLabel) {
+  const details = el('details'); details.append(el('summary', title));
+  const form = el('form', undefined, 'audience-form');
+  const grid = el('div', undefined, 'form-grid'); fields(grid); form.append(grid);
+  const submit = el('button', buttonLabel); submit.type = 'submit';
+  form.append(submit, el('p', '', 'form-message'));
+  form.querySelector('.form-message').setAttribute('role', 'status');
+  form.querySelector('.form-message').setAttribute('aria-live', 'polite');
+  form.addEventListener('submit', ev => audienceSubmit(ev, action));
+  details.append(form); return details;
+}
+async function audienceSubmit(ev, action) {
+  ev.preventDefault();
+  const form = ev.currentTarget, submit = form.querySelector('button[type=submit]');
+  const message = form.querySelector('.form-message');
+  submit.disabled = true; message.textContent = 'Saving…'; message.classList.remove('error');
+  try { await action(new FormData(form)); if (message.textContent === 'Saving…') message.textContent = 'Saved.'; }
+  catch (error) { message.textContent = error.message; message.classList.add('error'); }
+  finally { submit.disabled = false; }
+}
+async function loadAudience() {
+  const project = audienceProject(), requestId = ++audience.request;
+  if (project !== audience.project) { audience.project = project; audience.selected = null; clearAudienceExport(); }
+  const [list, performance] = await Promise.all([
+    api('audience/experiments?' + audienceQuery(project)),
+    api('audience/performance?' + audienceQuery(project)),
+  ]);
+  if (requestId !== audience.request || project !== audienceProject()) return;
+  const experiments = list.experiments || [];
+  $('audience-count').textContent = String(experiments.length);
+  if (!experiments.some(item => String(item.id) === String(audience.selected))) audience.selected = null;
+  if (!experiments.length) empty('audience-experiments', 'Create an experiment, then attach two drafts to compare.');
+  else $('audience-experiments').replaceChildren(...experiments.map(experiment => {
+    const item = el('div', undefined, 'item' + (String(experiment.id) === String(audience.selected) ? ' selected' : ''));
+    const line = el('div', undefined, 'line1');
+    line.append(el('span', experiment.name, 'title'), badge(experiment.split === 'eval' ? 'Evaluation' : 'Learning'));
+    item.append(line, el('div', [experiment.platform, experiment.account, experiment.kind].filter(Boolean).join(' · '), 'meta'),
+      btn('View drafts and results', async () => {
+        audience.selected = experiment.id; await loadAudience();
+      }, 'small ghost'));
+    return item;
+  }));
+  renderAudienceResults(performance);
+  if (audience.selected !== null) await loadAudienceDetail(project, audience.selected, requestId);
+  else { $('audience-detail-title').textContent = 'Experiment details'; empty('audience-detail', 'Choose an experiment to see its drafts and collection schedule.'); }
+}
+async function loadAudienceDetail(project, id, requestId = audience.request) {
+  const detail = await api(`audience/experiments/${encodeURIComponent(id)}?${audienceQuery(project)}`);
+  if (requestId !== audience.request || project !== audienceProject() || String(id) !== String(audience.selected)) return;
+  const experiment = detail.experiment || {}, box = $('audience-detail');
+  $('audience-detail-title').textContent = experiment.name || 'Experiment details';
+  box.replaceChildren(audienceInfo([
+    ['Use', experiment.split === 'eval' ? 'Evaluation only' : 'Learning'],
+    ['Platform / account', [experiment.platform, experiment.account].filter(Boolean).join(' · ')],
+    ['Format', experiment.kind], ['Posting context', experiment.context],
+    ['Brief', experiment.brief], ['Hypothesis', experiment.hypothesis],
+  ]));
+  box.append(audienceForm('Attach a draft', grid => {
+    audienceField(grid, 'label', 'Draft label', 'text', '', {required: true, maxLength: 160, placeholder: 'A — opening question'});
+    audienceField(grid, 'post_id', 'Saved post draft ID (optional)', 'number', '', {min: 1, step: 1});
+    audienceField(grid, 'model', 'Declared model (optional)', 'text', '', {maxLength: 300});
+    audienceField(grid, 'strategy', 'Declared strategy (optional)', 'text', '', {maxLength: 2000, placeholder: 'What you changed in this draft'});
+    audienceField(grid, 'response', 'Draft text or script', 'textarea', '', {wide: true, required: true, maxLength: 50000});
+  }, async data => {
+    await api('audience/variants', {
+      project, experiment_id: id, label: data.get('label'), response: data.get('response'),
+      post_id: data.get('post_id') === '' ? null : Number(data.get('post_id')),
+      model: data.get('model'), strategy: data.get('strategy'),
+    });
+    await loadAudience();
+  }, 'Attach draft'));
+  box.append(el('p', 'Model and strategy describe the origin you declare; this record does not verify which model wrote the draft.', 'muted small'));
+  const variants = detail.variants || [];
+  if (!variants.length) box.append(el('div', 'No drafts attached yet.', 'empty'));
+  else for (const variant of variants) box.append(audienceVariant(variant, experiment, project));
+  box.append(el('h3', 'Collection schedule'));
+  const checkpoints = detail.checkpoints || [];
+  if (!checkpoints.length) box.append(el('div', 'Record a published post to schedule its delayed checks.', 'empty'));
+  for (const checkpoint of checkpoints) {
+    const item = el('div', undefined, 'item');
+    const variant = variants.find(value => String(value.id) === String(checkpoint.variant_id));
+    const line = el('div', undefined, 'line1');
+    line.append(el('span', `${variant?.label || 'Draft ' + checkpoint.variant_id} · ${checkpoint.horizon_hours} hours`, 'title'), badge(checkpoint.status));
+    item.append(line, el('div', `Due ${audienceTime(checkpoint.due_at)} · ${checkpoint.attempts || 0} attempts`, 'meta'));
+    if (checkpoint.next_attempt_at) item.append(el('div', 'Next attempt ' + audienceTime(checkpoint.next_attempt_at), 'muted small'));
+    if (checkpoint.last_error) item.append(el('div', checkpoint.last_error, 'error small text'));
+    box.append(item);
+  }
+}
+function audienceVariant(variant, experiment, project) {
+  const item = el('div', undefined, 'item audience-variant'), line = el('div', undefined, 'line1');
+  line.append(el('span', variant.label || 'Draft ' + variant.id, 'title'), badge(variant.published_at ? 'Published' : 'Draft'));
+  item.append(line, el('div', variant.response, 'text audience-draft'));
+  item.append(audienceInfo([
+    ['Saved post draft', variant.post_id], ['Declared model', variant.model], ['Declared strategy', variant.strategy],
+    ['Published', audienceTime(variant.published_at)], ['Exposure', variant.exposure],
+    ['Post ID', variant.remote_id], ['Post', variant.url ? audienceLink(variant.url) : null],
+  ]));
+  if (!variant.published_at) item.append(audienceForm('Record a published post', grid => {
+    audienceField(grid, 'remote_id', 'Published post ID', 'text', '', {required: true, maxLength: 40, pattern: '[0-9]{1,40}', placeholder: 'Numeric video or media ID'});
+    audienceField(grid, 'url', 'Published post link', 'url', '', {required: true, maxLength: 2000});
+    audienceField(grid, 'published_at', 'Published at (your local time)', 'datetime-local', audienceLocalTime(), {required: true});
+    audienceField(grid, 'account', 'Publishing account', 'text', experiment.account || '', {required: true, maxLength: 200});
+    audienceField(grid, 'exposure', 'Exposure', 'select', 'organic', {choices: [['organic', 'Organic only'], ['paid', 'Paid promotion'], ['mixed', 'Mixed organic and paid'], ['unknown', 'Unknown']]});
+  }, async data => {
+    const url = new URL(data.get('url'));
+    if (url.protocol !== 'https:') throw Error('Use the HTTPS link to the published post.');
+    await api(`audience/variants/${encodeURIComponent(variant.id)}/publication`, {
+      project, remote_id: data.get('remote_id'), url: url.href,
+      published_at: audienceISO(data.get('published_at')), account: data.get('account'), exposure: data.get('exposure'),
+    });
+    await loadAudience();
+  }, 'Save publication record'));
+  if (variant.published_at) {
+    if (variant.exposure === 'organic') {
+      item.append(audienceForm('Exclude from organic comparisons', grid => {
+        audienceField(grid, 'exposure', 'Exposure after publication', 'select', 'paid', {wide: true, choices: [['paid', 'Paid promotion'], ['mixed', 'Mixed organic and paid'], ['unknown', 'Unknown']]});
+        grid.append(el('p', 'Use this if a post was boosted later or its exposure is uncertain. The publication identity and observations stay recorded; this draft is excluded from organic comparisons. The exclusion cannot be undone.', 'muted small form-wide'));
+      }, async data => {
+        await api(`audience/variants/${encodeURIComponent(variant.id)}/publication`, {
+          project, remote_id: variant.remote_id, url: variant.url, published_at: variant.published_at,
+          account: variant.account, exposure: data.get('exposure'),
+        });
+        await loadAudience();
+      }, 'Exclude draft'));
+    }
+    item.append(audienceForm('Record counts manually', grid => {
+      audienceField(grid, 'observed_at', 'Observed at (your local time)', 'datetime-local', audienceLocalTime(), {required: true, wide: true});
+      for (const [key, label] of Object.entries(audienceMetricLabels)) {
+        audienceField(grid, key, label, 'number', '', {min: 0, max: key === 'completion_rate' ? 100 : undefined, step: key === 'average_watch_seconds' || key === 'completion_rate' ? 'any' : 1});
+      }
+    }, async data => {
+      const metrics = {};
+      for (const key of Object.keys(audienceMetricLabels)) {
+        metrics[key] = data.get(key) === '' ? null : Number(data.get(key));
+        if (key === 'completion_rate' && metrics[key] !== null) metrics[key] /= 100;
+      }
+      if (!Object.values(metrics).some(value => value !== null)) throw Error('Enter at least one observed count. Leave unavailable counts blank.');
+      await api(`audience/variants/${encodeURIComponent(variant.id)}/metrics`, {
+        project, metrics, observed_at: audienceISO(data.get('observed_at')),
+      });
+      await loadAudience();
+    }, 'Save counts'));
+    item.append(el('p', 'Blank means unavailable. Enter zero only when the platform reports zero. Counts are stored with the observation time.', 'muted small'));
+  }
+  const snapshots = variant.snapshots || [];
+  if (snapshots.length) {
+    const details = el('details'); details.append(el('summary', `Observations (${snapshots.length})`));
+    for (const snapshot of snapshots) {
+      const observation = el('div', undefined, 'item');
+      observation.append(el('div', `${audienceTime(snapshot.observed_at)} · ${audienceText(snapshot.source)}`, 'meta'));
+      const values = Object.entries(audienceMetricLabels).map(([key, label]) => {
+        const value = snapshot.metrics?.[key];
+        return [label, key === 'completion_rate' && value != null ? `${(Number(value) * 100).toFixed(1)}%` : value];
+      });
+      observation.append(audienceInfo(values));
+      for (const warning of Array.isArray(snapshot.warnings) ? snapshot.warnings : snapshot.warnings ? [snapshot.warnings] : []) observation.append(el('div', audienceText(warning), 'muted small text'));
+      details.append(observation);
+    }
+    item.append(details);
+  }
+  if (variant.reward) item.append(audienceReward(variant.reward, variant.selected_snapshot));
+  return item;
+}
+function audienceReward(reward, snapshot) {
+  const baseline = reward.baseline_kind === 'historical' ? `Historical posts (${reward.baseline_count || 0})` : reward.baseline_kind === 'experiment_peers' ? 'Experiment median' : null;
+  const completion = snapshot?.metrics?.completion_rate;
+  return audienceInfo([
+    ['Reach score', reward.score == null ? 'Not scored yet' : Number(reward.score).toFixed(3)],
+    ['Views', reward.views], ['Sample support', typeof reward.confidence === 'number' ? `${(reward.confidence * 100).toFixed(0)}%` : reward.confidence],
+    ['Baseline', baseline], ['Reach relative to baseline', reward.reach_lift == null ? null : `${Number(reward.reach_lift).toFixed(2)}×`],
+    ['Share rate', reward.share_rate == null ? null : `${(reward.share_rate * 100).toFixed(2)}%`],
+    ['Completed viewing', completion == null ? null : `${(completion * 100).toFixed(1)}%`],
+    ['Observed', snapshot ? `${audienceTime(snapshot.observed_at)} · ${Number(snapshot.age_hours).toFixed(1)} hours after publication` : null],
+    ['Observation window', reward.horizon_hours == null ? null : `${reward.horizon_hours} hours`],
+    ['Comparison status', reward.eligible ? 'Eligible' : reward.reason || 'Waiting for comparable results'],
+  ]);
+}
+function renderAudienceResults(performance) {
+  $('audience-score-version').textContent = performance.score_version || '';
+  const results = performance.results || [];
+  if (!results.length) return empty('audience-results', 'Results appear once a published draft has observations.');
+  $('audience-results').replaceChildren(...results.map(result => {
+    const item = el('div', undefined, 'item'), reward = result.reward || result;
+    item.append(el('div', result.label || result.variant?.label || `Draft ${result.variant_id || result.id || ''}`, 'title'));
+    if (result.experiment_name || result.experiment?.name) item.append(el('div', result.experiment_name || result.experiment.name, 'meta'));
+    item.append(audienceReward(reward, result.selected_snapshot)); return item;
+  }));
+}
+$('audience-project').addEventListener('change', () => loadAudience().catch(error => notice(error.message)));
+$('audience-refresh').addEventListener('click', () => loadAudience().catch(error => notice(error.message)));
+$('audience-experiment-form').addEventListener('submit', ev => audienceSubmit(ev, async data => {
+  const body = {project: audienceProject()};
+  for (const key of ['name', 'brief', 'hypothesis', 'platform', 'account', 'kind', 'context', 'split']) body[key] = data.get(key);
+  const created = await api('audience/experiments', body);
+  audience.selected = created.id; audience.project = body.project;
+  $('audience-experiment-form').reset(); $('audience-create').open = false; await loadAudience();
+}));
+$('audience-export-form').addEventListener('submit', ev => audienceSubmit(ev, async data => {
+  const project = audienceProject();
+  const query = new URLSearchParams({project, horizon_hours: data.get('horizon_hours'), min_views: data.get('min_views'), min_margin: data.get('min_margin')});
+  const exported = await api('audience/preferences?' + query.toString());
+  if (project !== audienceProject()) throw Error('The project changed. Export again for the selected project.');
+  clearAudienceExport();
+  const report = $('audience-export-report');
+  audience.exportURL = URL.createObjectURL(new Blob([JSON.stringify(exported, null, 2) + '\n'], {type: 'application/json'}));
+  const audit = el('a', 'Download comparison audit'); audit.href = audience.exportURL; audit.download = 'audience-comparison-audit.json';
+  report.append(audit);
+  if (exported.dataset_digest) report.append(el('div', `Exported ${audienceTime(exported.exported_at)} · dataset digest ${exported.dataset_digest}`, 'muted small text'));
+  const records = exported.records || [];
+  for (const comparison of exported.comparisons || []) report.append(el('div', `Experiment ${comparison.experiment_id}: preferred draft ${comparison.chosen_id}, other draft ${comparison.rejected_id} · margin ${Number(comparison.margin).toFixed(3)} · sample support ${typeof comparison.confidence === 'number' ? (comparison.confidence * 100).toFixed(0) + '%' : audienceText(comparison.confidence)}`, 'item small'));
+  for (const skipped of exported.skipped || []) report.append(el('div', `Experiment ${skipped.experiment_id}: ${skipped.reason}`, 'item muted small'));
+  if (records.length) {
+    const url = URL.createObjectURL(new Blob([records.map(record => JSON.stringify({prompt: record.prompt, chosen: record.chosen, rejected: record.rejected})).join('\n') + '\n'], {type: 'application/x-ndjson'}));
+    const link = el('a'); link.href = url; link.download = 'audience-preferences.jsonl'; document.body.append(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  }
+  $('audience-export-form').querySelector('.form-message').textContent = records.length ? `Downloaded ${records.length} preference example${records.length === 1 ? '' : 's'}.` : 'No eligible comparisons yet. Review the reasons below.';
+}));
+
 // ---------- PHONE ----------
 async function loadPhone() {
   const p = await api('phone');
@@ -257,7 +542,7 @@ async function loadSystem() {
 }
 
 // ---------- loop ----------
-const loaders = {now: loadNow, chats: loadChats, memory: loadMemory, phone: loadPhone, people: loadPeople, system: loadSystem};
+const loaders = {now: loadNow, chats: loadChats, memory: loadMemory, audience: loadAudience, phone: loadPhone, people: loadPeople, system: loadSystem};
 let busy = false;
 async function refresh() {
   if (busy) return; busy = true;
@@ -266,4 +551,7 @@ async function refresh() {
   finally { busy = false; }
 }
 setInterval(() => { if (!document.hidden && !$('app').hidden && ['now', 'phone'].includes(tab)) refresh(); }, 5000);
+setInterval(() => {
+  if (!document.hidden && !$('app').hidden && tab === 'audience' && !document.querySelector('#tab-audience details[open]')) refresh();
+}, 30000);
 refresh();

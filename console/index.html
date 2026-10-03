@@ -26,6 +26,7 @@
       <button class="tab-btn active" data-tab="now">Now</button>
       <button class="tab-btn" data-tab="chats">Chats</button>
       <button class="tab-btn" data-tab="memory">Memory</button>
+      <button class="tab-btn" data-tab="audience">Audience</button>
       <button class="tab-btn" data-tab="phone">Phone</button>
       <button class="tab-btn" data-tab="people">People</button>
       <button class="tab-btn" data-tab="system">System</button>
@@ -68,6 +69,56 @@
       <div class="panel">
         <div class="panel-head"><h2>What Cowork remembers</h2><input id="memory-search" type="search" placeholder="Search memory" aria-label="Search memory"></div>
         <div id="memories" class="list"></div>
+      </div>
+    </section>
+
+    <!-- AUDIENCE -->
+    <section id="tab-audience" class="tab" hidden>
+      <div class="panel">
+        <div class="panel-head audience-heading">
+          <h2>Learn from your audience</h2>
+          <div class="row"><label for="audience-project">Project</label><input id="audience-project" type="text" value="default" maxlength="100" autocomplete="off"><button id="audience-refresh" class="ghost">Refresh</button></div>
+        </div>
+        <p class="muted small">Compare drafts against real TikTok and Instagram results. Record publication after a post is live; this page does not publish posts or train a model. Keep the same platform, account, format and posting context within an experiment. Automatic checks need a connected analytics account and its account ID. You can also enter counts manually.</p>
+        <details id="audience-create"><summary>New experiment</summary>
+          <form id="audience-experiment-form" class="audience-form">
+            <div class="form-grid">
+              <label>Name<input name="name" type="text" required maxlength="160" placeholder="Opening question versus direct claim"></label>
+              <label>Use these results for<select name="split"><option value="train">Learning</option><option value="eval">Evaluation only</option></select></label>
+              <label>Platform<select name="platform"><option value="tiktok">TikTok</option><option value="instagram">Instagram</option></select></label>
+              <label>Account ID<input name="account" type="text" required maxlength="200" placeholder="Connected account ID"></label>
+              <label>Format<input name="kind" type="text" required maxlength="80" placeholder="Reel, short or image"></label>
+              <label>Posting context<input name="context" type="text" required maxlength="1000" placeholder="Same topic, audience, offer and posting window"></label>
+              <label class="form-wide">Brief<textarea name="brief" required maxlength="12000" placeholder="What should these drafts achieve? Include the intended audience and offer."></textarea></label>
+              <label class="form-wide">Hypothesis<textarea name="hypothesis" required maxlength="2000" placeholder="What are you changing, and what result do you expect?"></textarea></label>
+            </div>
+            <p class="muted small">Evaluation experiments stay out of preference exports. Choose this before collecting results to keep your test independent.</p>
+            <button type="submit">Create experiment</button>
+            <p class="form-message" role="status" aria-live="polite"></p>
+          </form>
+        </details>
+      </div>
+      <div class="grid2 audience-layout">
+        <div class="panel"><div class="panel-head"><h2>Experiments</h2><span id="audience-count" class="muted small"></span></div><div id="audience-experiments" class="list"></div></div>
+        <div class="panel" id="audience-detail-panel"><div class="panel-head"><h2 id="audience-detail-title">Experiment details</h2></div><div id="audience-detail" class="list"><div class="empty">Choose an experiment to see its drafts and collection schedule.</div></div></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>Results</h2><span id="audience-score-version" class="muted small"></span></div>
+        <p class="muted small">The first score focuses on reach: views compared with similar organic posts at the same age. Shares and completed viewing are supporting signals. Sample support describes the amount of data, not proof that a draft caused the outcome. Paid exposure and changes in audience or timing can distort a comparison.</p>
+        <div id="audience-results" class="list"></div>
+        <details><summary>Export learning examples</summary>
+          <form id="audience-export-form" class="audience-form">
+            <div class="form-grid export-grid">
+              <label>Time after publication<select name="horizon_hours"><option value="24">24 hours</option><option value="72" selected>72 hours</option><option value="168">7 days</option></select></label>
+              <label>Minimum views per draft<input name="min_views" type="number" value="500" min="500" max="1000000000" step="1" required></label>
+              <label>Minimum score margin<input name="min_margin" type="number" value="0.15" min="0.01" max="10" step="0.01" required></label>
+            </div>
+            <button type="submit">Download preference examples</button>
+            <p class="form-message" role="status" aria-live="polite"></p>
+            <p class="muted small">Downloads JSONL with the brief, preferred draft and other draft. A separate comparison audit includes post links, observations and declared origins. Only eligible learning experiments enter the export; skipped comparisons and their reasons appear below. Exporting does not start training.</p>
+          </form>
+          <div id="audience-export-report" class="list"></div>
+        </details>
       </div>
     </section>
 

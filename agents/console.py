@@ -9,17 +9,19 @@ import json
 import os
 from pathlib import Path
 import secrets
+from typing import Literal
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictFloat, StrictInt
 
 import hub  # Reads agents/.env before the data directory is selected.
 import access as cf_access
 import store
 import workspace as ws
 import coordination
+import audience
 from skills import catalog
 from worker import controller_lock, serve
 
@@ -97,6 +99,45 @@ class NoteIn(BaseModel):
     kind: str = "preference"
 
 
+class AudienceExperimentIn(BaseModel):
+    project: str = "default"
+    name: str = Field(min_length=1, max_length=160)
+    brief: str = Field(min_length=1, max_length=12000)
+    hypothesis: str = Field(default="", max_length=2000)
+    platform: Literal["tiktok", "instagram"] = "tiktok"
+    account: str = Field(default="", max_length=200)
+    kind: str = Field(default="reel", max_length=80)
+    context: str = Field(default="", max_length=1000)
+    split: Literal["train", "eval"] = "train"
+
+
+class AudienceVariantIn(BaseModel):
+    project: str = "default"
+    experiment_id: StrictInt
+    label: str = Field(min_length=1, max_length=160)
+    response: str = Field(min_length=1, max_length=50000)
+    post_id: StrictInt | None = None
+    model: str = Field(default="", max_length=300)
+    strategy: str = Field(default="", max_length=2000)
+    media_hashes: list[str] = Field(default_factory=list, max_length=10)
+    job_id: str = Field(default="", max_length=120)
+
+
+class AudiencePublicationIn(BaseModel):
+    project: str = "default"
+    remote_id: str = Field(min_length=1, max_length=40)
+    url: str = Field(min_length=1, max_length=2000)
+    published_at: str = Field(min_length=1, max_length=80)
+    account: str = Field(min_length=1, max_length=200)
+    exposure: Literal["organic", "paid", "mixed", "unknown"] = "organic"
+
+
+class AudienceMetricsIn(BaseModel):
+    project: str = "default"
+    metrics: dict[str, StrictInt | StrictFloat | None]
+    observed_at: str | None = Field(default=None, max_length=80)
+
+
 def owner_key() -> str:
     configured = os.environ.get("CONSOLE_KEY", "")
     if configured:
@@ -138,6 +179,7 @@ def resolve_project(project: str, requested_by: str | None, thread: str | None =
 
 def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> FastAPI:
     ws.init()
+    audience.init()
     token = key or owner_key()
     public_url = os.environ.get("CONSOLE_URL", "").rstrip("/")
     public_host = urlparse(public_url).hostname
@@ -154,14 +196,16 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         import toolbox
         toolbox.install_in_background()  # free research/video/social tools, once (kept across restarts)
         import telegram_bot
+        import audience_worker
         with controller_lock():
             ws.recover_jobs()
             task = asyncio.create_task(serve(runner or run_job, lambda: bool(hub.HUB_URL and hub.HUB_KEY)))
             telegram = asyncio.create_task(telegram_bot.serve())  # idle until /connect telegram
+            metrics = asyncio.create_task(audience_worker.serve())  # durable checkpoints, independent of chat timeouts
             try:
                 yield
             finally:
-                for running in (task, telegram):
+                for running in (task, telegram, metrics):
                     running.cancel()
                     with suppress(asyncio.CancelledError):
                         await running
@@ -420,11 +464,48 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
             raise ValueError(str(error)) from None
 
     @app.get("/api/posts")
-    def social_posts():
+    def social_posts(project: str = "default"):
         import research_tools
         research_tools.init()
+        if not ws.project_exists(project):
+            raise HTTPException(404, "Project not found")
         return {"posts": ws.query("SELECT id,platform,kind,status,caption,result,created_at,updated_at FROM social_posts "
-                                  "ORDER BY id DESC LIMIT 50")}
+                                  "WHERE project=? ORDER BY id DESC LIMIT 50", (project,))}
+
+    # Audience experiments never publish posts or start training. Every record belongs to one project.
+    @app.get("/api/audience/experiments")
+    def audience_experiments(project: str = "default"):
+        return {"experiments": audience.list_experiments(project)}
+
+    @app.post("/api/audience/experiments", status_code=201)
+    def audience_create_experiment(body: AudienceExperimentIn):
+        return audience.create_experiment(**body.model_dump())
+
+    @app.get("/api/audience/experiments/{experiment_id}")
+    def audience_experiment(experiment_id: int, project: str = "default"):
+        return audience.experiment_detail(project, experiment_id)
+
+    @app.post("/api/audience/variants", status_code=201)
+    def audience_create_variant(body: AudienceVariantIn):
+        return audience.register_variant(**body.model_dump())
+
+    @app.post("/api/audience/variants/{variant_id}/publication")
+    def audience_publication(variant_id: int, body: AudiencePublicationIn):
+        return audience.confirm_publication(variant_id=variant_id, **body.model_dump())
+
+    @app.post("/api/audience/variants/{variant_id}/metrics", status_code=201)
+    def audience_metrics(variant_id: int, body: AudienceMetricsIn):
+        # Clients cannot impersonate an automated platform collector.
+        return audience.record_snapshot(variant_id=variant_id, source="manual", **body.model_dump())
+
+    @app.get("/api/audience/performance")
+    def audience_performance(project: str = "default"):
+        return audience.performance_summary(project)
+
+    @app.get("/api/audience/preferences")
+    def audience_preferences(project: str = "default", horizon_hours: int = 72, min_views: int = 500,
+                             min_margin: float = 0.15):
+        return audience.export_preferences(project, horizon_hours, min_views, min_margin)
 
     @app.post("/api/connections/claude")
     def connect_claude(body: TokenIn):
