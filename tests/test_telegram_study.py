@@ -60,7 +60,8 @@ class LinkTests(unittest.TestCase):
             "https://redd.it/1abcde": "Reddit thread",
             "https://www.youtube.com/shorts/abcDEF123": "YouTube Short",
             "https://youtu.be/abcDEF123": "YouTube video",
-            "https://x.com/growthguy": "X profile or page",
+            "https://x.com/growthguy": "X profile",
+            "https://x.com/home": "X profile or page",
             "https://example.com/blog/ugc-guide": "web page",
         }
         for url, label in cases.items():
@@ -173,9 +174,106 @@ class StudyTests(Base):
         with patch.object(escalate, "available", return_value="off"):
             agent = cowork.build(job, fake_client(lambda r: None), asyncio.Semaphore(1), space)
         names = {t.name for t in agent.tools}
-        self.assertTrue({"study_link", "list_knowledge", "search_knowledge"} <= names)
+        self.assertTrue({"study_link", "study_profile", "list_knowledge", "search_knowledge"} <= names)
         self.assertIn("KNOWLEDGE BASE", agent.instructions)
         self.assertIn("TELEGRAM", agent.instructions)
+
+
+PROFILE_ANSWER = """CATEGORY: content
+USEFUL: yes
+TITLE: Short skits that end on a silent reaction
+
+## Who they are
+Comedy creator.
+## Plays to steal
+- End on a silent reaction shot (https://www.tiktok.com/@creator/video/1000000000000000009, 4M views)."""
+
+
+def profile_posts(n=10, outlier=9):
+    posts = []
+    for i in range(n):
+        views = 4_000_000 if i == outlier else 200_000 + i * 10_000
+        posts.append({"url": f"https://www.tiktok.com/@creator/video/10000000000000000{i:02d}", "date": f"202609{10 + i:02d}",
+                      "views": views, "likes": views // 10, "comments": 100 + i, "shares": 50, "duration": 20 + i,
+                      "caption": f"skit number {i}", "is_video": True})
+    return list(reversed(posts))
+
+
+class ProfileTests(Base):
+    def kit(self, answer=PROFILE_ANSWER):
+        calls = {"social": [], "ask": [], "probe": []}
+
+        async def social(command, args):
+            calls["social"].append((command, args))
+            if command == "profile_posts":
+                return {"ok": True, "platform": "tiktok", "profile": {"handle": "creator", "name": "Creator", "followers": 1_200_000,
+                                                                      "bio": "skits daily", "link": "https://shop.example"},
+                        "posts": profile_posts()}
+            if command == "post_details":
+                return {"ok": True, "post": {"description": "caption"}, "comments": [{"user": "fan", "text": "the ending!!", "likes": 900}],
+                        "comments_note": None}
+            return {"ok": False, "error": "unexpected"}
+
+        async def ask(content):
+            calls["ask"].append(content)
+            return answer
+
+        async def probe(source):
+            calls["probe"].append(source)
+            return {"video": {"duration": 20.0, "width": 1080, "height": 1920, "fps": 30, "has_audio": True}, "frames": [],
+                    "shots": {}, "transcript": {"segments": [{"start": 0, "end": 2, "text": f"opening line of {source[-2:]}"}],
+                                                "language": "en", "words": 4, "speech_seconds": 2}}, None
+
+        import research_tools
+        return calls, dict(probe=probe, social=social, ask=ask, small_jpeg=lambda p: "data:,", facts=research_tools.facts,
+                           log=lambda kind, detail: None, x_signed_in=True)
+
+    def test_stats_find_the_outlier_and_a_typical_post(self):
+        posts = profile_posts()
+        stats = study.profile_stats(posts)
+        self.assertEqual(stats["metric"], "views")
+        self.assertEqual([posts[i]["views"] for i in stats["outliers"]], [4_000_000])
+        self.assertEqual(stats["per_week"], 7.8)
+        chosen = study.pick_deep_dives(posts, stats, 4)
+        self.assertEqual(len(chosen), 4)
+        self.assertTrue(chosen[0][1].startswith("outlier: "))
+        self.assertIn("typical post", chosen[-1][1])
+        self.assertEqual(study.pick_deep_dives(posts, stats, 0), [])
+
+    def test_a_profile_becomes_one_saved_playbook(self):
+        calls, kit = self.kit()
+        result = run(study.study_profile("https://www.tiktok.com/@creator?lang=en", "default", deep_dive=4, **kit))
+        self.assertEqual(calls["social"][0], ("profile_posts", {"platform": "tiktok", "handle": "creator", "limit": 30}))
+        self.assertEqual(len(calls["probe"]), 4)
+        prompt = calls["ask"][0][0]["text"]
+        for expected in ("PROFILE (TikTok profile): @creator", "1.2M followers", "Bio link: https://shop.example",
+                         "1 outliers", "DEEP DIVE 1 — outlier: ", "typical post", "opening line of 09", "the ending!!",
+                         "skit number 3"):
+            self.assertIn(expected, prompt)
+        self.assertTrue(result["saved"])
+        self.assertEqual(result["title"], "@creator: Short skits that end on a silent reaction")
+        rows = study.index("default", "profile")
+        self.assertEqual(rows[0]["source"], "https://www.tiktok.com/@creator")
+        self.assertIn("silent reaction", ws.search("default", "silent reaction skits")[0]["content"])
+        again = run(study.study_profile("https://tiktok.com/@creator", "default", **kit))
+        self.assertTrue(again["already"])
+        self.assertIn("Already studied", study.profile_reply(again))
+
+    def test_x_profiles_need_the_sign_in_and_posts_are_not_profiles(self):
+        _, kit = self.kit()
+        kit["x_signed_in"] = False
+        with self.assertRaises(RuntimeError):
+            run(study.study_profile("https://x.com/someone", "default", **kit))
+        with self.assertRaises(ValueError):
+            run(study.study_profile("https://www.tiktok.com/@creator/video/1234567890123", "default", **kit))
+
+    def test_profile_links(self):
+        self.assertEqual(links.profile_of("https://www.instagram.com/garyvee/reels/"),
+                         ("instagram", "garyvee", "https://www.instagram.com/garyvee/"))
+        self.assertEqual(links.profile_of("https://www.youtube.com/@MrBeast/shorts")[2], "https://www.youtube.com/@MrBeast")
+        self.assertIsNone(links.profile_of("https://x.com/home"))
+        self.assertIsNone(links.profile_of("https://www.instagram.com/reel/abc/"))
+        self.assertEqual(links.platform_of("https://x.com/naval")[1], "X profile")
 
 
 class FakeTelegram:
@@ -247,6 +345,16 @@ class TelegramTests(Base):
             self.assertEqual([m for m, _, _ in self.fake.calls].count("sendDocument"), 1)
             self.assertNotIn(job["id"], telegram_bot.load()["pending"])
         run(scenario())
+
+    def test_profile_links_get_a_longer_estimate(self):
+        self.connect_and_pair()
+
+        async def scenario():
+            with patch.object(telegram_bot, "watch", lambda job, chat: asyncio.sleep(0)):
+                await telegram_bot.handle(self.message("https://www.tiktok.com/@creator"))
+        run(scenario())
+        self.assertIn("TikTok profile", self.fake.sent()[-1])
+        self.assertIn("5-15 minutes", self.fake.sent()[-1])
 
     def test_new_conversations_history_and_files(self):
         self.connect_and_pair()

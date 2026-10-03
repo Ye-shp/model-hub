@@ -3,7 +3,7 @@ sign-ins (environment variables set by toolbox.social_env) never reach the chat 
 
     python social.py <command> '<json args>'      -> prints one JSON line: {"ok": true, ...} or {"ok": false, "error": ...}
 
-Commands: x_search, x_trends, x_user, x_post, x_thread, reddit_thread, post_details, instagram_profile,
+Commands: x_search, x_trends, x_user, x_post, x_thread, reddit_thread, post_details, profile_posts, instagram_profile,
 instagram_publish, tiktok_profile, google_trends.
 """
 from __future__ import annotations
@@ -566,7 +566,162 @@ def post_details(url: str, comments: int = 60) -> dict:
             "comments_note": note, "error": error}
 
 
-COMMANDS = {"x_search": x_search, "x_trends": x_trends, "x_user": x_user, "x_post": x_post,
+# ---------------------------------------------------------------------------------------------
+# A creator's profile: who they are and their recent posts with numbers (used by study_profile)
+# ---------------------------------------------------------------------------------------------
+def _ytdlp_options(limit: int, flat: bool) -> dict:
+    options = {"quiet": True, "no_warnings": True, "skip_download": True, "playlistend": limit, "ignoreerrors": True,
+               "socket_timeout": 30}
+    if flat:
+        options["extract_flat"] = "in_playlist"
+    try:
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        options["impersonate"] = ImpersonateTarget.from_str("chrome")
+    except Exception:
+        pass
+    return options
+
+
+def _tiktok_profile_info(handle: str) -> dict:
+    import re
+    status, _, page = web_get(f"https://www.tiktok.com/@{handle}", accept="text/html")
+    match = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', page or "", re.S)
+    if status != 200 or not match:
+        return {"handle": handle}
+    try:
+        detail = json.loads(match.group(1))["__DEFAULT_SCOPE__"]["webapp.user-detail"]["userInfo"]
+    except (ValueError, KeyError, TypeError):
+        return {"handle": handle}
+    user, stats = detail.get("user") or {}, detail.get("stats") or {}
+    return {"handle": user.get("uniqueId") or handle, "name": user.get("nickname"), "bio": (user.get("signature") or "")[:600],
+            "link": (user.get("bioLink") or {}).get("link"), "verified": user.get("verified"),
+            "followers": stats.get("followerCount"), "following": stats.get("followingCount"),
+            "total_likes": stats.get("heart") if (stats.get("heart") or 0) > 0 else None, "posts_total": stats.get("videoCount")}
+
+
+def _tiktok_profile(handle: str, limit: int) -> dict:
+    import yt_dlp
+    with yt_dlp.YoutubeDL(_ytdlp_options(limit, flat=False)) as ydl:
+        info = ydl.extract_info(f"https://www.tiktok.com/@{handle}", download=False) or {}
+    posts = [{"url": e.get("webpage_url"), "date": e.get("upload_date"), "views": e.get("view_count"), "likes": e.get("like_count"),
+              "comments": e.get("comment_count"), "shares": e.get("repost_count"), "saves": e.get("save_count"),
+              "duration": e.get("duration"), "sound": " - ".join(x for x in (e.get("track"), e.get("artist")) if x) or None,
+              "caption": (e.get("description") or e.get("title") or "")[:500], "is_video": True}
+             for e in info.get("entries") or [] if e and e.get("webpage_url")]
+    if not posts:
+        raise RuntimeError("TikTok returned no posts for this profile (it sometimes blocks data-center servers; try again "
+                           "later, or collect from the phone)")
+    return {"profile": _tiktok_profile_info(handle), "posts": posts}
+
+
+def _instagram_node(node: dict) -> dict:
+    caption = node.get("caption")
+    if isinstance(caption, dict):
+        caption = caption.get("text")
+    if caption is None:
+        edges = ((node.get("edge_media_to_caption") or {}).get("edges") or [{}])
+        caption = ((edges[0] or {}).get("node") or {}).get("text")
+    code = node.get("shortcode") or node.get("code")
+    taken = node.get("taken_at_timestamp") or node.get("taken_at")
+    if isinstance(taken, (int, float)):
+        taken = time.strftime("%Y%m%d", time.gmtime(taken))
+    is_video = bool(node.get("is_video") or node.get("video_duration") or node.get("media_type") == 2)
+    return {"url": f"https://www.instagram.com/{'reel' if is_video else 'p'}/{code}/" if code else None, "date": taken,
+            "views": node.get("video_view_count") or node.get("video_play_count") or node.get("play_count") or node.get("view_count"),
+            "likes": ((node.get("edge_liked_by") or node.get("edge_media_preview_like") or {}).get("count")) or node.get("like_count"),
+            "comments": (node.get("edge_media_to_comment") or {}).get("count") or node.get("comment_count"),
+            "duration": node.get("video_duration"), "caption": (caption or "")[:500], "is_video": is_video}
+
+
+def _instagram_profile(handle: str, limit: int) -> dict:
+    errors = []
+    try:  # 1. instaloader (works when Instagram isn't rate-limiting this server)
+        data = instagram_profile(handle, limit)
+        user = data["user"]
+        return {"profile": {"handle": user["username"], "followers": user["followers"], "following": user["following"],
+                            "posts_total": user["posts"], "bio": user["bio"], "verified": user["verified"]},
+                "posts": [{**p, "date": (p.get("date") or "")[:10].replace("-", ""),
+                           "url": p["url"].replace("/p/", "/reel/") if p.get("is_video") else p["url"]} for p in data["posts"]]}
+    except Exception as error:
+        errors.append(f"instaloader: {type(error).__name__}")
+    # 2. Instagram's own web endpoint, as the website calls it
+    status, _, body = web_get(f"https://www.instagram.com/api/v1/users/web_profile_info/?username={handle}",
+                              accept="application/json", tries=1)
+    if status == 200:
+        try:
+            user = json.loads(body)["data"]["user"]
+            edges = (user.get("edge_owner_to_timeline_media") or {}).get("edges") or []
+            return {"profile": {"handle": user.get("username"), "name": user.get("full_name"),
+                                "followers": (user.get("edge_followed_by") or {}).get("count"),
+                                "posts_total": (user.get("edge_owner_to_timeline_media") or {}).get("count"),
+                                "bio": (user.get("biography") or "")[:600], "link": user.get("external_url"),
+                                "verified": user.get("is_verified")},
+                    "posts": [_instagram_node(e.get("node") or {}) for e in edges][:limit]}
+        except (ValueError, KeyError, TypeError):
+            errors.append("web profile: unexpected answer")
+    else:
+        errors.append(f"web profile: HTTP {status}")
+    # 3. ScrapeCreators, if the owner connected a key (/connect scrapecreators …)
+    key = os.environ.get("SCRAPECREATORS_API_KEY")
+    if key:
+        request = urllib.request.Request(f"https://api.scrapecreators.com/v1/instagram/user/reels?handle={urllib.parse.quote(handle)}",
+                                         headers={"x-api-key": key, "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=40) as response:
+                data = json.loads(response.read().decode("utf-8", "replace"))
+            items = data.get("items") or data.get("reels") or data.get("data") or []
+            posts = [_instagram_node(item.get("media") or item) for item in items][:limit]
+            if posts:
+                return {"profile": {"handle": handle}, "posts": posts}
+            errors.append("ScrapeCreators: no reels")
+        except Exception as error:
+            errors.append(f"ScrapeCreators: {type(error).__name__}")
+    raise RuntimeError("Instagram refused every route from this server (" + "; ".join(errors) + "). Connect a ScrapeCreators "
+                       "key (/connect scrapecreators <key>), or send the profile's top reel links instead.")
+
+
+def _youtube_profile(handle: str, limit: int) -> dict:
+    import yt_dlp
+    base = f"https://www.youtube.com/{handle if '/' in handle else '@' + handle}"
+    posts, info = [], {}
+    for tab in ("shorts", "videos"):
+        with yt_dlp.YoutubeDL(_ytdlp_options(limit, flat=True)) as ydl:
+            info = ydl.extract_info(f"{base}/{tab}", download=False) or {}
+        posts = [{"url": e.get("url") if (e.get("url") or "").startswith("http") else f"https://www.youtube.com/watch?v={e.get('id')}",
+                  "views": e.get("view_count"), "duration": e.get("duration"), "caption": (e.get("title") or "")[:300],
+                  "is_video": True, "format": tab} for e in info.get("entries") or [] if e and e.get("id")]
+        if posts:
+            break
+    if not posts:
+        raise RuntimeError("YouTube returned no videos for this channel")
+    return {"profile": {"handle": info.get("uploader_id") or handle, "name": info.get("channel") or info.get("uploader"),
+                        "followers": info.get("channel_follower_count"), "bio": (info.get("description") or "")[:600]},
+            "posts": posts, "note": "YouTube lists don't include likes or dates; views and titles only"}
+
+
+async def _x_profile(handle: str, limit: int) -> dict:
+    data = await x_user(handle, limit)
+    user = data["user"]
+    posts = [{"url": p["url"], "date": (p.get("date") or "")[:10].replace("-", ""), "views": p.get("views"),
+              "likes": p.get("likes"), "comments": p.get("replies"), "shares": p.get("reposts"), "caption": p.get("text"),
+              "is_video": False} for p in data["posts"]]
+    return {"profile": {"handle": user["username"], "name": user["name"], "followers": user["followers"],
+                        "posts_total": user["posts"], "bio": user["bio"]}, "posts": posts}
+
+
+async def profile_posts(platform: str, handle: str, limit: int = 30) -> dict:
+    """A creator's profile and recent posts with stats: platform is tiktok | instagram | youtube | x."""
+    limit = max(5, min(limit, 60))
+    handle = handle.lstrip("@")
+    if platform == "x":
+        return {"platform": platform, **(await _x_profile(handle, limit))}
+    reader = {"tiktok": _tiktok_profile, "instagram": _instagram_profile, "youtube": _youtube_profile}.get(platform)
+    if not reader:
+        raise ValueError(f"Profiles on {platform} aren't supported")
+    return {"platform": platform, **(await asyncio.to_thread(reader, handle, limit))}
+
+
+COMMANDS = {"x_search": x_search, "x_trends": x_trends, "x_user": x_user, "x_post": x_post, "profile_posts": profile_posts,
             "instagram_profile": instagram_profile, "instagram_publish": instagram_publish,
             "tiktok_profile": tiktok_profile, "google_trends": google_trends,
             "x_thread": x_thread, "reddit_thread": reddit_thread, "post_details": post_details}

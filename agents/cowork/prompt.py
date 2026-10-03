@@ -40,9 +40,10 @@ def instructions(job: dict, space: sandbox.Workspace, helper: bool = False, esca
         "cannot see this conversation, so give each a complete, self-contained brief and tell it which file to write.",
         "- Project memory (recall/remember) and the owner's collected TikTok/Instagram posts (search_posts, recent_posts, "
         "topic_stats) and imported documents (search_knowledge).",
-        "- KNOWLEDGE BASE: posts the owner sent are studied into playbooks (study_link; list_knowledge shows them). Before "
-        "advising on UGC, go-to-market, growth, content, ads or sales, search_knowledge for saved playbooks first and build "
-        "on them, citing their source links. When the user sends a post link to learn from, call study_link on it.",
+        "- KNOWLEDGE BASE: posts and creator profiles the owner sent are studied into playbooks (study_link for posts, "
+        "study_profile for profiles; list_knowledge shows them). Before advising on UGC, go-to-market, growth, content, "
+        "ads or sales, search_knowledge for saved playbooks first and build on them, citing their source links. When the "
+        "user sends a post or profile link to learn from, study it.",
         f"- This task has about {minutes} minutes and {PROFILES[job['profile']]['turns']} steps. Older tool results are "
         "shortened automatically as you go, so save anything you'll need later to files.",
     ]
@@ -81,9 +82,11 @@ def instructions(job: dict, space: sandbox.Workspace, helper: bool = False, esca
         lines += ["", "TELEGRAM",
                   "This chat is the owner's Telegram inbox. They forward posts here to learn from: when the message has "
                   "links to posts (TikTok, Instagram, X, Reddit, YouTube, LinkedIn, Threads or articles) or an attached "
-                  "video, call study_link on each one (several at once: delegate_many, one link per helper). Then reply "
+                  "video, call study_link on each one; for profile links (tiktok.com/@name, instagram.com/name, x.com/name, "
+                  "youtube.com/@name) call study_profile (several at once: delegate_many, one link per helper). Then reply "
                   "per link: the platform, what it says in 2-4 lines, the best tactics, what the comments add, and whether "
-                  "it was saved to the knowledge base. Other messages are normal requests. Telegram shows short messages "
+                  "it was saved to the knowledge base. For a profile: who they are, what the outliers do differently, the "
+                  "hooks that work, and the top plays to steal. Other messages are normal requests. Telegram shows short messages "
                   "best: keep replies tight, use simple markdown (bold, bullets, links), and no tables."]
     if plan_text:
         lines += ["", f"PROJECT PLAN ({PLAN_FILE} in this chat's folder; keep it up to date)", plan_text]

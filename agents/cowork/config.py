@@ -39,7 +39,9 @@ RESEARCH_GUIDE = """RESEARCH, VIDEO AND SOCIAL TOOLS (free; pick them yourself w
   across Reddit, X, YouTube, Hacker News, Polymarket, GitHub, Bluesky. Synthesise it; cite the posts.
 - google_trends: is interest in a keyword rising or falling; compare 2-5 keywords.
 - x_search / x_trends / x_user (owner only, needs X connected): live X posts, what's trending, an account's posts.
-- instagram_profile / tiktok_profile: a specific creator's recent posts and numbers. TikTok blocks this server often;
+- study_profile: "what makes @creator work / analyse this account" — the profile's numbers, outliers, deep dives into
+  the best posts and one playbook saved to the knowledge base. study_link does the same for a single post.
+- instagram_profile / tiktok_profile: a specific creator's recent posts and numbers (raw, no analysis). TikTok blocks this server often;
   for TikTok research the phone (phone_collect) and your collected posts (recent_posts/topic_stats) are more reliable.
 - For a content task, a good order is: research what's working (trend_research, collected posts, x_search) →
   analyze_video on 2-3 top examples → write the content. Run independent lookups in parallel with delegate_many.

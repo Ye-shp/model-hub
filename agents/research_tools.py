@@ -4,6 +4,7 @@
   trend_research    last 30 days across Reddit, X, YouTube, Hacker News, Polymarket, GitHub, Bluesky (last30days engine)
   study_link        one post (TikTok, Reel, X thread, Reddit thread, YouTube, article) + its top comments -> the useful
                     UGC / go-to-market know-how, saved to the project's knowledge base (see study.py); list_knowledge
+  study_profile     a creator's profile: recent posts' numbers + deep dives into the outliers -> one playbook, saved too
   x_search/x_trends/x_user, instagram_profile, tiktok_profile, google_trends   targeted lookups
   draft_post / publish_post / list_posts   posting to X, Instagram or TikTok (via the phone) — only after the user
                                            approves a specific draft in their own message
@@ -252,19 +253,9 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
         saved = space.write_text(f"research/{slug(topic)}-{time.strftime('%Y%m%d-%H%M')}.md", text)
         return text[:16000] + f"\n\n({saved}. Synthesise this into findings with sources; don't paste it whole.)"
 
-    # ---- studying posts into the knowledge base ----
-    @function_tool
-    async def study_link(source: str, save: str = "auto") -> str:
-        """Study one post the user sent: a TikTok, Instagram Reel or post, X post or thread, Reddit thread, YouTube
-        video or Short, LinkedIn/Threads post, article, or a video file in the workspace (uploads/…). Says which platform
-        it is, reads what it says (thread text, or the video's transcript, on-screen text and caption) and its most-liked
-        comments, and extracts every useful UGC / go-to-market / growth / content tactic. Useful findings are saved to
-        this project's knowledge base, where search_knowledge finds them in every future chat. save: auto (save when it's
-        actionable know-how) | always | never. A link studied before returns the saved notes unless save='always'.
-        Takes 1-4 minutes for videos. Study several links in parallel with delegate_many."""
-        import study
-        budget.active()
-        folder = f"study/{slug(source.rsplit('/', 1)[-1] or source)}-{time.strftime('%H%M%S')}"
+    # ---- studying posts and profiles into the knowledge base ----
+    def study_kit(folder: str) -> dict:
+        """What study.py needs: the scrapers, one model call, video measuring, and where to write notes."""
 
         async def run_social(command: str, args: dict) -> dict:
             return await toolbox.run_social(command, args, 300)
@@ -273,7 +264,7 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
             budget.before(helper_model)
             async with gate:
                 response = await client.chat.completions.create(
-                    model=helper_model, messages=[{"role": "user", "content": content}], max_tokens=5000,
+                    model=helper_model, messages=[{"role": "user", "content": content}], max_tokens=6000,
                     temperature=0.3, extra_body={"reasoning_effort": "medium"})
             return response.choices[0].message.content or ""
 
@@ -281,24 +272,66 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
             report, _, error = await probe(src, 10, folder)
             return report, error
 
+        return {"probe": video, "social": run_social, "ask": ask, "small_jpeg": small_jpeg, "facts": facts, "log": log,
+                "x_signed_in": owner and links.get("x", {}).get("connected", False),
+                "write_file": lambda text: space.write_text(f"{folder}/notes.md", text)}
+
+    async def run_profile(source: str, posts: int, deep_dive: int, save: str) -> str:
+        import study
+        folder = f"study/profile-{slug(source.rstrip('/').rsplit('/', 1)[-1] or source)}-{time.strftime('%H%M%S')}"
         try:
-            result = await study.study(
-                source.strip(), project, probe=video, social=run_social, ask=ask, small_jpeg=small_jpeg, facts=facts, log=log,
-                x_signed_in=owner and links.get("x", {}).get("connected", False), save=save if save in {"auto", "always", "never"} else "auto",
-                write_file=lambda text: space.write_text(f"{folder}/notes.md", text))
+            result = await study.study_profile(source.strip(), project, posts=posts, deep_dive=deep_dive,
+                                               save=save if save in {"auto", "always", "never"} else "auto", **study_kit(folder))
+        except (RuntimeError, ValueError, LookupError) as error:
+            return f"Couldn't study this profile: {error}"
+        return study.profile_reply(result) + (f"\n\n(Full notes and the material read: {folder}/notes.md)"
+                                              if not result["already"] else "")
+
+    @function_tool
+    async def study_link(source: str, save: str = "auto") -> str:
+        """Study one post the user sent: a TikTok, Instagram Reel or post, X post or thread, Reddit thread, YouTube
+        video or Short, LinkedIn/Threads post, article, or a video file in the workspace (uploads/…). Says which platform
+        it is, reads what it says (thread text, or the video's transcript, on-screen text and caption) and its most-liked
+        comments, and extracts every useful UGC / go-to-market / growth / content tactic. Useful findings are saved to
+        this project's knowledge base, where search_knowledge finds them in every future chat. save: auto (save when it's
+        actionable know-how) | always | never. A link studied before returns the saved notes unless save='always'.
+        Profile links are handed to study_profile automatically. Takes 1-4 minutes for videos. Study several links in
+        parallel with delegate_many."""
+        import links as link_rules
+        import study
+        budget.active()
+        if link_rules.profile_of(source.strip()):
+            return await run_profile(source, 30, 5, save)
+        folder = f"study/{slug(source.rsplit('/', 1)[-1] or source)}-{time.strftime('%H%M%S')}"
+        try:
+            result = await study.study(source.strip(), project, save=save if save in {"auto", "always", "never"} else "auto",
+                                       **study_kit(folder))
         except (RuntimeError, ValueError, LookupError) as error:
             return f"Couldn't study this link: {error}"
         return study.reply(result) + (f"\n\n(Full notes and the material read: {folder}/notes.md)" if not result["already"] else "")
 
     @function_tool
+    async def study_profile(profile: str, posts: int = 30, deep_dive: int = 5, save: str = "auto") -> str:
+        """Study a creator's whole profile: a TikTok (tiktok.com/@name), Instagram (instagram.com/name), YouTube channel
+        (youtube.com/@name) or X account (x.com/name, needs X connected). Reads the profile and its recent posts' numbers
+        (posts: how many, 5-60), finds the outliers, studies the best posts closely (deep_dive: how many, 0-8: transcript,
+        on-screen text, caption and top comments, plus one typical post for contrast), and writes one playbook: pillars,
+        formats, hooks quoted word for word, what the outliers do differently, CTAs and funnel, cadence, what the audience
+        says, and plays to steal. Saved to the knowledge base (save: auto | always | never); a profile studied in the
+        last 14 days returns the saved playbook unless save='always'. Takes about 5-15 minutes; compare several profiles
+        in parallel with delegate_many (one profile per helper)."""
+        budget.active()
+        return await run_profile(profile, max(5, min(posts, 60)), max(0, min(deep_dive, 8)), save)
+
+    @function_tool
     def list_knowledge(category: str = "", limit: int = 40) -> str:
-        """Posts already studied into this project's knowledge base, newest first, with their source links. category:
-        optional filter (ugc, gtm, growth, content, ads, sales, product, creator-business). Use search_knowledge to
-        search their contents."""
+        """Posts and profiles already studied into this project's knowledge base, newest first, with their source links.
+        category: optional filter (profile, ugc, gtm, growth, content, ads, sales, product, creator-business). Use
+        search_knowledge to search their contents."""
         import study
         return json.dumps(study.index(project, category, limit), ensure_ascii=False)
 
-    tools = [analyze_video, trend_research, study_link, list_knowledge]
+    tools = [analyze_video, trend_research, study_link, study_profile, list_knowledge]
 
     # ---- lookups ----
     @function_tool
