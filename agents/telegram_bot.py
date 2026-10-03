@@ -34,7 +34,8 @@ PROJECT = "default"  # the owner's project: its knowledge base is shared by all 
 MAX_DOWNLOAD = 20 * 1024 * 1024  # Telegram's limit for bots downloading files
 MAX_UPLOAD = 49 * 1024 * 1024
 CHUNK = 3800
-HELP = ("Send me a TikTok, Reel, X post or thread, Reddit thread or YouTube link (or a video file up to 20 MB). I'll tell "
+HELP = ("Send me a TikTok, Reel, X post or thread, Reddit thread or YouTube link (or a video file up to 20 MB), or a "
+        "creator's profile link to analyse their whole account. I'll tell "
         "you which platform it is, study what it says and the top comments, and save anything useful about UGC, "
         "go-to-market and growth to the knowledge base for every future chat. Anything else you write is a normal "
         "Cowork request.\n\n/new starts a fresh conversation, /status shows what's running.")
@@ -277,7 +278,9 @@ async def handle(message: dict) -> None:
     what = [links.describe(found)] if found else []
     if attached:
         what.append("your file")
-    ack = (f"📥 {' + '.join(what)} — studying it now." if what else "On it.") + (" " + " ".join(problems) if problems else "")
+    profiles = any(links.profile_of(u) for u in found)
+    ack = ((f"📥 {' + '.join(what)} — studying it now." + (" Profiles take about 5-15 minutes." if profiles else ""))
+           if what else "On it.") + (" " + " ".join(problems) if problems else "")
     await send(token, chat, ack)
     with suppress(Exception):
         await api(token, "sendChatAction", {"chat_id": chat, "action": "typing"})

@@ -37,14 +37,56 @@ def find_urls(text: str) -> list[str]:
     return found
 
 
-def platform_of(url: str) -> tuple[str, str]:
-    """(key, label) for a link, e.g. ("tiktok", "TikTok video"); ("web", "web page") when unrecognised."""
+# Profile pages: (platform, label, host pattern, path pattern capturing the handle)
+PROFILE_RULES = [
+    ("tiktok", "TikTok profile", r"(^|\.)tiktok\.com$", r"^/@([\w.-]+)/?$"),
+    ("youtube", "YouTube channel", r"(^|\.)youtube\.com$", r"^/(@[\w.-]+|channel/[\w-]+|c/[\w.-]+)(/(shorts|videos|featured|streams))?/?$"),
+    ("instagram", "Instagram profile", r"(^|\.)instagram\.com$", r"^/([A-Za-z0-9._]{1,30})(/(reels|tagged))?/?$"),
+    ("x", "X profile", r"(^|\.)(x|twitter)\.com$", r"^/([A-Za-z0-9_]{1,15})/?$"),
+]
+NOT_HANDLES = {"p", "reel", "reels", "tv", "stories", "explore", "accounts", "direct", "about", "legal", "developer",
+               "home", "search", "i", "settings", "notifications", "messages", "hashtag", "compose", "login", "signup",
+               "share", "intent", "tos", "privacy", "jobs", "shorts", "watch", "results", "feed", "discover", "tag"}
+
+
+def _host_path(url: str) -> tuple[str, str]:
     try:
         parsed = urlparse(url.strip())
     except ValueError:
-        return "web", "web page"
+        return "", "/"
     host = (parsed.hostname or "").lower().removeprefix("www.").removeprefix("m.").removeprefix("mobile.")
-    path = parsed.path or "/"
+    return host, parsed.path or "/"
+
+
+def profile_of(url: str) -> tuple[str, str, str] | None:
+    """(platform, handle, canonical profile url) for a creator's profile/channel link, else None."""
+    host, path = _host_path(url)
+    for platform, _, host_rule, path_rule in PROFILE_RULES:
+        match = re.search(path_rule, path) if re.search(host_rule, host) else None
+        if not match:
+            continue
+        handle = match.group(1).lstrip("@")
+        if handle.lower() in NOT_HANDLES:
+            return None
+        canonical = {"tiktok": f"https://www.tiktok.com/@{handle}",
+                     "instagram": f"https://www.instagram.com/{handle}/",
+                     "x": f"https://x.com/{handle}",
+                     "youtube": f"https://www.youtube.com/{match.group(1)}"}[platform]
+        if platform == "youtube" and not match.group(1).startswith("@"):
+            handle = match.group(1)  # channel/ID or c/name: keep the path form
+        return platform, handle, canonical
+    return None
+
+
+def platform_of(url: str) -> tuple[str, str]:
+    """(key, label) for a link, e.g. ("tiktok", "TikTok video"); ("web", "web page") when unrecognised.
+    Creator profiles come back as ("profile", "TikTok profile") and so on."""
+    profile = profile_of(url)
+    if profile:
+        return "profile", next(label for key, label, _, _ in PROFILE_RULES if key == profile[0])
+    host, path = _host_path(url)
+    if not host:
+        return "web", "web page"
     for key, label, host_rule, path_rule in RULES:
         if re.search(host_rule, host) and (not path_rule or re.search(path_rule, path)):
             return key, label
