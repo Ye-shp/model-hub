@@ -25,6 +25,7 @@ Big projects: ask for a plan first; Cowork keeps `plan.md` in the chat's folder 
 
 Owner commands: `/connections` (status of everything) · `/connect claude TOKEN` (token from `claude setup-token`) ·
 `/connect codex` · `/connect x USERNAME auth_token=… ct0=…` · `/connect instagram USER_ID ACCESS_TOKEN` ·
+`/connect tiktok OPEN_ID ACCESS_TOKEN` (add `refresh_token=… client_key=… client_secret=…` for automatic renewal) ·
 `/connect bluesky HANDLE APP_PASSWORD` · `/connect github TOKEN` · `/connect telegram BOT_TOKEN` (use Cowork from
 Telegram). Approve a drafted post with `approve post N`."""
 
@@ -34,6 +35,19 @@ SKIP = {"model", "usage", "queued", "completed", "failed", "interrupted", "cance
 
 class LostContact(Exception):
     pass
+
+
+def connection_error(error, request_text: str) -> str:
+    """Controller validation errors must not echo credentials pasted into a connection command."""
+    text = str(error)
+    values = set()
+    for word in request_text.split()[2:]:
+        values.add(word)
+        if "=" in word:
+            values.add(word.partition("=")[2])
+    for value in sorted((v for v in values if v), key=len, reverse=True):
+        text = text.replace(value, "[redacted]")
+    return text
 
 
 class Pipe:
@@ -303,9 +317,9 @@ class Pipe:
                             f"{'connected' if v['signed_in'] else 'not connected'}{'' if v['installed'] else ' (not installed)'}; "
                             f"{v['used_today']}/{v['daily_limit']} tasks in the last 24 h" for k, v in info.items()]
                     social = await self._call(client, "GET", "/api/connections/social")
-                    names = {"x": "X", "instagram": "Instagram (posting)", "bluesky": "Bluesky", "github": "GitHub",
+                    names = {"x": "X", "instagram": "Instagram (posting)", "tiktok": "TikTok (analytics)", "bluesky": "Bluesky", "github": "GitHub",
                              "scrapecreators": "ScrapeCreators (optional)"}
-                    rows += [f"- **{names[k]}**: {'connected' + (' as @' + v['username'] if v.get('username') else '') if v['connected'] else 'not connected'}"
+                    rows += [f"- **{names.get(k, k)}**: {'connected' + (' as @' + v['username'] if v.get('username') else '') if v['connected'] else 'not connected'}"
                              for k, v in social["accounts"].items()]
                     tools = social["tools"]
                     rows.append(f"- **Research tools**: {tools['state']}" + (f" ({tools.get('detail')})" if tools.get("detail") else ""))
@@ -343,7 +357,7 @@ class Pipe:
                            "You can delete this message from the chat; the token is stored only on the box.")
                     return
                 social_name = command.split()[1] if command.startswith("/connect ") and len(command.split()) > 1 else ""
-                if social_name in {"x", "twitter", "instagram", "ig", "bluesky", "github", "scrapecreators"}:
+                if social_name in {"x", "twitter", "instagram", "ig", "tiktok", "bluesky", "github", "scrapecreators"}:
                     if tier != "owner":
                         yield "Only the owner can manage connections."
                         return
@@ -352,7 +366,7 @@ class Pipe:
                     try:
                         result = await self._call(client, "POST", "/api/connections/social", json={"service": service, "words": words})
                     except ValueError as error:
-                        yield f"Not saved: {error}"
+                        yield f"Not saved: {connection_error(error, request_text)}"
                         return
                     state = result["accounts"][service]
                     yield (f"**{service}** is {'connected' if state['connected'] else 'disconnected'}. "
@@ -435,4 +449,5 @@ class Pipe:
                     yield piece
         except (httpx.HTTPError, ValueError, KeyError) as error:
             await self._status(emit, "Could not reach the agent controller", done=True)
-            yield f"Could not reach the agent controller ({type(error).__name__}: {str(error)[:200]}). It may be restarting; try again in a minute."
+            detail = connection_error(error, request_text) if command.startswith("/connect ") else str(error)
+            yield f"Could not reach the agent controller ({type(error).__name__}: {detail[:200]}). It may be restarting; try again in a minute."

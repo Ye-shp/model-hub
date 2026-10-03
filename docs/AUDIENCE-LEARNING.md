@@ -67,6 +67,31 @@ permissions. The collector shows missing credentials, expired tokens, permission
 failures, unavailable metrics and rate limits as errors or warnings. It preserves
 available counts when a different metric is unsupported.
 
+TikTok access tokens expire after 24 hours according to [TikTok's token management
+documentation](https://developers.tiktok.com/docs/en/oauth-user-access-token-management).
+Connecting only an access token requires manual renewal; it is not enough for
+unattended 72-hour and seven-day checkpoints. Automatic renewal also needs the
+refresh token and the app's client key and client secret. Refresh credentials
+must remain valid and retain the required permissions. A revoked or expired
+refresh token still requires reconnecting the account, and missed checkpoints
+cannot be reconstructed by renewing a token later.
+
+Connect from an owner Cowork chat using credentials from the authorized TikTok
+app with `video.list` and `user.info.basic` permissions:
+
+```text
+/connect tiktok <OAuth open_id> <access token> refresh_token=<refresh token> client_key=<client key> client_secret=<client secret>
+```
+
+Supply all three refresh fields together. The account ID is OAuth `open_id`, not
+the account's username. The shorter `/connect tiktok <OAuth open_id> <access token>`
+form uses manual renewal. Reconnecting with that shorter form also removes any
+previously saved refresh configuration. Connection commands are handled outside
+the model; do not copy their credentials into experiment descriptions or exports.
+With valid refresh configuration, the collector renews access when needed and
+saves the returned access token, refresh token and expiry. A failed renewal is
+reported in the collection schedule rather than treated as an empty observation.
+
 Use the numeric published video ID for TikTok or media ID for Instagram. An
 Instagram permalink's shortcode is not its numeric media ID. The link must be a
 direct TikTok video or Instagram post/reel permalink on that platform; the
@@ -120,8 +145,13 @@ a minimum score margin. Choose 24, 72 or 168 hours; defaults are 72 hours, at le
 500 views and a 0.15 margin in log reach units. A selected observation must be
 within the larger of two hours or 20% of the target age. The two compared
 observations must also differ in age by no more than the larger of two hours or
-10% of that horizon. For
-each eligible comparison, the download contains JSONL rows:
+10% of that horizon.
+
+Select **Prepare learning export**, then use **Download preference examples**
+and **Download comparison audit** to save the two files. Preparing an export
+does not automatically save a file or start training.
+
+Each eligible comparison produces a JSONL row:
 
 ```json
 {"prompt":"The creative brief", "chosen":"The preferred draft", "rejected":"The other draft"}

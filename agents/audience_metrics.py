@@ -1,21 +1,25 @@
 """Read first-party audience counts for the owner's connected accounts.
 
 No scraping or publishing happens here. TikTok Display API verifies video ownership;
-Instagram observations require a matching media owner. Tokens stay in HTTP headers,
-redirects are refused, and provider bodies/URLs are never included in errors.
+Instagram observations require a matching media owner. Analytics access tokens stay
+in headers; OAuth renewal secrets stay in form bodies. Redirects are refused, and
+provider bodies/URLs are never included in errors.
 
 API references:
 https://developers.tiktok.com/docs/en/tiktok-api-v2-video-query
 https://developers.tiktok.com/docs/en/tiktok-api-v2-get-user-info
+https://developers.tiktok.com/docs/en/oauth-user-access-token-management
 https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/insights/
 https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/adobjects/igmedia.py
 """
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager, nullcontext
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,6 +30,8 @@ import toolbox
 METRICS = ("views", "likes", "comments", "shares", "saves", "reach")
 _NUMERIC_ID = re.compile(r"[0-9]{1,40}\Z")
 _ACCOUNT_ID = re.compile(r"[A-Za-z0-9_.-]{1,200}\Z")
+_OAUTH_ENDPOINT = "https://open.tiktokapis.com/v2/oauth/token/"
+_REFRESH_FIELDS = ("refresh_token", "client_key", "client_secret")
 _ERROR_MESSAGES = {
     "credentials_missing": "Account analytics are not connected.",
     "account_mismatch": "The post account does not match the connected account.",
@@ -43,6 +49,8 @@ _ERROR_MESSAGES = {
     "invalid_response": "The analytics API returned an invalid response.",
     "unsafe_endpoint": "The analytics endpoint configuration is invalid.",
     "platform_unsupported": "Automatic analytics are supported for TikTok and Instagram only.",
+    "credentials_changed": "The account connection changed during token renewal; retry scheduled.",
+    "refresh_busy": "Another worker is renewing the account token; retry scheduled.",
 }
 
 
@@ -63,7 +71,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def _provider_error(status: int, payload: dict, retry_after: str | None = None) -> MetricsError:
     error = payload.get("error")
-    code = error.get("code") if isinstance(error, dict) else None
+    code = error.get("code") if isinstance(error, dict) else error if isinstance(error, str) else None
     if not isinstance(code, (str, int)):
         code = None
     if status == 429 or code in {4, 17, 32, 613, "rate_limit_exceeded"}:
@@ -71,8 +79,10 @@ def _provider_error(status: int, payload: dict, retry_after: str | None = None) 
         return MetricsError("rate_limited", min(max(delay, 60), 21600))
     if status >= 500:
         return MetricsError("provider_unavailable")
-    if status == 401 or code in {190, "access_token_invalid", "access_token_expired"}:
-        return MetricsError("credentials_expired", 21600)
+    if status == 401 or code in {190, "access_token_invalid", "access_token_expired", "invalid_grant", "invalid_token"}:
+        return MetricsError("credentials_expired", 900)
+    if code == "invalid_client":
+        return MetricsError("invalid_credentials", 900)
     if status == 403 or code in {10, 200, "scope_not_authorized", "scope_permission_missed"}:
         return MetricsError("permission_missing", 21600)
     if code == 100:
@@ -80,15 +90,16 @@ def _provider_error(status: int, payload: dict, retry_after: str | None = None) 
     return MetricsError("provider_rejected")
 
 
-def _request_json(method: str, url: str, token: str, body: dict | None = None) -> dict:
+def _request_json(method: str, url: str, token: str | None, body: dict | None = None, *, form: dict | None = None) -> dict:
     parsed = urllib.parse.urlsplit(url)
     if (parsed.scheme != "https" or parsed.hostname not in {"open.tiktokapis.com", "graph.instagram.com"}
             or parsed.username or parsed.password or parsed.port not in {None, 443}):
         raise MetricsError("unsafe_endpoint")
-    request = urllib.request.Request(
-        url, data=json.dumps(body).encode() if body is not None else None, method=method,
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
-    )
+    headers = {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded" if form is not None else "application/json"}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    data = urllib.parse.urlencode(form).encode() if form is not None else json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.build_opener(_NoRedirect()).open(request, timeout=20) as response:
             raw = response.read(1024 * 1024 + 1)
@@ -116,6 +127,117 @@ def _request_json(method: str, url: str, token: str, body: dict | None = None) -
     return payload
 
 
+def _request_oauth(form: dict) -> dict:
+    # OAuth secrets belong in the POST body, never in URLs or diagnostic text.
+    return _request_json("POST", _OAUTH_ENDPOINT, None, form=form)
+
+
+def _safe_token(value) -> bool:
+    return isinstance(value, str) and bool(value.strip()) and len(value) <= 600 and not any(c in value for c in "\r\n\x00")
+
+
+def _has_refresh(entry: dict) -> bool:
+    present = [bool(entry.get(field)) for field in _REFRESH_FIELDS]
+    if any(present) and (not all(present) or any(not _safe_token(entry.get(field)) for field in _REFRESH_FIELDS)):
+        raise MetricsError("invalid_credentials", 900)
+    return all(present)
+
+
+def _expires_soon(entry: dict, now: datetime) -> bool:
+    try:
+        expires = datetime.fromisoformat(entry["expires_at"].replace("Z", "+00:00"))
+        if expires.tzinfo is None:
+            return True
+        return (expires - now).total_seconds() <= 120
+    except (KeyError, TypeError, AttributeError, ValueError):
+        # The initially pasted token has no trusted expiry. Renew before first use.
+        return True
+
+
+@contextmanager
+def _tiktok_refresh_lock():
+    """Serialize rotating refresh grants across threads/processes, including restart."""
+    path = toolbox._path().with_name("tiktok-refresh.lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    locked = False
+    try:
+        if os.fstat(descriptor).st_size == 0:
+            os.write(descriptor, b"0")
+        deadline = time.monotonic() + 20
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise MetricsError("refresh_busy", 60) from None
+                time.sleep(.05)
+        yield
+    finally:
+        if locked:
+            if os.name == "nt":
+                import msvcrt
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _prepare_tiktok(task: dict, credentials: dict, *, live: bool, oauth_request, persist_tokens,
+                    force_for_token: str | None = None) -> dict:
+    account = str(task["account"])
+    _credential("tiktok", account, credentials)
+    entry = dict(credentials["tiktok"])
+    if not _has_refresh(entry):
+        return entry
+    # Injected credentials stay local unless the caller explicitly supplies persistence.
+    with _tiktok_refresh_lock() if live else nullcontext():
+        if live:
+            current = toolbox.credentials()
+            _credential("tiktok", account, current)
+            entry = dict(current["tiktok"])
+            if not _has_refresh(entry):
+                return entry  # Owner intentionally reconnected in manual-token mode.
+        now = datetime.now(timezone.utc)
+        if not _expires_soon(entry, now) and force_for_token != entry["access_token"]:
+            return entry
+        payload = oauth_request({"grant_type": "refresh_token", "refresh_token": entry["refresh_token"],
+                                 "client_key": entry["client_key"], "client_secret": entry["client_secret"]})
+        if not isinstance(payload, dict):
+            raise MetricsError("invalid_response")
+        if payload.get("error"):
+            raise _provider_error(200, payload)
+        if str(payload.get("open_id") or "") != account:
+            raise MetricsError("account_mismatch", 21600)
+        expiry = payload.get("expires_in")
+        if (not _safe_token(payload.get("access_token")) or not _safe_token(payload.get("refresh_token"))
+                or not isinstance(payload.get("token_type"), str) or payload["token_type"].lower() != "bearer"
+                or isinstance(expiry, bool) or not isinstance(expiry, int) or not 1 <= expiry <= 31536000):
+            raise MetricsError("invalid_response")
+        scopes = payload.get("scope")
+        if not isinstance(scopes, str):
+            raise MetricsError("invalid_response")
+        expires_at = datetime.fromtimestamp(now.timestamp() + expiry, timezone.utc).isoformat(timespec="seconds")
+        if persist_tokens is not None and not persist_tokens(entry, payload["access_token"], payload["refresh_token"], expires_at=expires_at):
+            # A concurrent owner reconnect/disconnect is authoritative. Do not overwrite it.
+            raise MetricsError("credentials_changed", 60)
+        updated = {**entry, "access_token": payload["access_token"], "refresh_token": payload["refresh_token"], "expires_at": expires_at}
+        if not {"user.info.basic", "video.list"}.issubset({scope.strip() for scope in scopes.split(",")}):
+            # Keep a valid rotated refresh token even if the grant now lacks analytics permission.
+            raise MetricsError("permission_missing", 21600)
+        return updated
+
+
 def _count(value) -> int | None:
     if isinstance(value, bool):
         return None
@@ -129,11 +251,11 @@ def _count(value) -> int | None:
 def _credential(platform: str, account: str, credentials: dict) -> tuple[str, str]:
     entry = credentials.get(platform)
     if not isinstance(entry, dict):
-        raise MetricsError("credentials_missing", 21600)
+        raise MetricsError("credentials_missing", 900)
     identity = str(entry.get("account_id" if platform == "tiktok" else "user_id") or "")
     token = entry.get("access_token")
     if not _ACCOUNT_ID.fullmatch(identity) or not isinstance(token, str) or not token or any(c in token for c in "\r\n\x00"):
-        raise MetricsError("invalid_credentials", 21600)
+        raise MetricsError("invalid_credentials", 900)
     if identity != account:
         raise MetricsError("account_mismatch", 21600)
     return identity, token
@@ -236,16 +358,29 @@ def _instagram(task: dict, credentials: dict, request) -> dict:
     return {"metrics": metrics, "source": "instagram_graph_api", "warnings": warnings}
 
 
-def collect_sync(task: dict, *, credentials: dict | None = None, request=None) -> dict:
+def collect_sync(task: dict, *, credentials: dict | None = None, request=None, oauth_request=None, persist_tokens=None) -> dict:
     """Collect one owned post, with dependency injection for offline tests."""
     platform = task.get("platform")
     if platform not in {"tiktok", "instagram"}:
         raise MetricsError("platform_unsupported", 21600)
     if not _NUMERIC_ID.fullmatch(str(task.get("remote_id") or "")) or not _ACCOUNT_ID.fullmatch(str(task.get("account") or "")):
         raise MetricsError("invalid_identifier", 21600)
-    result = {"tiktok": _tiktok, "instagram": _instagram}[platform](
-        task, toolbox.credentials() if credentials is None else credentials, request or _request_json,
-    )
+    live = credentials is None
+    credentials = toolbox.credentials() if live else credentials
+    request = request or _request_json
+    if platform == "tiktok":
+        persist_tokens = toolbox.rotate_tiktok_tokens if live and persist_tokens is None else persist_tokens
+        entry = _prepare_tiktok(task, credentials, live=live, oauth_request=oauth_request or _request_oauth, persist_tokens=persist_tokens)
+        try:
+            result = _tiktok(task, {"tiktok": entry}, request)
+        except MetricsError as error:
+            if error.code != "credentials_expired" or not _has_refresh(entry):
+                raise
+            entry = _prepare_tiktok(task, {"tiktok": entry}, live=live, oauth_request=oauth_request or _request_oauth,
+                                    persist_tokens=persist_tokens, force_for_token=entry["access_token"])
+            result = _tiktok(task, {"tiktok": entry}, request)
+    else:
+        result = _instagram(task, credentials, request)
     result["observed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     return result
 

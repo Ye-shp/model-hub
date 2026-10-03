@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.error
 from unittest.mock import patch
@@ -20,6 +21,7 @@ import audience_metrics as metrics
 import audience_worker as worker
 import audience
 import store
+import toolbox
 import workspace as ws
 
 
@@ -214,6 +216,308 @@ class QueueFixture:
 
     def fail_collection(self, *args, **kwargs):
         self.failed.append((args, kwargs))
+
+
+class TikTokRenewalTests(unittest.TestCase):
+    def task(self):
+        return {"id": 1, "platform": "tiktok", "account": "open-id", "remote_id": "7123456789012345678"}
+
+    def credentials(self, **extra):
+        return {"tiktok": {"account_id": "open-id", "access_token": TOKEN, "refresh_token": "private-refresh",
+                           "client_key": "private-client-key", "client_secret": "private-client-secret", **extra}}
+
+    def token_response(self, **extra):
+        return {"open_id": "open-id", "access_token": "renewed-access", "refresh_token": "renewed-refresh",
+                "expires_in": 86400, "token_type": "Bearer", "scope": "user.info.basic,video.list", **extra}
+
+    def counts(self, method, url, token, body=None):
+        if "/user/info/" in url:
+            return {"data": {"user": {"open_id": "open-id"}}}
+        return {"data": {"videos": [{"id": self.task()["remote_id"], "view_count": 1000, "like_count": 10}]}}
+
+    def test_first_refresh_persists_rotation_before_any_analytics_read(self):
+        events = []
+        credentials = self.credentials()
+
+        def oauth(form):
+            self.assertEqual(form["grant_type"], "refresh_token")
+            self.assertEqual(form["refresh_token"], "private-refresh")
+            self.assertEqual(form["client_key"], "private-client-key")
+            self.assertEqual(form["client_secret"], "private-client-secret")
+            events.append("refresh")
+            return self.token_response()
+
+        def persist(expected, access_token, refresh_token, expires_at=None):
+            self.assertEqual(expected, credentials["tiktok"])
+            self.assertEqual((access_token, refresh_token), ("renewed-access", "renewed-refresh"))
+            self.assertGreater(datetime.fromisoformat(expires_at), datetime.now(timezone.utc))
+            events.append("persist")
+            return True
+
+        def request(method, url, token, body=None):
+            self.assertEqual(events[:2], ["refresh", "persist"])
+            self.assertEqual(token, "renewed-access")
+            events.append("read")
+            return self.counts(method, url, token, body)
+
+        result = metrics.collect_sync(self.task(), credentials=credentials, request=request, oauth_request=oauth, persist_tokens=persist)
+        self.assertEqual(result["metrics"]["views"], 1000)
+        self.assertEqual(credentials["tiktok"]["access_token"], TOKEN)  # No mutation of injected credentials.
+        for secret in (TOKEN, "private-refresh", "private-client-key", "private-client-secret", "renewed-access", "renewed-refresh"):
+            self.assertNotIn(secret, json.dumps(result))
+
+    def test_injected_refresh_never_persists_without_explicit_callback(self):
+        with patch.object(toolbox, "rotate_tiktok_tokens") as persist:
+            result = metrics.collect_sync(self.task(), credentials=self.credentials(), request=self.counts,
+                                          oauth_request=lambda form: self.token_response())
+        self.assertEqual(result["metrics"]["views"], 1000)
+        persist.assert_not_called()
+
+    def test_cached_valid_expiry_avoids_repeated_token_renewal(self):
+        expiry = (datetime.now(timezone.utc) + timedelta(hours=12)).isoformat()
+        result = metrics.collect_sync(self.task(), credentials=self.credentials(expires_at=expiry), request=self.counts,
+                                      oauth_request=lambda form: self.fail("Fresh cached token should not refresh"))
+        self.assertEqual(result["metrics"]["views"], 1000)
+
+    def test_token_expired_response_forces_one_refresh_then_retries_with_new_token(self):
+        tokens, grants = [], []
+        expiry = (datetime.now(timezone.utc) + timedelta(hours=12)).isoformat()
+
+        def request(method, url, token, body=None):
+            tokens.append(token)
+            if token == TOKEN:
+                raise metrics.MetricsError("credentials_expired", 900)
+            return self.counts(method, url, token, body)
+
+        def oauth(form):
+            grants.append(form)
+            return self.token_response()
+
+        result = metrics.collect_sync(self.task(), credentials=self.credentials(expires_at=expiry), request=request, oauth_request=oauth)
+        self.assertEqual(tokens, [TOKEN, "renewed-access", "renewed-access"])
+        self.assertEqual(len(grants), 1)
+        self.assertEqual(result["metrics"]["views"], 1000)
+
+    def test_invalid_refresh_response_does_not_persist_or_read_counts(self):
+        responses = [self.token_response(open_id="another-account"), self.token_response(refresh_token=None),
+                     self.token_response(access_token="secret\nheader"), self.token_response(expires_in=True),
+                     self.token_response(expires_in=-1), self.token_response(token_type="Basic"), self.token_response(scope=None)]
+        for response in responses:
+            persisted = []
+            with self.subTest(response_field_types={k: type(v).__name__ for k, v in response.items()}), self.assertRaises(metrics.MetricsError) as error:
+                metrics.collect_sync(self.task(), credentials=self.credentials(), request=lambda *args: self.fail("Counts read"),
+                                      oauth_request=lambda form: response,
+                                      persist_tokens=lambda *args, **kwargs: persisted.append(args))
+            self.assertEqual(persisted, [])
+            self.assertNotIn(TOKEN, str(error.exception))
+
+    def test_revoked_refresh_error_is_safe_and_manual_token_mode_does_not_refresh(self):
+        with self.assertRaises(metrics.MetricsError) as error:
+            metrics.collect_sync(self.task(), credentials=self.credentials(), request=lambda *args: self.fail("Counts read"),
+                                  oauth_request=lambda form: {"error": "invalid_grant", "error_description": "secret " + TOKEN})
+        self.assertEqual(error.exception.code, "credentials_expired")
+        self.assertEqual(error.exception.retry_after_seconds, 900)
+        self.assertNotIn(TOKEN, str(error.exception))
+
+        def expired(*args):
+            raise metrics.MetricsError("credentials_expired", 900)
+
+        with self.assertRaises(metrics.MetricsError):
+            metrics.collect_sync(self.task(), credentials={"tiktok": {"account_id": "open-id", "access_token": TOKEN}},
+                                  request=expired, oauth_request=lambda form: self.fail("Manual mode refreshed"))
+
+    def test_partial_refresh_configuration_fails_before_network(self):
+        credentials = self.credentials()
+        credentials["tiktok"].pop("client_secret")
+        with self.assertRaises(metrics.MetricsError) as error:
+            metrics.collect_sync(self.task(), credentials=credentials, request=lambda *args: self.fail("Counts read"),
+                                  oauth_request=lambda form: self.fail("OAuth request"))
+        self.assertEqual(error.exception.code, "invalid_credentials")
+
+    def test_valid_rotation_is_retained_even_when_analytics_scope_was_removed(self):
+        persisted = []
+
+        def persist(*args, **kwargs):
+            persisted.append(args)
+            return True
+
+        with self.assertRaises(metrics.MetricsError) as error:
+            metrics.collect_sync(self.task(), credentials=self.credentials(), request=lambda *args: self.fail("Counts read"),
+                                  oauth_request=lambda form: self.token_response(scope="user.info.basic"), persist_tokens=persist)
+        self.assertEqual(error.exception.code, "permission_missing")
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(persisted[0][2], "renewed-refresh")
+
+    def test_oauth_transport_keeps_secrets_in_form_body_and_redacts_provider_error(self):
+        secret = "private-client-secret"
+
+        class Opener:
+            def open(self, request, timeout):
+                assert request.full_url == "https://open.tiktokapis.com/v2/oauth/token/"
+                assert request.get_header("Authorization") is None
+                assert request.get_header("Content-type") == "application/x-www-form-urlencoded"
+                assert secret not in request.full_url
+                assert secret.encode() in request.data
+                raise urllib.error.HTTPError(request.full_url, 400, secret, {},
+                                             io.BytesIO(json.dumps({"error": "invalid_grant", "error_description": secret}).encode()))
+
+        with patch("urllib.request.build_opener", return_value=Opener()), self.assertRaises(metrics.MetricsError) as error:
+            metrics._request_oauth({"grant_type": "refresh_token", "client_secret": secret, "client_key": "key", "refresh_token": "refresh"})
+        self.assertEqual(error.exception.code, "credentials_expired")
+        self.assertNotIn(secret, str(error.exception))
+
+
+class PersistentTikTokRenewalTests(unittest.TestCase):
+    task = TikTokRenewalTests.task
+    credentials = TikTokRenewalTests.credentials
+    token_response = TikTokRenewalTests.token_response
+    counts = TikTokRenewalTests.counts
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.data_patch = patch.object(store, "DATA", Path(self.temp.name))
+        self.data_patch.start()
+        toolbox.save_credentials("tiktok", self.credentials()["tiktok"])
+
+    def tearDown(self):
+        self.data_patch.stop()
+        self.temp.cleanup()
+
+    def test_unattended_24_72_168_hour_reads_use_and_preserve_rotated_tokens(self):
+        state = {"now": datetime.now(timezone.utc)}
+        grants = []
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return state["now"]
+
+        def oauth(form):
+            grants.append(form["refresh_token"])
+            return self.token_response(access_token=f"access-{len(grants)}", refresh_token=f"refresh-{len(grants)}")
+
+        start = state["now"]
+        with patch.object(metrics, "datetime", Clock):
+            for hours in (24, 72, 168):
+                state["now"] = start + timedelta(hours=hours)
+                result = metrics.collect_sync({**self.task(), "horizon_hours": hours}, request=self.counts, oauth_request=oauth)
+                self.assertEqual(result["metrics"]["views"], 1000)
+                self.assertEqual(toolbox.credentials()["tiktok"]["refresh_token"], f"refresh-{len(grants)}")
+                self.assertGreater(datetime.fromisoformat(toolbox.credentials()["tiktok"]["expires_at"]), state["now"])
+        self.assertEqual(grants, ["private-refresh", "refresh-1", "refresh-2"])
+
+    def test_competing_collectors_share_one_refresh_grant(self):
+        started, release = threading.Event(), threading.Event()
+        grants = []
+
+        def oauth(form):
+            grants.append(form["refresh_token"])
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("Fixture timeout")
+            return self.token_response()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(metrics.collect_sync, self.task(), request=self.counts, oauth_request=oauth)
+            self.assertTrue(started.wait(5))
+            second = executor.submit(metrics.collect_sync, self.task(), request=self.counts, oauth_request=oauth)
+            release.set()
+            results = [first.result(timeout=10), second.result(timeout=10)]
+        self.assertEqual(grants, ["private-refresh"])
+        self.assertTrue(all(result["metrics"]["views"] == 1000 for result in results))
+        self.assertEqual(toolbox.credentials()["tiktok"]["refresh_token"], "renewed-refresh")
+
+    def test_owner_reconnect_during_refresh_is_not_overwritten(self):
+        def oauth(form):
+            toolbox.save_credentials("tiktok", {"account_id": "open-id", "access_token": "owner-reconnected"})
+            return self.token_response()
+
+        with self.assertRaises(metrics.MetricsError) as error:
+            metrics.collect_sync(self.task(), request=lambda *args: self.fail("Counts read"), oauth_request=oauth)
+        self.assertEqual(error.exception.code, "credentials_changed")
+        self.assertEqual(toolbox.credentials()["tiktok"]["access_token"], "owner-reconnected")
+        self.assertNotIn("refresh_token", toolbox.credentials()["tiktok"])
+
+    def test_owner_disconnect_during_refresh_stays_disconnected(self):
+        def oauth(form):
+            toolbox.forget("tiktok")
+            return self.token_response()
+
+        with self.assertRaises(metrics.MetricsError) as error:
+            metrics.collect_sync(self.task(), request=lambda *args: self.fail("Counts read"), oauth_request=oauth)
+        self.assertEqual(error.exception.code, "credentials_changed")
+        self.assertNotIn("tiktok", toolbox.credentials())
+
+    def test_live_transport_escapes_form_persists_rotation_and_restart_reuses_expiry(self):
+        secret, refresh = "client&=+?/ ü", "refresh&=+?/ ü"
+        toolbox.save_credentials("tiktok", {**self.credentials()["tiktok"], "client_secret": secret, "refresh_token": refresh})
+        requests = []
+        test = self
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = json.dumps(payload).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, limit):
+                return self.payload
+
+        class Opener:
+            def open(self, request, timeout):
+                requests.append(request)
+                if request.full_url.endswith("/oauth/token/"):
+                    form = metrics.urllib.parse.parse_qs(request.data.decode())
+                    test.assertEqual(form["client_secret"], [secret])
+                    test.assertEqual(form["refresh_token"], [refresh])
+                    test.assertNotIn(secret, request.full_url)
+                    test.assertNotIn(refresh, request.full_url)
+                    test.assertIsNone(request.get_header("Authorization"))
+                    return Response(test.token_response())
+                test.assertEqual(request.get_header("Authorization"), "Bearer renewed-access")
+                return Response(test.counts(request.get_method(), request.full_url, "renewed-access"))
+
+        with patch("urllib.request.build_opener", return_value=Opener()):
+            result = metrics.collect_sync(self.task())
+        self.assertEqual(result["metrics"]["views"], 1000)
+        self.assertEqual(sum("/oauth/token/" in request.full_url for request in requests), 1)
+        saved = toolbox.credentials()["tiktok"]
+        self.assertEqual(saved["access_token"], "renewed-access")
+        self.assertEqual(saved["refresh_token"], "renewed-refresh")
+        self.assertIn("expires_at", saved)
+        # A new interpreter has no in-memory token cache. It must use the file's
+        # fresh expiry/token and must never contact the OAuth endpoint.
+        code = """import sys
+sys.path.insert(0, sys.argv[1])
+import audience_metrics
+def no_refresh(form):
+    raise AssertionError('Persisted token was unnecessarily refreshed')
+def read(method, url, token, body=None):
+    assert token == 'renewed-access'
+    if '/user/info/' in url:
+        return {'data': {'user': {'open_id': 'open-id'}}}
+    return {'data': {'videos': [{'id': '7123456789012345678', 'view_count': 1000}]}}
+result = audience_metrics.collect_sync({'platform':'tiktok','account':'open-id','remote_id':'7123456789012345678'},
+                                      request=read, oauth_request=no_refresh)
+assert result['metrics']['views'] == 1000
+print('reused')
+"""
+        environment = {**os.environ, "HUB_DATA_DIR": str(store.DATA)}
+        run = subprocess.run([sys.executable, "-c", code, str(ROOT / "agents")], env=environment,
+                             capture_output=True, text=True, timeout=20)
+        self.assertEqual(run.returncode, 0, "Fresh worker could not reuse persisted token")
+        self.assertEqual(run.stdout.strip(), "reused")
+        self.assertEqual(toolbox.credentials()["tiktok"], saved)
+
+    def test_live_manual_token_connection_uses_no_oauth(self):
+        toolbox.save_credentials("tiktok", {"account_id": "open-id", "access_token": TOKEN})
+        result = metrics.collect_sync(self.task(), request=self.counts,
+                                      oauth_request=lambda form: self.fail("Manual connection must not refresh"))
+        self.assertEqual(result["metrics"]["views"], 1000)
+        self.assertNotIn("refresh_token", toolbox.credentials()["tiktok"])
 
 
 class WorkerTests(unittest.IsolatedAsyncioTestCase):

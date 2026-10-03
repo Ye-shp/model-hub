@@ -387,6 +387,32 @@ def fail_collection(task_id, lease_token, error, retry_after_seconds=300):
                     _text(error, "Collection error", 800), task_id))
 
 
+def resume_credentials(platform, account) -> int:
+    """A reconnect may retry matching credential failures while their original observation window remains open."""
+    if platform not in {"tiktok", "instagram"}:
+        return 0
+    account = _text(account, "Account ID", 200, True)
+    prefixes = {"credentials_missing", "credentials_expired", "invalid_credentials", "permission_missing",
+                "account_mismatch", "credentials_changed", "refresh_busy"}
+    moment, resumed = _clock(), 0
+    with ws.connection() as db, db:
+        db.execute("BEGIN IMMEDIATE")
+        rows = db.execute("SELECT c.* FROM audience_checkpoints c JOIN audience_variants v ON v.id=c.variant_id "
+                          "JOIN audience_experiments e ON e.id=v.experiment_id WHERE e.platform=? AND v.account=? "
+                          "AND c.status IN ('retry','failed')", (platform, account)).fetchall()
+        for row in rows:
+            if (row["last_error"] or "").partition(":")[0] not in prefixes:
+                continue
+            due = _time(row["due_at"])
+            if not due <= moment <= due + timedelta(hours=max(2, row["horizon_hours"] * .2)):
+                continue
+            db.execute("UPDATE audience_checkpoints SET status='queued',attempts=0,next_attempt_at=?,last_error=NULL,"
+                       "lease_token=NULL,lease_until=NULL WHERE id=? AND status IN ('retry','failed')",
+                       (_iso(moment), row["id"]))
+            resumed += 1
+    return resumed
+
+
 def _selected(variant, horizon):
     candidates = [s for s in variant["snapshots"] if abs(s["age_hours"] - horizon) <= max(2, horizon * .2)
                   and s["metrics"]["views"] is not None]

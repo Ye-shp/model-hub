@@ -97,6 +97,22 @@ Check the experiment's **Collection schedule** for retry errors after reconnecti
 analytics credentials. A token that supports posting may still lack insight
 permissions. Unsupported metrics are missing values, not zeroes.
 
+TikTok's access tokens expire after 24 hours. An access-token-only connection
+needs manual renewal; unattended 72-hour and seven-day checks additionally need
+a valid refresh token, client key and client secret. The collector can renew
+access when these are connected. Reconnect if refresh access is revoked or
+expired, and review the collection schedule for missed checkpoints.
+
+Connect in an owner Cowork chat:
+
+```text
+/connect tiktok <OAuth open_id> <access token> refresh_token=<refresh token> client_key=<client key> client_secret=<client secret>
+```
+
+The refresh fields must be supplied together. The app authorization needs
+`video.list` and `user.info.basic`. Reconnecting with only the account ID and
+access token removes the saved refresh configuration and requires manual renewal.
+
 This feature does not train or promote a model. The first reward focuses on reach;
 other engagement counts are diagnostics. Keep independent evaluation experiments
 out of preference exports before planning any separate training work.

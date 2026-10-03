@@ -80,6 +80,7 @@
           <div class="row"><label for="audience-project">Project</label><input id="audience-project" type="text" value="default" maxlength="100" autocomplete="off"><button id="audience-refresh" class="ghost">Refresh</button></div>
         </div>
         <p class="muted small">Compare drafts against real TikTok and Instagram results. Record publication after a post is live; this page does not publish posts or train a model. Keep the same platform, account, format and posting context within an experiment. Automatic checks need a connected analytics account and its account ID. You can also enter counts manually.</p>
+        <p class="muted small">For unattended TikTok checks, connect the refresh token and app credentials as well as the access token. An access-token-only connection needs manual renewal after expiry.</p>
         <details id="audience-create"><summary>New experiment</summary>
           <form id="audience-experiment-form" class="audience-form">
             <div class="form-grid">
@@ -113,9 +114,9 @@
               <label>Minimum views per draft<input name="min_views" type="number" value="500" min="500" max="1000000000" step="1" required></label>
               <label>Minimum score margin<input name="min_margin" type="number" value="0.15" min="0.01" max="10" step="0.01" required></label>
             </div>
-            <button type="submit">Download preference examples</button>
+            <button type="submit">Prepare learning export</button>
             <p class="form-message" role="status" aria-live="polite"></p>
-            <p class="muted small">Downloads JSONL with the brief, preferred draft and other draft. A separate comparison audit includes post links, observations and declared origins. Only eligible learning experiments enter the export; skipped comparisons and their reasons appear below. Exporting does not start training.</p>
+            <p class="muted small">Prepares download links for JSONL with the brief, preferred draft and other draft, and a separate comparison audit with post links, observations and declared origins. Only eligible learning experiments enter the export; skipped comparisons and their reasons appear below. Exporting does not start training.</p>
           </form>
           <div id="audience-export-report" class="list"></div>
         </details>

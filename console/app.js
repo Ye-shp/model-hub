@@ -198,7 +198,7 @@ async function loadMemory() {
 }
 
 // ---------- AUDIENCE ----------
-const audience = {selected: null, project: 'default', request: 0, exportURL: null};
+const audience = {selected: null, project: 'default', request: 0, exportURL: null, exportJSONLURL: null};
 const audienceMetricLabels = {
   views: 'Views', likes: 'Likes', comments: 'Comments', shares: 'Shares', saves: 'Saves',
   reach: 'People reached', average_watch_seconds: 'Average watch (seconds)',
@@ -208,7 +208,9 @@ function audienceProject() { return $('audience-project').value.trim() || 'defau
 function audienceQuery(project = audienceProject()) { return 'project=' + encodeURIComponent(project); }
 function clearAudienceExport() {
   if (audience.exportURL) URL.revokeObjectURL(audience.exportURL);
+  if (audience.exportJSONLURL) URL.revokeObjectURL(audience.exportJSONLURL);
   audience.exportURL = null;
+  audience.exportJSONLURL = null;
   $('audience-export-report').replaceChildren();
 }
 function audienceText(value) {
@@ -469,17 +471,19 @@ $('audience-export-form').addEventListener('submit', ev => audienceSubmit(ev, as
   const report = $('audience-export-report');
   audience.exportURL = URL.createObjectURL(new Blob([JSON.stringify(exported, null, 2) + '\n'], {type: 'application/json'}));
   const audit = el('a', 'Download comparison audit'); audit.href = audience.exportURL; audit.download = 'audience-comparison-audit.json';
-  report.append(audit);
+  const downloads = el('div', undefined, 'row');
+  report.append(downloads);
   if (exported.dataset_digest) report.append(el('div', `Exported ${audienceTime(exported.exported_at)} · dataset digest ${exported.dataset_digest}`, 'muted small text'));
   const records = exported.records || [];
   for (const comparison of exported.comparisons || []) report.append(el('div', `Experiment ${comparison.experiment_id}: preferred draft ${comparison.chosen_id}, other draft ${comparison.rejected_id} · margin ${Number(comparison.margin).toFixed(3)} · sample support ${typeof comparison.confidence === 'number' ? (comparison.confidence * 100).toFixed(0) + '%' : audienceText(comparison.confidence)}`, 'item small'));
   for (const skipped of exported.skipped || []) report.append(el('div', `Experiment ${skipped.experiment_id}: ${skipped.reason}`, 'item muted small'));
   if (records.length) {
-    const url = URL.createObjectURL(new Blob([records.map(record => JSON.stringify({prompt: record.prompt, chosen: record.chosen, rejected: record.rejected})).join('\n') + '\n'], {type: 'application/x-ndjson'}));
-    const link = el('a'); link.href = url; link.download = 'audience-preferences.jsonl'; document.body.append(link); link.click(); link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    audience.exportJSONLURL = URL.createObjectURL(new Blob([records.map(record => JSON.stringify({prompt: record.prompt, chosen: record.chosen, rejected: record.rejected})).join('\n') + '\n'], {type: 'application/x-ndjson'}));
+    const link = el('a', 'Download preference examples'); link.href = audience.exportJSONLURL; link.download = 'audience-preferences.jsonl';
+    downloads.append(link);
   }
-  $('audience-export-form').querySelector('.form-message').textContent = records.length ? `Downloaded ${records.length} preference example${records.length === 1 ? '' : 's'}.` : 'No eligible comparisons yet. Review the reasons below.';
+  downloads.append(audit);
+  $('audience-export-form').querySelector('.form-message').textContent = records.length ? `Prepared ${records.length} preference example${records.length === 1 ? '' : 's'}. Use the download links below.` : 'No eligible comparisons yet. Review the reasons below.';
 }));
 
 // ---------- PHONE ----------
@@ -517,7 +521,7 @@ async function loadPeople() {
   else kv('connections', Object.entries(c).map(([k, v]) => [k === 'claude' ? 'Claude Code' : 'Codex', `${v.signed_in ? 'connected' : 'not connected'}${v.installed ? '' : ' (not installed)'} · ${v.used_today}/${v.daily_limit} today`]));
   try {
     const [social, posts] = await Promise.all([api('connections/social'), api('posts')]);
-    const names = {x: 'X', instagram: 'Instagram posting', bluesky: 'Bluesky', github: 'GitHub', scrapecreators: 'ScrapeCreators'};
+    const names = {x: 'X', instagram: 'Instagram posting', tiktok: 'TikTok analytics', bluesky: 'Bluesky', github: 'GitHub', scrapecreators: 'ScrapeCreators'};
     kv('social', [['Research tools', social.tools.state + (social.tools.detail ? ' — ' + social.tools.detail.slice(0, 160) : '')],
       ...Object.entries(social.accounts).map(([k, v]) => [names[k] || k, v.connected ? 'connected' + (v.username ? ' as @' + v.username : '') : 'not connected'])]);
     if (!posts.posts.length) empty('posts', 'No drafts yet.');

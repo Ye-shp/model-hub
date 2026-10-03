@@ -1,6 +1,7 @@
 """Offline API/tool boundaries for audience feedback; no platform requests, posting or training."""
 import asyncio
 from datetime import datetime, timedelta, timezone
+import importlib.util
 import json
 from pathlib import Path
 import sys
@@ -21,6 +22,7 @@ import research_tools
 import store
 import toolbox
 import workspace as ws
+import httpx2 as httpx
 
 AUTH = {"Authorization": "Bearer " + "k" * 40}
 
@@ -229,6 +231,153 @@ class AudienceIntegrationTests(unittest.TestCase):
         self.assertTrue(connected["tiktok"]["connected"])
         self.assertNotIn("private-token", json.dumps(connected))
         self.assertEqual(toolbox.credentials()["tiktok"]["account_id"], "oauth-open-id")
+
+    def test_optional_oauth_credentials_parse_persist_and_remain_private(self):
+        words = ["open-id", "@access-token", "refresh_token=@refresh-token", "client_key=application-key", "client_secret=@private-secret"]
+        values = toolbox.parse_connect("tiktok", words)
+        expected = {"account_id": "open-id", "access_token": "@access-token", "refresh_token": "@refresh-token",
+                    "client_key": "application-key", "client_secret": "@private-secret"}
+        self.assertEqual(values, expected)
+        state = toolbox.save_credentials("tiktok", values)
+        self.assertEqual({k: toolbox.credentials()["tiktok"][k] for k in expected}, expected)
+        for secret in ("@access-token", "@refresh-token", "@private-secret", "application-key"):
+            self.assertNotIn(secret, json.dumps(state))
+        with self.assertRaisesRegex(ValueError, "together"):
+            toolbox.save_credentials("tiktok", {"account_id": "open-id", "access_token": "new", "refresh_token": "partial"})
+        self.assertEqual(toolbox.credentials()["tiktok"]["access_token"], "@access-token")
+        # A manual reconnect deliberately removes automatic-renewal configuration.
+        toolbox.save_credentials("tiktok", {"account_id": "open-id", "access_token": "manual-token"})
+        self.assertNotIn("refresh_token", toolbox.credentials()["tiktok"])
+
+    def test_rotation_is_atomic_preserves_other_accounts_and_respects_reconnects(self):
+        values = {"account_id": "open-id", "access_token": "old-access", "refresh_token": "old-refresh",
+                  "client_key": "app-key", "client_secret": "app-secret"}
+        toolbox.save_credentials("tiktok", values)
+        toolbox.save_credentials("github", {"token": "github-private"})
+        expected = toolbox.credentials()["tiktok"]
+        self.assertTrue(toolbox.rotate_tiktok_tokens(expected, "rotated-access", "rotated-refresh", "2026-10-04T12:00:00Z"))
+        current = toolbox.credentials()
+        self.assertEqual(current["tiktok"]["saved_at"], expected["saved_at"])
+        self.assertEqual(current["tiktok"]["access_token"], "rotated-access")
+        self.assertEqual(current["tiktok"]["expires_at"], "2026-10-04T12:00:00+00:00")
+        self.assertEqual(current["github"]["token"], "github-private")
+        self.assertFalse(toolbox.rotate_tiktok_tokens(expected, "stale-access", "stale-refresh"))
+        before_reconnect = current["tiktok"]
+        toolbox.save_credentials("tiktok", {"account_id": "new-account", "access_token": "reconnected-token"})
+        self.assertFalse(toolbox.rotate_tiktok_tokens(before_reconnect, "stale-access", "stale-refresh"))
+        self.assertEqual(toolbox.credentials()["tiktok"]["access_token"], "reconnected-token")
+        toolbox.forget("tiktok")
+        self.assertFalse(toolbox.rotate_tiktok_tokens(before_reconnect, "stale-access", "stale-refresh"))
+        self.assertNotIn("tiktok", toolbox.credentials())
+        self.assertEqual(toolbox.credentials()["github"]["token"], "github-private")
+
+    def test_credential_write_failure_keeps_previous_file_and_removes_temporary(self):
+        toolbox.save_credentials("tiktok", {"account_id": "open-id", "access_token": "old"})
+        previous = toolbox.credentials()
+        with patch.object(toolbox.os, "replace", side_effect=OSError("Storage failure")):
+            with self.assertRaises(OSError):
+                toolbox.save_credentials("github", {"token": "private-new-token"})
+        self.assertEqual(toolbox.credentials(), previous)
+        self.assertEqual(list(store.DATA.glob(".social-*.tmp")), [])
+
+    def test_reconnect_resumes_only_matching_credential_failures_inside_window(self):
+        now = datetime.now(timezone.utc)
+        checkpoints = {}
+        cases = [("retry", "tiktok", "open-id", 25, "credentials_expired"),
+                 ("failed", "tiktok", "open-id", 25, "invalid_credentials"),
+                 ("retry", "tiktok", "different-account", 25, "credentials_expired"),
+                 ("retry", "instagram", "open-id", 25, "credentials_expired"),
+                 ("retry", "tiktok", "open-id", 40, "credentials_expired"),
+                 ("retry", "tiktok", "open-id", 25, "network_error"),
+                 ("done", "tiktok", "open-id", 25, "credentials_expired"),
+                 ("leased", "tiktok", "open-id", 25, "credentials_expired"),
+                 ("missed", "tiktok", "open-id", 25, "credentials_expired")]
+        for index, (status, platform, account, age, error) in enumerate(cases):
+            experiment = audience.create_experiment("default", f"Case {index}", "Controlled brief", platform=platform, account=account)
+            variant = audience.register_variant("default", experiment["id"], "A", "Script")
+            remote_id = str(90000 + index)
+            url = f"https://www.tiktok.com/@creator/video/{remote_id}" if platform == "tiktok" else f"https://www.instagram.com/reel/{remote_id}/"
+            audience.confirm_publication("default", variant["id"], remote_id, url, (now - timedelta(hours=age)).isoformat(), account)
+            checkpoint = ws.query("SELECT id FROM audience_checkpoints WHERE variant_id=? AND horizon_hours=24", (variant["id"],))[0]["id"]
+            with ws.connection() as db, db:
+                db.execute("UPDATE audience_checkpoints SET status=?,last_error=?,attempts=8,next_attempt_at=? WHERE id=?",
+                           (status, error + ": safe message", (now + timedelta(hours=6)).isoformat(), checkpoint))
+            checkpoints[index] = checkpoint
+        with patch.object(audience, "_clock", return_value=now):
+            self.assertEqual(audience.resume_credentials("tiktok", "open-id"), 2)
+        for index, checkpoint in checkpoints.items():
+            row = ws.query("SELECT * FROM audience_checkpoints WHERE id=?", (checkpoint,))[0]
+            self.assertEqual(row["status"], "queued" if index < 2 else cases[index][0])
+            self.assertEqual(row["attempts"], 0 if index < 2 else 8)
+
+    def test_queue_failure_does_not_fail_a_successful_connection_or_echo_secrets(self):
+        with patch.object(audience, "resume_credentials", side_effect=RuntimeError("fake-private-token")):
+            response = self.client.post("/api/connections/social", headers=AUTH,
+                                        json={"service": "tiktok", "words": ["open-id", "fake-private-token"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["accounts"]["tiktok"]["connected"])
+        self.assertNotIn("fake-private-token", response.text)
+        self.assertIn("audience_retry_warning", response.json())
+
+    def pipe(self):
+        spec = importlib.util.spec_from_file_location("audience_pipe_test", ROOT / "integrations" / "openwebui_cowork.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        pipe = module.Pipe()
+        pipe.valves.OWNER_KEY = "k" * 40
+        pipe.valves.ALLOWED_EMAILS = "friend@example.com"
+        pipe._client = lambda: httpx.AsyncClient(transport=httpx.ASGITransport(app=self.client.app), base_url="http://testserver",
+                                                headers=AUTH)
+        return pipe
+
+    def pipe_reply(self, pipe, text, user=None):
+        async def collect():
+            chunks = []
+            async for chunk in pipe.pipe({"messages": [{"role": "user", "content": text}]},
+                                         __user__=user or {"role": "admin"}, __metadata__={"chat_id": "offline-test"}):
+                chunks.append(chunk)
+            return "".join(chunks)
+        return asyncio.run(collect())
+
+    def test_pipe_routes_tiktok_connection_to_owner_api_without_jobs_and_hides_credentials(self):
+        pipe = self.pipe()
+        text = "/connect tiktok open-id private-access refresh_token=private-refresh client_key=app-key client_secret=private-secret"
+        with patch.object(pipe, "_call", wraps=pipe._call) as call:
+            reply = self.pipe_reply(pipe, text)
+        self.assertIn("tiktok", reply)
+        self.assertIn("connected", reply)
+        self.assertEqual([c.args[2] for c in call.await_args_list], ["/api/connections/social"])
+        self.assertEqual(toolbox.credentials()["tiktok"]["refresh_token"], "private-refresh")
+        self.assertEqual(ws.query("SELECT id FROM jobs"), [])
+        for secret in ("private-access", "private-refresh", "private-secret", "app-key"):
+            self.assertNotIn(secret, reply)
+        with patch.object(pipe, "_call", wraps=pipe._call) as call:
+            reply = self.pipe_reply(pipe, text, {"role": "user", "email": "friend@example.com"})
+        self.assertIn("Only the owner", reply)
+        call.assert_not_awaited()
+
+    def test_pipe_connections_lists_tiktok_and_refresh_setup_without_model_work(self):
+        pipe = self.pipe()
+        toolbox.save_credentials("tiktok", {"account_id": "open-id", "access_token": "private-access"})
+        with patch.object(pipe, "_call", wraps=pipe._call) as call:
+            reply = self.pipe_reply(pipe, "/connections")
+        self.assertIn("TikTok (analytics)", reply)
+        self.assertIn("unattended checkpoints", reply)
+        self.assertIn("refresh_token=", reply)
+        self.assertNotIn("private-access", reply)
+        self.assertNotIn("/api/jobs", [c.args[2] for c in call.await_args_list])
+        self.assertEqual(ws.query("SELECT id FROM jobs"), [])
+
+    def test_pipe_redacts_credentials_in_connection_validation_errors(self):
+        pipe = self.pipe()
+        text = "/connect tiktok open-id private-access refresh_token=private-refresh client_key=app-key client_secret=private-secret"
+        with patch.object(pipe, "_call", new_callable=AsyncMock,
+                          side_effect=ValueError("Controller rejected private-access and private-secret and private-refresh")):
+            reply = self.pipe_reply(pipe, text)
+        self.assertIn("Not saved", reply)
+        self.assertIn("[redacted]", reply)
+        for secret in ("private-access", "private-refresh", "private-secret"):
+            self.assertNotIn(secret, reply)
 
     def test_metrics_worker_starts_and_stops_with_controller_lifespan(self):
         import audience_worker

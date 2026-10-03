@@ -446,7 +446,17 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         service = body.service.lower()
         if body.words == ["off"]:
             return {"accounts": toolbox.forget(service)}
-        return {"accounts": toolbox.save_credentials(service, toolbox.parse_connect(service, body.words))}
+        values = toolbox.parse_connect(service, body.words)
+        result = {"accounts": toolbox.save_credentials(service, values)}
+        if service in {"tiktok", "instagram"}:
+            try:
+                result["audience_resumed"] = audience.resume_credentials(service, values.get("account_id") or values.get("user_id"))
+            except Exception:
+                # Sign-in is already durably saved; never echo a queue or provider exception containing credentials.
+                import logging
+                logging.getLogger("audience_worker").warning("Credentials saved; analytics retries could not be resumed.")
+                result["audience_retry_warning"] = "Credentials saved; analytics retries could not be resumed yet."
+        return result
 
     @app.get("/api/connections/telegram")
     def telegram_status():
