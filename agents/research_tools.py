@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import re
@@ -25,6 +26,31 @@ from agents import function_tool
 import store
 import toolbox
 import workspace as ws
+import audience
+
+# Helper agents may inspect results, but only the lead receives lifecycle mutations or dataset exports.
+OWNER_ONLY_TOOLS = {"draft_post", "publish_post", "list_posts", "create_content_experiment", "track_content_variant",
+                    "confirm_post_published", "record_post_metrics", "export_content_preferences"}
+
+
+def performance_json(result: dict) -> str:
+    """Keep useful complete measurement records even when scripts or long snapshot histories are large."""
+    def compact(value):
+        if isinstance(value, dict):
+            return {k: compact(v) for k, v in value.items() if k not in {"response", "snapshots"}}
+        if isinstance(value, list):
+            return [compact(v) for v in value]
+        if isinstance(value, str) and len(value) > 1000:
+            return value[:1000] + " [text shortened]"
+        return value
+    view = compact(result)
+    omitted = {}
+    for key, value in list(view.items()):
+        if isinstance(value, list):
+            bounded = json.loads(ws.bounded_json(value, limit=10000 if key in {"results", "variants"} else 3000))
+            view[key] = bounded["items"]
+            omitted[key] = bounded["omitted"]
+    return json.dumps({**view, "omitted": omitted}, ensure_ascii=False)
 
 POST_PLATFORMS = {"x", "instagram", "tiktok"}
 MAX_MEDIA = 200 * 1024**2
@@ -145,6 +171,7 @@ def facts(report: dict) -> str:
 def build_tools(job: dict, space, client, gate, log, budget, request_text: str, helper_model: str) -> tuple[list, str]:
     """Function tools plus a line for the instructions saying which sign-ins are connected."""
     init()
+    audience.init()
     owner = space.is_owner
     links = toolbox.connected()
     project, job_id = job["project"], job["id"]
@@ -361,7 +388,109 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
 
     tools += [google_trends, instagram_profile, tiktok_profile]
 
+    @function_tool
+    def content_performance(experiment_id: int | None = None) -> str:
+        """Read this project's audience experiments and measured performance. An omitted experiment_id returns the
+        project summary; an ID returns its variants and collection checkpoints. Missing metrics are unknown, not zero.
+        These are observational outcomes, not proof that one creative choice caused a result."""
+        budget.active()
+        result = audience.experiment_detail(project, experiment_id) if experiment_id is not None else audience.performance_summary(project)
+        return performance_json(result)
+
+    tools.append(content_performance)
+
     if owner:
+        @function_tool
+        def create_content_experiment(name: str, brief: str, hypothesis: str = "", platform: str = "tiktok",
+                                      account: str = "", kind: str = "reel", context: str = "", split: str = "train") -> str:
+            """Start a tracked content experiment in this project, without posting anything. Keep the original brief
+            identical across variants; put account, audience, timing constraints and controlled differences in context.
+            account is the platform account ID (TikTok OAuth open_id, Instagram user_id), not an invented username.
+            platform: tiktok | instagram. split: train | eval. Evaluation experiments are excluded from training exports."""
+            budget.active()
+            result = audience.create_experiment(project, name, brief, hypothesis, platform, account, kind, context, split)
+            log("tool", f"Audience experiment created: {name[:120]}")
+            return json.dumps(result, ensure_ascii=False)
+
+        @function_tool
+        def track_content_variant(experiment_id: int, label: str, response: str, post_id: int | None = None,
+                                  model: str = "", strategy: str = "", media_paths: list[str] | None = None) -> str:
+            """Save the exact generated response/script for an experiment, optionally linked to an existing draft number.
+            model is an explicit model/version note; leave it empty if unknown. strategy describes the creative change.
+            media_paths are final workspace files to hash for lineage (not to publish). If post_id is supplied its draft
+            media are hashed automatically. Publishing still requires the user's separate approval of that draft."""
+            budget.active()
+            hashes = []
+            if post_id is not None:
+                rows = ws.query("SELECT media FROM social_posts WHERE id=? AND project=?", (post_id, project))
+                if not rows:
+                    raise ValueError("Draft not found in this project")
+                paths = [Path(p) for p in json.loads(rows[0]["media"] or "[]")]
+            else:
+                paths = [space.resolve(p) for p in (media_paths or [])]
+            if len(paths) > 10:
+                raise ValueError("Use at most 10 media files")
+            for path in paths:
+                if not path.is_file() or path.stat().st_size > MAX_MEDIA:
+                    raise ValueError("Final media is missing or larger than 200 MB")
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                hashes.append(digest.hexdigest())
+            result = audience.register_variant(project, experiment_id, label, response, post_id, model, strategy,
+                                               hashes, job_id)
+            log("tool", f"Audience variant recorded: {label[:120]}")
+            return json.dumps(result, ensure_ascii=False)
+
+        @function_tool
+        def confirm_post_published(variant_id: int, remote_id: str, url: str, published_at: str, account: str,
+                                   exposure: str = "organic") -> str:
+            """Record evidence that a tracked variant was actually published; this tool does not publish it. remote_id
+            is the real platform post ID, url its public post link, published_at the known ISO timestamp with timezone,
+            account the platform account ID. Never infer publication from TikTok's on_phone status or invent a time/ID.
+            exposure: organic | paid | mixed | unknown. Paid/mixed/unknown posts cannot become organic preference pairs."""
+            budget.active()
+            result = audience.confirm_publication(project, variant_id, remote_id, url, published_at, account, exposure)
+            log("tool", f"Audience publication confirmed: {remote_id[:100]}")
+            return json.dumps(result, ensure_ascii=False)
+
+        @function_tool
+        def record_post_metrics(variant_id: int, metrics_json: str, observed_at: str = "") -> str:
+            """Import measured cumulative metrics for a confirmed publication. metrics_json is a JSON object using
+            supported fields such as views, likes, comments, shares, saves, followers, reach. Omit unavailable fields;
+            never estimate or invent them. observed_at is the actual ISO timestamp with timezone (empty means now).
+            Imported measurements are marked manual; the durable collector handles connected platform accounts."""
+            budget.active()
+            try:
+                metrics = json.loads(metrics_json)
+            except (TypeError, ValueError):
+                raise ValueError("metrics_json must be a JSON object of measured numeric values") from None
+            if not isinstance(metrics, dict):
+                raise ValueError("metrics_json must be a JSON object")
+            result = audience.record_snapshot(project, variant_id, metrics, observed_at or None, source="manual")
+            log("tool", "Manual audience measurement recorded")
+            return json.dumps(result, ensure_ascii=False)
+
+        @function_tool
+        def export_content_preferences(filename: str = "audience-preferences.jsonl", horizon_hours: int = 72,
+                                       min_views: int = 500, min_margin: float = 0.15) -> str:
+            """Export eligible same-brief audience preference pairs for offline training. This does not start training
+            or change Qwen. Unknown outcomes, holdouts and unmatched exposures are excluded. Writes JSONL plus an audit
+            file describing comparisons/exclusions in the workspace; call share_file for files the user needs."""
+            budget.active()
+            if not filename.endswith(".jsonl"):
+                raise ValueError("Use a .jsonl filename")
+            result = audience.export_preferences(project, horizon_hours, min_views, min_margin)
+            space.write_text(filename, "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in result["records"]))
+            space.write_text(filename + ".audit.json", json.dumps(result, indent=2, ensure_ascii=False))
+            log("tool", f"Exported {len(result['records'])} audience preference pairs")
+            return json.dumps({"records": len(result["records"]), "path": filename, "audit": filename + ".audit.json",
+                               "training_started": False}, ensure_ascii=False)
+
+        tools += [create_content_experiment, track_content_variant, confirm_post_published, record_post_metrics,
+                  export_content_preferences]
+
         @function_tool
         async def x_search(query: str, mode: str = "top", limit: int = 30) -> str:
             """Search X posts (supports X search operators, e.g. 'gym min_faves:500 lang:en'). mode: top | latest | media.
@@ -420,7 +549,7 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
                 shutil.copyfile(target, copy)
                 kept.append(str(copy))
             with ws.connection() as db, db:
-                db.execute("UPDATE social_posts SET media=? WHERE id=?", (json.dumps(kept), post_id))
+                db.execute("UPDATE social_posts SET media=? WHERE id=? AND project=?", (json.dumps(kept), post_id, project))
             log("tool", f"Draft post #{post_id} for {platform} ready for approval")
             return (f"Draft #{post_id} saved ({platform}{', ' + kind if kind else ''}, {len(kept)} file(s)). Show the user the caption and "
                     f"files and tell them to reply \"approve post {post_id}\" to publish it. Do not publish it in this task.")
@@ -429,7 +558,7 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
         async def publish_post(post_id: int) -> str:
             """Publish a draft the user has approved in their current message ("approve post N")."""
             budget.active()
-            rows = ws.query("SELECT * FROM social_posts WHERE id=?", (post_id,))
+            rows = ws.query("SELECT * FROM social_posts WHERE id=? AND project=?", (post_id, project))
             if not rows:
                 raise ValueError(f"No draft #{post_id}")
             post = rows[0]
@@ -457,20 +586,20 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
                     f"the caption with phone_type, then tap Post. Caption: {post['caption'][:500]}")}
             status = "published" if result.get("ok") and post["platform"] != "tiktok" else "on_phone" if result.get("ok") else "failed"
             with ws.connection() as db, db:
-                db.execute("UPDATE social_posts SET status=?,result=?,updated_at=? WHERE id=?",
-                           (status, json.dumps(result)[:2000], store.now(), post_id))
+                db.execute("UPDATE social_posts SET status=?,result=?,updated_at=? WHERE id=? AND project=?",
+                           (status, json.dumps(result)[:2000], store.now(), post_id, project))
             return json.dumps(result, ensure_ascii=False)
 
         @function_tool
         def list_posts(limit: int = 10) -> str:
             """Recent drafts and published posts with their status."""
             rows = ws.query("SELECT id,platform,kind,status,substr(caption,1,140) AS caption,result,created_at FROM social_posts "
-                            "ORDER BY id DESC LIMIT ?", (max(1, min(limit, 30)),))
+                            "WHERE project=? ORDER BY id DESC LIMIT ?", (project, max(1, min(limit, 30)),))
             return json.dumps(rows, ensure_ascii=False)
 
         tools += [draft_post, publish_post, list_posts]
 
     ready = "installed" if toolbox.ready() else "installing in the background (the first call may wait a few minutes)"
     status = ", ".join(f"{name} {'connected' if info['connected'] else 'not connected'}" for name, info in links.items()
-                       if name in {"x", "instagram", "bluesky", "github"})
+                       if name in {"x", "instagram", "tiktok", "bluesky", "github"})
     return tools, f"Research tools: {ready}. Accounts: {status}."

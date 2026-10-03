@@ -81,3 +81,38 @@ normal Cowork request. `/new` starts a fresh conversation, `/status` shows what'
 disconnects. The bot polls Telegram from the box, so no tunnel route is needed. Comments: TikTok, Reddit and X (with
 `/connect x`) work without other sign-ins; Instagram only shows comments to signed-in accounts, so Reels are studied
 from the video and caption alone.
+
+## 7. Audience experiments
+
+The console's **Audience** page records drafts, publication and delayed analytics.
+See [AUDIENCE-LEARNING.md](AUDIENCE-LEARNING.md) for creating a comparable
+experiment, entering counts, reading scores and exporting preference examples.
+
+The audience collector runs separately from chat tasks. Its checkpoint queue,
+retry state, observations and experiments live in the controller database under
+`DATA_DIR`, so normal backups and migration must retain that database. A chat
+timeout leaves the collector running. After a container restart, pending work is
+recovered from the stored queue; collection pauses while the container is stopped.
+Check the experiment's **Collection schedule** for retry errors after reconnecting
+analytics credentials. A token that supports posting may still lack insight
+permissions. Unsupported metrics are missing values, not zeroes.
+
+TikTok's access tokens expire after 24 hours. An access-token-only connection
+needs manual renewal; unattended 72-hour and seven-day checks additionally need
+a valid refresh token, client key and client secret. The collector can renew
+access when these are connected. Reconnect if refresh access is revoked or
+expired, and review the collection schedule for missed checkpoints.
+
+Connect in an owner Cowork chat:
+
+```text
+/connect tiktok <OAuth open_id> <access token> refresh_token=<refresh token> client_key=<client key> client_secret=<client secret>
+```
+
+The refresh fields must be supplied together. The app authorization needs
+`video.list` and `user.info.basic`. Reconnecting with only the account ID and
+access token removes the saved refresh configuration and requires manual renewal.
+
+This feature does not train or promote a model. The first reward focuses on reach;
+other engagement counts are diagnostics. Keep independent evaluation experiments
+out of preference exports before planning any separate training work.

@@ -8,11 +8,14 @@ DATA/social.json.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+from datetime import datetime, timezone
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -150,14 +153,21 @@ def wait_ready(seconds: float = 900) -> None:
 SERVICES = {
     "x": ("username", "auth_token", "ct0"),
     "instagram": ("user_id", "access_token"),
+    "tiktok": ("account_id", "access_token"),
     "bluesky": ("handle", "app_password"),
     "github": ("token",),
     "scrapecreators": ("key",),
 }
+OPTIONAL_SERVICES = {"tiktok": ("refresh_token", "client_key", "client_secret")}
+_credentials_mutex = threading.Lock()
 HELP = {
     "x": "`/connect x <your X username> auth_token=<…> ct0=<…>` (the two cookies from x.com: browser dev tools → Application → Cookies)",
     "instagram": "`/connect instagram <Instagram user id> <long-lived access token>` (a free Meta developer app with the Instagram API, "
                  "professional account)",
+    "tiktok": "`/connect tiktok <OAuth open_id> <access token>` (an authorized TikTok developer app with video.list and "
+              "user.info.basic scopes; the account ID is open_id, not your username). For unattended checkpoints add "
+              "`refresh_token=<…> client_key=<…> client_secret=<…>` together; otherwise renew the access token manually. "
+              "This enables metrics, not publishing.",
     "bluesky": "`/connect bluesky <handle> <app password>` (Bluesky → Settings → App passwords)",
     "github": "`/connect github <token>` (a free fine-grained token with no permissions is enough)",
     "scrapecreators": "`/connect scrapecreators <key>` (optional: their free key has 100 calls in total, for TikTok/Instagram search)",
@@ -175,33 +185,111 @@ def credentials() -> dict:
         return {}
 
 
+@contextmanager
+def credential_lock():
+    """Serialize short credential mutations across console threads and optional worker processes."""
+    with _credentials_mutex:
+        store.DATA.mkdir(parents=True, exist_ok=True)
+        fd = os.open(store.DATA / "social.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "r+b") as handle:
+            if os.name == "nt":
+                import msvcrt
+                if os.fstat(handle.fileno()).st_size == 0:
+                    handle.write(b"0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _write_credentials(data: dict) -> None:
+    """Caller holds credential_lock; readers see an entire old or new private file."""
+    path = _path()
+    fd, temporary = tempfile.mkstemp(prefix=".social-", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _credential_value(value) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > 600 or any(c in value for c in "\n\r\x00"):
+        raise ValueError("A credential must be nonempty text of at most 600 characters without line breaks")
+    return value.strip()
+
+
 def save_credentials(service: str, values: dict) -> dict:
     if service not in SERVICES:
         raise ValueError("Unknown service: " + ", ".join(SERVICES))
     missing = [k for k in SERVICES[service] if not str(values.get(k, "")).strip()]
     if missing:
         raise ValueError(f"Missing {', '.join(missing)}. Use: {HELP[service]}")
-    clean = {k: str(values[k]).strip().lstrip("@") for k in SERVICES[service]}
-    if any(len(v) > 600 or any(c in v for c in "\n\r\x00") for v in clean.values()):
-        raise ValueError("A value is too long or contains line breaks")
-    data = credentials()
-    data[service] = {**clean, "saved_at": store.now()}
-    store.DATA.mkdir(parents=True, exist_ok=True)
-    path = _path()
-    fd = os.open(path.with_suffix(".tmp"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        json.dump(data, handle)
-    os.replace(path.with_suffix(".tmp"), path)
+    optional = OPTIONAL_SERVICES.get(service, ())
+    if any(k in values for k in optional) and not all(k in values for k in optional):
+        raise ValueError("For automatic renewal supply refresh_token, client_key and client_secret together")
+    fields = SERVICES[service] + optional
+    clean = {k: _credential_value(values[k]) for k in fields if k in values}
+    for k in ("username", "handle"):
+        if k in clean:
+            clean[k] = clean[k].lstrip("@")
+    with credential_lock():
+        data = credentials()
+        data[service] = {**clean, "saved_at": store.now()}
+        _write_credentials(data)
     return connected()
 
 
 def forget(service: str) -> dict:
-    data = credentials()
-    data.pop(service, None)
-    fd = os.open(_path(), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        json.dump(data, handle)
+    with credential_lock():
+        data = credentials()
+        data.pop(service, None)
+        _write_credentials(data)
     return connected()
+
+
+def rotate_tiktok_tokens(expected: dict, access_token: str, refresh_token: str, expires_at: str | None = None) -> bool:
+    """Persist a provider rotation only if the owner has not changed/disconnected that connection."""
+    access_token, refresh_token = _credential_value(access_token), _credential_value(refresh_token)
+    if not isinstance(expected, dict):
+        raise ValueError("Expected a TikTok credential snapshot")
+    if expires_at is not None:
+        try:
+            expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            if expires.tzinfo is None:
+                raise ValueError()
+            expires_at = expires.astimezone(timezone.utc).isoformat(timespec="seconds")
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("Token expiry must be a timestamp with a timezone") from None
+    with credential_lock():
+        data = credentials()
+        current = data.get("tiktok")
+        if not isinstance(current, dict) or current != expected:
+            return False
+        data["tiktok"] = {**current, "access_token": access_token, "refresh_token": refresh_token,
+                          "refreshed_at": store.now()}
+        if expires_at is not None:
+            data["tiktok"]["expires_at"] = expires_at
+        else:
+            data["tiktok"].pop("expires_at", None)
+        _write_credentials(data)
+    return True
 
 
 def connected() -> dict:
@@ -213,9 +301,10 @@ def connected() -> dict:
 
 def parse_connect(service: str, words: list[str]) -> dict:
     """Values from '/connect <service> ...' words: key=value pairs, or positional in SERVICES order."""
-    fields, values, positional = SERVICES.get(service), {}, []
-    if not fields:
+    required, values, positional = SERVICES.get(service), {}, []
+    if not required:
         raise ValueError("Unknown service")
+    fields = required + OPTIONAL_SERVICES.get(service, ())
     for word in words:
         key, sep, value = word.partition("=")
         if sep and key.lower() in fields:
