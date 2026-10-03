@@ -359,8 +359,16 @@ class AudienceIntegrationTests(unittest.TestCase):
     def test_pipe_connections_lists_tiktok_and_refresh_setup_without_model_work(self):
         pipe = self.pipe()
         toolbox.save_credentials("tiktok", {"account_id": "open-id", "access_token": "private-access"})
-        with patch.object(pipe, "_call", wraps=pipe._call) as call:
+        # Keep the real social API and temporary credentials, but never inspect the
+        # host's frontier-agent homes or installed research environment for this test.
+        frontier_status = {name: {"installed": False, "signed_in": False, "used_today": 0, "daily_limit": 30}
+                           for name in ("claude", "codex")}
+        with patch.object(pipe, "_call", wraps=pipe._call) as call, \
+                patch("escalate.status", return_value=frontier_status) as escalation, \
+                patch.object(toolbox, "status", return_value={"state": "ready"}) as tools_status:
             reply = self.pipe_reply(pipe, "/connections")
+        escalation.assert_called_once_with()
+        tools_status.assert_called_once_with()
         self.assertIn("TikTok (analytics)", reply)
         self.assertIn("unattended checkpoints", reply)
         self.assertIn("refresh_token=", reply)
