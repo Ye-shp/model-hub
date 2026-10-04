@@ -48,9 +48,14 @@ Behind the scenes:
 | Now | GPU load, model queues, disk space, image box; running tasks (with Stop) and recent tasks with their full step log |
 | Chats | Every chat folder with its size: browse and download files, delete old folders to free disk |
 | Memory | What Cowork has saved about you and your projects: edit or forget |
+| Audience | Compare drafts, record published posts and delayed counts, review reach scores and export preference examples |
 | Phone | Bridge status, the setup command, a live screenshot, collected posts |
 | People | Who used what (tasks, tokens), Claude Code and Codex status, recent hand-offs |
 | System | Code version, disks, and progress when moving to a new box |
+
+See [Audience learning](docs/AUDIENCE-LEARNING.md) for a first TikTok or Instagram
+experiment. Delayed checks run independently of chat timeouts. The first score
+focuses on reach, and preference exports stay separate from model training.
 
 ## Phone bridge
 

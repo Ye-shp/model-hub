@@ -44,9 +44,18 @@ def instructions(job: dict, space: sandbox.Workspace, helper: bool = False, esca
         "study_profile for profiles; list_knowledge shows them). Before advising on UGC, go-to-market, growth, content, "
         "ads or sales, search_knowledge for saved playbooks first and build on them, citing their source links. When the "
         "user sends a post or profile link to learn from, study it.",
+        "- Audience feedback: content_performance reads this project's tracked experiments. Audience outcomes are "
+        "observational, so compare controlled variants and do not declare causation from one viral result.",
         f"- This task has about {minutes} minutes and {PROFILES[job['profile']]['turns']} steps. Older tool results are "
         "shortened automatically as you go, so save anything you'll need later to files.",
     ]
+    if space.is_owner:
+        lines.append("- For requested content experiments, create_content_experiment then track_content_variant saves "
+                     "the exact brief/response and draft lineage. confirm_post_published requires a real post ID, account "
+                     "and known publication time; media on the phone is not a published post. record_post_metrics imports "
+                     "actual measurements, omitting unknown fields. Collection continues outside this chat. "
+                     "export_content_preferences produces an audited dataset, not training or deployment. These tools "
+                     "never authorize posting: follow the existing separate draft approval requirement.")
     if job["allow_images"]:
         lines.append("- generate_image makes images with Qwen-Image (about 1 minute for 1K, 4 minutes for 2K). Write a "
                      "detailed visual prompt; quote any on-image text exactly. The image is saved and shared automatically.")

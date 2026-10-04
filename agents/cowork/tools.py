@@ -406,7 +406,7 @@ def build_tools(ctx: ToolContext) -> list:
                                                                      current_request(job.get("task") or ""), ctx.helper_model)
     # Helpers get the lookups and video analysis too (so several videos/topics can be researched in parallel),
     # never posting.
-    helper_research = [t for t in research_list if t.name not in {"draft_post", "publish_post", "list_posts"}]
+    helper_research = [t for t in research_list if t.name not in research_module.OWNER_ONLY_TOOLS]
 
     run_helper = _run_helper(ctx, workspace_tools + research_tools + helper_research)
     delegate, delegate_many = _delegate(ctx, run_helper), _delegate_many(ctx, run_helper)
