@@ -8,12 +8,13 @@ import hmac
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 from typing import Literal
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, StrictFloat, StrictInt
 
 import hub  # Reads agents/.env before the data directory is selected.
@@ -56,6 +57,10 @@ class SocialIn(BaseModel):
 class ConnectorIn(BaseModel):
     kind: Literal["mcp", "api"]
     text: str = Field(min_length=1, max_length=8000)
+
+
+class HiggsfieldIn(BaseModel):
+    action: Literal["connect", "disconnect"] = "connect"
 
 
 class AnswerIn(BaseModel):
@@ -220,9 +225,34 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
                         await running
 
     app = FastAPI(title="Model Hub workspace", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    higgsfield_callback_path = "/api/connections/higgsfield/callback"
+
+    def public_higgsfield(result: dict) -> dict:
+        """Only deliberately public connection fields can reach the console or chat."""
+        connected = result.get("connected") is True
+        statuses = {"disconnected", "connecting", "awaiting_sign_in", "connected", "reconnect_required", "error"}
+        errors = {"invalid_callback", "invalid_state", "authorization_failed", "connection_failed", "reconnect_required"}
+        status, error = result.get("status"), result.get("error")
+        state = {"connected": connected,
+                 "status": status if isinstance(status, str) and status in statuses else
+                           ("connected" if connected else "disconnected")}
+        if error:
+            state["error"] = error if isinstance(error, str) and error in errors else "connection_failed"
+        if isinstance(result.get("tools"), list):
+            state["tools"] = [name for name in result["tools"] if isinstance(name, str) and
+                              re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name)]
+        authorization_url = result.get("authorization_url")
+        if isinstance(authorization_url, str):
+            target = urlparse(authorization_url)
+            if target.scheme == "https" and target.hostname == "clerk.higgsfield.ai" and not target.username \
+                    and not target.password and target.path == "/oauth/authorize" and len(authorization_url) <= 8000 \
+                    and not any(char in authorization_url for char in '\r\n<>"'):
+                state["authorization_url"] = authorization_url
+        return state
 
     @app.middleware("http")
     async def access(request: Request, call_next):
+        higgsfield_callback = request.method == "GET" and request.url.path == higgsfield_callback_path
         host = urlparse("http://" + request.headers.get("host", "")).hostname
         if host not in allowed_hosts:
             return JSONResponse({"error": "Unexpected hostname"}, status_code=403)
@@ -242,7 +272,9 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
             if not owner and cf_access.configured() and request.headers.get("cf-access-jwt-assertion"):
                 # Signed in through Cloudflare Access as the owner: no key needed.
                 owner = await asyncio.to_thread(cf_access.verify, request.headers["cf-access-jwt-assertion"]) is not None
-            if not owner:
+            # A browser redirect cannot attach a bearer key. This single GET route
+            # instead validates the owner-initiated, expiring single-use OAuth state.
+            if not owner and not higgsfield_callback:
                 return JSONResponse({"error": "Paste your workspace owner key to unlock."}, status_code=401)
             origin = request.headers.get("origin")
             if origin and origin not in {public_url, f"http://{request.headers.get('host')}", f"https://{request.headers.get('host')}"}:
@@ -259,9 +291,41 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
         return response
 
+    @app.middleware("http")
+    async def hide_higgsfield_callback_query(request: Request, call_next):
+        try:
+            return await call_next(request)
+        finally:
+            if request.url.path == higgsfield_callback_path:
+                # Uvicorn formats its access log from this ASGI scope after
+                # response handling, including rejected callbacks.
+                request.scope["query_string"] = b""
+
     @app.exception_handler(ValueError)
     async def bad_value(request, error):
         return JSONResponse({"error": str(error)}, status_code=400)
+
+
+    @app.get(higgsfield_callback_path, response_class=HTMLResponse)
+    async def higgsfield_callback(request: Request):
+        import higgsfield
+        try:
+            result = await higgsfield.complete(request.query_params.get("code", ""),
+                                              request.query_params.get("state", ""),
+                                              issuer=request.query_params.get("iss"),
+                                              error=request.query_params.get("error"))
+            state = public_higgsfield(result)
+        except Exception:
+            state = {"connected": False, "status": "error"}
+        if state["connected"]:
+            title, message, code = "Higgsfield connected", "You can return to Cowork and use Higgsfield in your next task.", 200
+        elif state["status"] in {"connecting", "awaiting_sign_in"} and not state.get("error"):
+            title, message, code = "Higgsfield sign-in pending", "Return to Cowork and send /connect higgsfield to check the connection.", 202
+        else:
+            title, message, code = "Higgsfield sign-in could not finish", "Return to Cowork and send /connect higgsfield to try again.", 400
+        return HTMLResponse(f'<!doctype html><html lang="en"><head><meta charset="utf-8"><title>{title}</title></head>'
+                            f'<body><h1>{title}</h1><p>{message}</p><p><a href="/">Return to Model Hub</a></p></body></html>',
+                            status_code=code, headers={"Referrer-Policy": "no-referrer"})
 
     @app.get("/")
     def home():
@@ -496,6 +560,24 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
             except Exception as error:
                 result["check"] = {"error": f"{type(error).__name__}: {str(error)[:200]}"}
         return result
+
+
+    @app.get("/api/connections/higgsfield")
+    def higgsfield_status():
+        import higgsfield
+        try:
+            return public_higgsfield(higgsfield.status())
+        except Exception:
+            return {"connected": False, "status": "error", "error": "connection_failed"}
+
+    @app.post("/api/connections/higgsfield")
+    async def connect_higgsfield(body: HiggsfieldIn):
+        import higgsfield
+        try:
+            result = await higgsfield.disconnect() if body.action == "disconnect" else await higgsfield.connect(public_url)
+            return public_higgsfield(result)
+        except Exception:
+            return JSONResponse({"connected": False, "status": "error", "error": "connection_failed"}, status_code=502)
 
     @app.get("/api/connections/telegram")
     def telegram_status():

@@ -28,6 +28,7 @@ Pick **Qwen Cowork** in the chat site's model list. (**Qwen (chat)** is the plai
 
   The tools install themselves into `/workspace/tools` on first start. TikTok and Instagram often block the rented server, so TikTok research leans on the phone.
 - **Accounts:** connect free accounts from any chat as the owner: `/connect x USERNAME auth_token=… ct0=…` (enables X search and posting), `/connect instagram USER_ID TOKEN` (Instagram API posting), `/connect bluesky HANDLE APP_PASSWORD`, `/connect github TOKEN`. `/connections` shows everything. Sign-in messages are never passed to the model.
+- **Higgsfield:** `/connect higgsfield` opens a sign-in link for your existing account. Cowork discovers Higgsfield's image, video, audio, and utility tools for your next task; `/connections` shows its status. See [Higgsfield setup](docs/HIGGSFIELD.md).
 - **Posting:** Cowork drafts posts with `draft_post`. Nothing is published until you reply `approve post N`.
   - X posts through your connected account.
   - Instagram reels and stories go through the official API. Image posts need the next hub image.

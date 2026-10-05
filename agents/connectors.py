@@ -33,6 +33,17 @@ METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 MAX_OUTPUT = 20000
 CONNECT_SECONDS = 90
 CALL_SECONDS = 180
+HIGGSFIELD_GUIDE = (
+    "Higgsfield uses the owner's connected account. Use the discovered Higgsfield tools and their schemas; "
+    "do not invent model or preset IDs. Inspect the model/preset and quote its cost before a requested generation. "
+    "Looking up models, balance, or status does not authorize generation. Follow any returned choice that needs "
+    "the user's answer. Save returned job IDs in the workspace before waiting, and resume those IDs after an "
+    "interruption; never blindly repeat a submission whose outcome is unknown. Report success only when the "
+    "job is complete, and keep its result URLs. Stopping a local wait does not cancel a remote generation. "
+    "Provider tools cannot read this Hub's local paths; use a supported upload flow for references and do not "
+    "claim files were uploaded without a successful upload and confirmation. No Higgsfield login credentials "
+    "are needed in your tool arguments. Generating media does not authorize publishing or messaging it."
+)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -166,6 +177,11 @@ def _server(name: str, entry: dict, space):
         return MCPServerStdio({"command": argv[0], "args": argv[1:], "env": space.env(entry.get("env") or {}),
                                "cwd": str(space.dir)}, **options)
     params = {"url": entry["url"], "headers": entry.get("headers") or {}, "timeout": 30}
+    if entry.get("auth") == "higgsfield":
+        import higgsfield
+        if entry["transport"] != "http" or entry["url"] != higgsfield.MCP_URL:
+            raise ValueError("Higgsfield authentication is restricted to its official MCP endpoint")
+        params["auth"] = higgsfield.auth()
     return (MCPServerSse if entry["transport"] == "sse" else MCPServerStreamableHttp)(params, **options)
 
 
@@ -182,18 +198,24 @@ def _field(item, *names):
     return None
 
 
-def render(result) -> str:
+def render(result, media_results: bool = False) -> str:
     """An MCP CallToolResult as text for the model."""
     parts = []
+    structured = _field(result, "structured_content", "structuredContent")
+    # Higgsfield's structured results contain job IDs and URLs; a widget-only
+    # text block must not hide those from a client that has no provider widget.
+    if media_results and structured:
+        parts.append(json.dumps(structured, ensure_ascii=False))
     for item in getattr(result, "content", None) or []:
         kind = getattr(item, "type", "")
         if kind == "text":
             parts.append(item.text)
         elif kind == "resource" and getattr(getattr(item, "resource", None), "text", None):
             parts.append(item.resource.text)
+        elif media_results and kind == "resource_link":
+            parts.append(f"{getattr(item, 'name', 'Result')}: {getattr(item, 'uri', '')}")
         else:
             parts.append(f"[{kind or 'content'} omitted]")
-    structured = _field(result, "structured_content", "structuredContent")
     if structured and not parts:
         parts.append(json.dumps(structured, ensure_ascii=False))
     text = "\n".join(parts) or "(no output)"
@@ -202,7 +224,7 @@ def render(result) -> str:
     return text if len(text) <= MAX_OUTPUT else text[:MAX_OUTPUT] + f"\n[… {len(text) - MAX_OUTPUT} more characters cut]"
 
 
-def wrap(server_name: str, server, tool, still_running, log):
+def wrap(server_name: str, server, tool, still_running, log, higgsfield: bool = False):
     """One MCP tool as a function tool named <server>__<tool>."""
     from agents import FunctionTool
     schema = dict(_field(tool, "input_schema", "inputSchema") or {})
@@ -220,10 +242,16 @@ def wrap(server_name: str, server, tool, still_running, log):
             async with asyncio.timeout(CALL_SECONDS):
                 result = await server.call_tool(tool.name, values if isinstance(values, dict) else {})
         except TimeoutError:
+            if higgsfield:
+                return (f"Higgsfield {tool.name} timed out. A submitted generation may still be running; "
+                        "check its existing job ID before submitting again.")
             return f"{server_name}.{tool.name} took longer than {CALL_SECONDS} s and was abandoned."
         except Exception as error:
+            if higgsfield:
+                return (f"Higgsfield {tool.name} failed ({type(error).__name__}). Check the existing job status; "
+                        "if sign-in expired, reconnect with /connect higgsfield.")
             return f"{server_name}.{tool.name} failed: {type(error).__name__}: {str(error)[:400]}"
-        return render(result)
+        return render(result, media_results=higgsfield)
 
     description = (tool.description or tool.name).strip()[:900]
     return FunctionTool(name=tool_name(server_name, tool.name), description=f"[{server_name} MCP] {description}",
@@ -232,10 +260,14 @@ def wrap(server_name: str, server, tool, still_running, log):
 
 async def open_mcp(stack: AsyncExitStack, space, still_running, log) -> tuple[list, list[str]]:
     """Connect the owner's MCP servers for one task: (tools, notes for the prompt). Close by closing the stack."""
+    if not space.is_owner:
+        return [], []
     tools, notes = [], []
     for name, entry in load()["mcp"].items():
-        server = _server(name, entry, space)
+        server = None
+        is_higgsfield = entry.get("auth") == "higgsfield"
         try:
+            server = _server(name, entry, space)
             async with asyncio.timeout(CONNECT_SECONDS):  # not wait_for: MCP's task groups must stay in this task
                 await server.connect()
             stack.push_async_callback(server.cleanup)
@@ -247,15 +279,20 @@ async def open_mcp(stack: AsyncExitStack, space, still_running, log) -> tuple[li
             if isinstance(error, asyncio.CancelledError) and asyncio.current_task().cancelling():
                 raise
             try:
-                await server.cleanup()
+                if server is not None:
+                    await server.cleanup()
             except BaseException:
                 pass
             notes.append(f"- {name} (MCP): unavailable right now ({type(error).__name__})")
+            if is_higgsfield:
+                notes.append("Higgsfield sign-in may need renewal: ask the owner to use /connect higgsfield.")
             log("tool", f"MCP server {name} is unavailable ({type(error).__name__})")
             continue
-        wrapped = [wrap(name, server, tool, still_running, log) for tool in listed]
+        wrapped = [wrap(name, server, tool, still_running, log, higgsfield=is_higgsfield) for tool in listed]
         tools += wrapped
         notes.append(f"- {name} (MCP): {len(wrapped)} tools, named {tool_name(name, '…')}")
+        if is_higgsfield:
+            notes.append(HIGGSFIELD_GUIDE)
     return tools, notes
 
 
