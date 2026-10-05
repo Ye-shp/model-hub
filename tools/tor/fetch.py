@@ -21,6 +21,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 COOKIE = os.path.join(HERE, "run", "control_auth_cookie")
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 SOCKS = "127.0.0.1:9151"
+RETRYABLE_STATUSES = {0, 408, 429, 500, 502, 503, 504}
+
+
+class FetchError(ConnectionError):
+    """A failed or incomplete transfer; partial content is never returned."""
+
+    def __init__(self, message, curl_code=None):
+        super().__init__(message)
+        self.curl_code = curl_code
+
+
+def _cookie_path():
+    tor_home = os.environ.get("TOR_HOME")
+    return os.path.join(tor_home, "run", "control_auth_cookie") if tor_home else COOKIE
 
 
 def _read_n(s, n):
@@ -68,7 +82,7 @@ def socks_connect(host, port, proxy_host=SOCKS_HOST, proxy_port=SOCKS_PORT, time
 def new_circuit():
     try:
         s = socket.create_connection(("127.0.0.1", 9051), timeout=8)
-        cookie = open(COOKIE, "rb").read().hex().upper()
+        cookie = open(_cookie_path(), "rb").read().hex().upper()
         s.sendall(("AUTHENTICATE " + cookie + "\r\n").encode())
         s.settimeout(2.0); s.recv(1024)
         s.sendall(b"SIGNAL NEWNYM\r\n"); s.settimeout(2.0); s.recv(1024)
@@ -85,7 +99,7 @@ def circuit_ready(timeout=25):
     while time.time() < deadline:
         try:
             s = socket.create_connection(("127.0.0.1", 9051), timeout=5)
-            cookie = open(COOKIE, "rb").read().hex().upper()
+            cookie = open(_cookie_path(), "rb").read().hex().upper()
             s.sendall(("AUTHENTICATE " + cookie + "\r\n").encode())
             s.settimeout(1.5); s.recv(1024)
             s.sendall(b"GETINFO status/circuit-established\r\n")
@@ -113,9 +127,15 @@ def circuit_ready(timeout=25):
     return False
 
 
-def fetch(url, timeout=60, rotate=True):
+def fetch(url, timeout=60, rotate=True, *, http_only=False, max_bytes=None):
     """GET a URL through the local Tor SOCKS5 proxy, using curl as the HTTP/TLS
-    client (curl's fingerprint is what many onion services accept)."""
+    client (curl's fingerprint is what many onion services accept).
+
+    Hub callers can restrict protocols and response size with http_only/max_bytes.
+    TOR_SOCKS_SOCKET selects a private Unix SOCKS socket instead of the TCP proxy.
+    """
+    if max_bytes is not None and (isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1):
+        raise ValueError("max_bytes must be a positive integer")
     if rotate:
         new_circuit()
         circuit_ready()
@@ -124,22 +144,45 @@ def fetch(url, timeout=60, rotate=True):
     with tempfile.NamedTemporaryFile(delete=False) as tf:
         body_path = tf.name
     try:
+        # -q must be first to exclude implicit curlrc options; an empty noproxy
+        # list overrides NO_PROXY/no_proxy even for redirects to matching hosts.
+        proxy_socket = os.environ.get("TOR_SOCKS_SOCKET")
+        if proxy_socket:
+            proxy_args = ["--proxy", "socks5h://localhost" + proxy_socket]
+        else:
+            proxy_args = ["--socks5-hostname", SOCKS]
+        args = ["curl", "-q", "-sSL", *proxy_args, "--noproxy", "",
+                "--max-time", str(int(timeout)), "-A", UA,
+                "-w", "%{http_code}\t%{size_download}\t%{url_effective}\t%{time_total}",
+                "-o", body_path]
+        if http_only:
+            args += ["--proto", "=http,https", "--proto-redir", "=http,https", "--globoff"]
+        if max_bytes is not None:
+            args += ["--max-filesize", str(max_bytes)]
+        args += ["--url", url] if http_only else [url]
         proc = subprocess.run(
-            ["curl", "-sL", "--socks5-hostname", SOCKS,
-             "--max-time", str(int(timeout)),
-             "-A", UA,
-             "-w", "%{http_code}\t%{size_download}\t%{url_effective}\t%{time_total}",
-             "-o", body_path, url],
+            args,
             capture_output=True, text=True, timeout=timeout + 5)
+        if proc.returncode:
+            raise FetchError(f"curl transfer failed (exit {proc.returncode})", curl_code=proc.returncode)
         out = proc.stdout.strip()
-        body = open(body_path, "rb").read()
+        if not out:
+            raise FetchError("curl completed without HTTP metadata")
+        parts = out.split("\t")
+        status = int(parts[0]) if parts[0].isdigit() else 0
+        if status == 0:
+            raise FetchError("curl completed without an HTTP response")
+        if max_bytes is not None and os.path.getsize(body_path) > max_bytes:
+            raise FetchError("response exceeds size limit")
+        with open(body_path, "rb") as body_file:
+            body = body_file.read(max_bytes + 1) if max_bytes is not None else body_file.read()
+        if max_bytes is not None and len(body) > max_bytes:
+            raise FetchError("response exceeds size limit")
+    except subprocess.TimeoutExpired as e:
+        raise FetchError("curl transfer timed out") from e
     finally:
         try: os.unlink(body_path)
         except Exception: pass
-    if not out:
-        raise ConnectionError(f"curl failed: {proc.stderr.strip()[:200]}")
-    parts = out.split("\t")
-    status = int(parts[0]) if parts[0].isdigit() else 0
     final_url = parts[2] if len(parts) > 2 else url
     elapsed = float(parts[3]) if len(parts) > 3 and parts[3] else round(time.time() - t0, 2)
     ctype = ""
@@ -186,12 +229,15 @@ def main():
         for attempt in range(retry + 1):
             try:
                 last = fetch(url, timeout=timeout, rotate=True)
-                if last["status"] == 200 or last.get("text"):
+                if 200 <= last["status"] < 300 or last["status"] not in RETRYABLE_STATUSES:
                     break
                 print(f"  retry {attempt + 1} for {url} (status {last['status']})...", file=sys.stderr)
             except Exception as e:
                 last = {"url": url, "status": 0, "time": 0, "text": "", "error": repr(e)}
                 print(f"  retry {attempt + 1} for {url} ({e!r})...", file=sys.stderr)
+            if attempt < retry:
+                time.sleep(min(2 ** min(attempt, 3), 8))
+        success = 200 <= last["status"] < 300 and not last.get("error")
         if as_json:
             t = last.get("text", "")
             title = re.search(r"(?is)<title[^>]*>(.*?)</title>", t)
@@ -203,9 +249,12 @@ def main():
             print(html_to_text(last.get("text", "")))
         else:
             path = os.path.join(out, slug(url) + ".html")
-            open(path, "w").write(last.get("text", ""))
-            print(f"[{last['status']}] {url} -> {path} ({last['time']}s, {len(last.get('text',''))} bytes)")
-        ok += 1 if last["status"] < 400 else 0
+            if success:
+                open(path, "w").write(last.get("text", ""))
+                print(f"[{last['status']}] {url} -> {path} ({last['time']}s, {len(last.get('text',''))} bytes)")
+            else:
+                print(f"[{last['status']}] {url} failed ({last['time']}s); no file written")
+        ok += 1 if success else 0
     print(f"\n{ok}/{len(urls)} succeeded", file=sys.stderr)
     sys.exit(0 if ok == len(urls) else 2)
 

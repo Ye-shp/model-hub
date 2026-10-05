@@ -28,6 +28,31 @@ cd tools/tor
 
 Requirements: `curl`, `python3`, `dpkg-deb` (all in Ubuntu's base).
 
+## Model Hub / Cowork deployment
+
+The Hub's owner can read a supplied `.onion` URL with Cowork's
+`read_onion_page` tool or select the `tor-fetcher` skill. The controller uses
+Tor through a private Unix SOCKS socket at `DATA_DIR/tor/run/socks.sock`;
+sandbox users cannot access that runtime. Hub mode disables the control
+listener and does not request identity rotation. Standalone commands below
+keep their existing local TCP configuration.
+
+The first deployment requires an image containing the updated supervisor and
+toolkit: `/update-code` cannot change the entrypoint of an older running image.
+After that initial image update, toolkit and controller changes can arrive
+through `/update-code` and an instance restart. The verified binary, libraries,
+and Tor state persist in `DATA_DIR/tor` across restarts; they are independent
+of the active code overlay. Installation runs in the background so download
+failures do not delay the chat site or tunnel, and the supervisor restarts
+the foreground daemon if it exits.
+
+Installation is pinned to Ubuntu 24.04 AMD64 packages, downloaded over HTTPS
+and checked against the SHA256 values published on Ubuntu's package pages
+before extraction. `bash tools/tor/setup.sh --install-only` prepares the
+runtime without starting Tor. The Ubuntu 24.04 runtime test exercises this
+installation and `tor --verify-config` with the Hub's private socket settings;
+it validates configuration without starting a daemon or fetching onion pages.
+
 ## Usage
 
 ```bash

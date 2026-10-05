@@ -20,7 +20,7 @@ for (const name of ['MODEL_API_KEY', 'TUNNEL_TOKEN', 'ADMIN_KEY']) {
 }
 // App code can be updated without rebuilding the image (which would wipe chats and re-download models):
 // the controller stages a GitHub commit into DATA/hub-code/<sha> and marks it active, then a plain restart
-// of the instance picks it up here. Covers agents/, integrations/, skills/, console/ and deploy/webui_*.
+// of the instance picks it up here. Covers agents/, integrations/, skills/, console/, tools/tor/ and deploy/webui_*.
 // New Python packages or gateway changes still need a new image. HUB_CODE_OVERLAY=off ignores the overlay.
 const CODE_ROOT = join(DATA, 'hub-code');
 async function appDir() {
@@ -134,6 +134,34 @@ keepRunning('gateway', '/usr/local/bin/node', ['/opt/hub/gateway/index.js'], {..
 
 // Optional always-on CPU controller. Uses the resident models through the gateway.
 if (env.ENABLE_AGENT_CONSOLE === 'true') {
+  // Keep Tor's verified installation and state on the private persistent volume.
+  // Its SOCKS socket is reachable by the controller, never by sandbox users.
+  const TOR_HOME = join(DATA, 'tor');
+  const TOR_SOCKS_SOCKET = join(TOR_HOME, 'run', 'socks.sock');
+  const torEnv = {...BASE, TOR_HOME, TOR_SOCKS_SOCKET};
+  async function startTor() {
+    await mkdir(TOR_HOME, {recursive: true, mode: 0o700});
+    await chmod(TOR_HOME, 0o700);
+    await new Promise((resolve, reject) => {
+      const installer = spawn('/bin/bash', [join(APP, 'tools', 'tor', 'setup.sh'), '--install-only'], {
+        env: torEnv, stdio: ['ignore', 'inherit', 'inherit'],
+      });
+      children.add(installer);
+      const timeout = setTimeout(() => {
+        installer.kill('SIGKILL');
+        reject(new Error('installation timed out'));
+      }, 300000);
+      installer.on('error', error => { clearTimeout(timeout); children.delete(installer); reject(error); });
+      installer.on('exit', code => {
+        clearTimeout(timeout);
+        children.delete(installer);
+        if (code === 0) resolve();
+        else reject(new Error(`installer exited (code ${code})`));
+      });
+    });
+    keepRunning('tor', '/bin/bash', [join(APP, 'tools', 'tor', 'torctl.sh'), 'foreground'], torEnv);
+  }
+  startTor().catch(error => console.error(`[supervisor] Tor unavailable: ${error.message}`));
   const file = join(DATA, 'agent-controller.key');
   let key = await readFile(file, 'utf8').then(s => s.trim(), () => '');
   const frontier = Boolean(env.AGENT_FRONTIER_MODEL);
@@ -148,6 +176,7 @@ if (env.ENABLE_AGENT_CONSOLE === 'true') {
     CONSOLE_URL: env.CONSOLE_URL || '', CONSOLE_KEY: env.CONSOLE_KEY || '',
     // Qwen Cowork: sandboxed workspaces, and sign-ins for handing work to Claude Code / Codex.
     COWORK_ROOT: env.COWORK_ROOT || '/workspace/cowork', HUB_CODE_DIR: CODE_ROOT, HUB_ROOT_DATA_DIR: DATA, MODEL_DIR: MODELS,
+    TOR_HOME, TOR_SOCKS_SOCKET,
     // Shown on the console: the image box's health, and the address the phone bridge on the PC connects to.
     MODEL3_URL: env.MODEL3_URL || '', BRIDGE_PUBLIC_URL: env.BRIDGE_PUBLIC_URL || (env.WEBUI_URL || '').replace('://hub.', '://api.'),
     // Opens console.<domain> without the owner key for the owner signed in through Cloudflare Access.

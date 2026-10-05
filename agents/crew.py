@@ -243,7 +243,7 @@ def build_team(job: dict, client, gate: asyncio.Semaphore) -> Agent:
 
 
 async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
-    if job["skill"] == "cowork":
+    if job["skill"] in {"cowork", "tor-fetcher"}:
         import cowork
         return await cowork.run_job(job, gate)
     gate = gate or asyncio.Semaphore(2)

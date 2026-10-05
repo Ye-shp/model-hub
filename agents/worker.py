@@ -50,7 +50,7 @@ async def execute(job: dict, gate: asyncio.Semaphore, runner):
         result = await task
         if ws.query("SELECT status FROM jobs WHERE id=?", (job["id"],))[0]["status"] != "running":
             return
-        if job["skill"] != "cowork":  # Cowork replies live in the chat; its files are shared explicitly
+        if job["skill"] not in {"cowork", "tor-fetcher"}:  # Cowork replies live in the chat; its files are shared explicitly
             artifact = ws.write_artifact(job["project"], job["id"], "task-result.md", result.encode())
             ws.save_note(job["project"], f"Task {job['id'][:8]}",
                          f"Completed: {job['task'][:1000]}\nResult artifact: {artifact['id']}\n{result[:3500]}",

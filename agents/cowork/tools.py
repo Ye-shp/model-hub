@@ -151,6 +151,21 @@ def _read_webpage(ctx: ToolContext):
     return read_webpage
 
 
+def _read_onion_page(ctx: ToolContext):
+    @function_tool
+    async def read_onion_page(url: str, offset: int = 0) -> str:
+        """Read an http(s) .onion page through the Hub's Tor service (owner only).
+        Returns text and source URLs. For long pages, pass next_offset to continue.
+        This reader cannot submit forms, upload files, or manage the Tor daemon."""
+        if not ctx.space.is_owner:
+            raise PermissionError("The Tor reader is available only to the owner")
+        import tor_fetch
+        ctx.budget.active()
+        ctx.log("tool", f"Reading through Tor: {url[:150]}")
+        return web.as_json(await tor_fetch.read_page(url, offset))
+    return read_onion_page
+
+
 # ---- project memory and collected posts ----
 def _recall(ctx: ToolContext):
     @function_tool
@@ -441,6 +456,8 @@ def build_tools(ctx: ToolContext) -> list:
 
     workspace_tools = [run_shell, list_files, read_file, write_file, edit_file]
     research_tools = [web_search, read_webpage, search_knowledge, search_posts]
+    if space.is_owner:
+        research_tools.append(_read_onion_page(ctx))
 
     import research_tools as research_module
     research_list, ctx.research_status = research_module.build_tools(job, space, ctx.client, ctx.gate, ctx.log, ctx.budget,

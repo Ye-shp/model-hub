@@ -17,7 +17,7 @@ FROM ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:3e7673cce183a55f97a1bc3c80817
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates curl \
-      python3-pip git jq ffmpeg imagemagick zip unzip pandoc procps less file \
+      python3-pip git jq ffmpeg imagemagick zip unzip pandoc procps less file libseccomp2 \
  && rm -rf /var/lib/apt/lists/*
 
 # Cowork's workspace: what the agent can use from its shell (as the unprivileged users below).
@@ -52,6 +52,7 @@ COPY agents/ ./agents/
 COPY console/ ./console/
 COPY skills/ ./skills/
 COPY integrations/ ./integrations/
+COPY tools/tor/ ./tools/tor/
 
 # llama-server finds its own libraries in /app only via this path (or when started from /app).
 ENV DATA_DIR=/workspace/data MODEL_DIR=/workspace/models LD_LIBRARY_PATH=/app:/usr/local/cuda/lib64

@@ -13,7 +13,7 @@ except ImportError:
     import httpx
 
 REPO = os.environ.get("HUB_REPO", "Ye-shp/model-hub")
-PARTS = ("agents/", "integrations/", "skills/", "console/", "deploy/")
+PARTS = ("agents/", "integrations/", "skills/", "console/", "deploy/", "tools/tor/")
 
 
 def extract(archive: bytes, target: Path) -> int:

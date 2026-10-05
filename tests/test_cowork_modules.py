@@ -178,7 +178,7 @@ class ToolsUnit(unittest.TestCase):
     def test_owner_gets_the_full_toolset(self):
         names, ctx = self.names("owner", "default")
         self.assertTrue({"run_shell", "list_files", "read_file", "write_file", "edit_file", "share_file", "web_search",
-                         "read_webpage", "recall", "remember", "search_knowledge", "search_posts", "recent_posts", "topic_stats",
+                         "read_webpage", "read_onion_page", "recall", "remember", "search_knowledge", "search_posts", "recent_posts", "topic_stats",
                          "update_plan", "queue_next_phase", "delegate", "delegate_many", "generate_image", "ask_claude",
                          "ask_codex"} <= names)
         self.assertEqual(ctx.escalation, ["claude", "codex"])
@@ -188,6 +188,7 @@ class ToolsUnit(unittest.TestCase):
         self.assertNotIn("ask_claude", names)
         self.assertNotIn("ask_codex", names)
         self.assertNotIn("generate_image", names)
+        self.assertNotIn("read_onion_page", names)
         self.assertIn("run_shell", names)
         self.assertEqual(ctx.escalation, [])
 
