@@ -116,3 +116,34 @@ access token removes the saved refresh configuration and requires manual renewal
 This feature does not train or promote a model. The first reward focuses on reach;
 other engagement counts are diagnostics. Keep independent evaluation experiments
 out of preference exports before planning any separate training work.
+
+## 7. Questions mid-task, MCP servers and APIs
+
+**Questions.** When a request is ambiguous or a decision is yours, Cowork asks (`ask_user`) and the task pauses. In the
+chat site the reply ends with the question (options numbered); in Telegram it arrives with tap-to-answer buttons. Your
+next message in that chat is the answer, not a new task. The task's time limit is paused while it waits; after the wait
+(30 minutes by default, at most 4 hours) it carries on with its best assumption and says which one it made.
+
+**MCP servers** (owner only, from a Cowork chat on the web; keys never go through Telegram or the model):
+
+```text
+/connect mcp notion https://mcp.notion.com/mcp bearer=<token>             remote, streamable HTTP (…/sse URLs use SSE)
+/connect mcp memory stdio npx -y @modelcontextprotocol/server-memory     local command, runs as the sandbox user
+/connect mcp github stdio npx -y @modelcontextprotocol/server-github env:GITHUB_PERSONAL_ACCESS_TOKEN=<token>
+/connect mcp <name> off
+```
+
+The box connects once right away and lists the server's tools. Every owner task then gets them as `<name>__<tool>`
+(for example `memory__create_entities`). A server that's down is skipped and named in the task's instructions.
+
+**HTTP APIs:**
+
+```text
+/connect api shop https://api.example.com/v1 bearer=<key> methods=GET,POST about="Orders and customers"
+/connect api weather https://api.example.com query:appid=<key> about="Forecasts"
+/connect api <name> off
+```
+
+Cowork calls them with `call_api(api, method, path, query_json, body_json)`. Stored headers and query values are added
+on the box and hidden from responses; calls stay under the base URL, redirects aren't followed, and only the listed
+methods (default GET, POST) are allowed. `/connections` lists everything connected (names and hosts, no keys).

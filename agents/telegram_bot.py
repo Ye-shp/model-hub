@@ -38,7 +38,8 @@ HELP = ("Send me a TikTok, Reel, X post or thread, Reddit thread or YouTube link
         "creator's profile link to analyse their whole account. I'll tell "
         "you which platform it is, study what it says and the top comments, and save anything useful about UGC, "
         "go-to-market and growth to the knowledge base for every future chat. Anything else you write is a normal "
-        "Cowork request.\n\n/new starts a fresh conversation, /status shows what's running.")
+        "Cowork request. If a task needs something from you, it asks here and waits for your reply.\n\n/new starts a fresh "
+        "conversation, /status shows what's running.")
 
 _watchers: dict[str, asyncio.Task] = {}
 
@@ -164,13 +165,22 @@ def pieces(text: str, size: int = CHUNK) -> list[str]:
     return out + [text]
 
 
-async def send(token: str, chat: int, text: str) -> None:
-    for piece in pieces(text):
+async def send(token: str, chat: int, text: str, markup: dict | None = None) -> None:
+    """Send a reply (split if long). markup, e.g. a keyboard of answer options, goes on the last message."""
+    parts = pieces(text)
+    for n, piece in enumerate(parts):
+        extra = {"reply_markup": markup} if markup and n == len(parts) - 1 else {}
         try:
             await api(token, "sendMessage", {"chat_id": chat, "text": to_html(piece), "parse_mode": "HTML",
-                                             "disable_web_page_preview": True})
+                                             "disable_web_page_preview": True, **extra})
         except RuntimeError:  # bad markup: send it plain
-            await api(token, "sendMessage", {"chat_id": chat, "text": piece[:4096], "disable_web_page_preview": True})
+            await api(token, "sendMessage", {"chat_id": chat, "text": piece[:4096], "disable_web_page_preview": True, **extra})
+
+
+def options_keyboard(options: list[str]) -> dict:
+    """Tappable answer buttons; tapping one sends its text as a normal message."""
+    return {"keyboard": [[{"text": option[:60]}] for option in options], "one_time_keyboard": True, "resize_keyboard": True,
+            "input_field_placeholder": "Tap an option or type your answer"}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -241,6 +251,10 @@ async def handle(message: dict) -> None:
     if command in {"/start", "/help"}:
         await send(token, chat, HELP)
         return
+    if command == "/connect":
+        await send(token, chat, "Connections (accounts, MCP servers, APIs) are set up from a Cowork chat on the web, so "
+                                "keys never pass through Telegram.")
+        return
     if command == "/new":
         threads = state.get("threads", {})
         threads[str(chat)] = threads.get(str(chat), 1) + 1
@@ -253,6 +267,14 @@ async def handle(message: dict) -> None:
                         "ORDER BY created_at", (PROJECT, thread))
         await send(token, chat, "Nothing is running." if not rows else "\n".join(
             f"- {r['status']}: {r['task'].split('CURRENT REQUEST:' + chr(10), 1)[-1][:120]}" for r in rows))
+        return
+
+    import asking
+    waiting = asking.pending_in_thread(PROJECT, thread)
+    if waiting and text and not command:
+        # The running task asked a question (ask_user): this message is the answer, not a new task.
+        asking.answer(waiting[0]["id"], text)
+        await send(token, chat, "Got it, the task continues.", {"remove_keyboard": True})
         return
 
     found = message_links(message)
@@ -320,7 +342,15 @@ async def watch(job: str, chat: int, every: float = 3.0) -> None:
             break
         row = rows[0]
         if row["status"] in {"queued", "running"}:
-            if row["status"] == "running" and loop.time() - typing_at > 8:
+            import asking
+            question = asking.pending(job) if row["status"] == "running" else None
+            asked = load().get("asked", [])
+            if question and question["id"] not in asked:
+                update(asked=(asked + [question["id"]])[-50:])
+                with suppress(Exception):
+                    await send(token, chat, asking.show(question).replace("Reply in this chat", "Reply here"),
+                               options_keyboard(question["options"]) if question["options"] else None)
+            if row["status"] == "running" and not question and loop.time() - typing_at > 8:
                 typing_at = loop.time()
                 with suppress(Exception):
                     await api(token, "sendChatAction", {"chat_id": chat, "action": "typing"})

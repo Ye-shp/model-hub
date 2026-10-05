@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import AsyncExitStack
 
 from agents import Agent, ModelSettings, Runner, SQLiteSession
 
@@ -20,6 +21,28 @@ from .gpu import assign_gpus, release_gpus
 from .prompt import STOP_WRAP_UP, WRAP_UP, instructions
 from .tier import tier_for
 from .tools import StopTask, ToolContext, build_tools, settings
+
+
+async def open_connectors(job: dict, space: sandbox.Workspace, state: dict, stack: AsyncExitStack) -> None:
+    """The owner's MCP servers and APIs (connectors.py) as tools for this task, plus a note for the prompt."""
+    import connectors
+
+    def still_running():
+        rows = ws.query("SELECT status FROM jobs WHERE id=?", (job["id"],))
+        if not rows or rows[0]["status"] != "running":
+            raise RuntimeError("This task is no longer running")
+
+    def log(kind: str, detail: str):
+        ws.event(job["id"], kind, detail)
+
+    try:
+        tools, notes = await connectors.open_mcp(stack, space, still_running, log)
+        call_api, api_notes = connectors.api_tool(still_running, log)
+    except Exception as error:  # never let a connector stop the task
+        log("tool", f"Connected tools unavailable: {type(error).__name__}")
+        return
+    state["connector_tools"] = tools + ([call_api] if call_api else [])
+    state["connector_notes"] = "\n".join(notes + api_notes)
 
 
 def out_of_turns(client, gate, tokens: int, job_id: str):
@@ -50,7 +73,8 @@ def make_agent(ctx: ToolContext, tools: list) -> Agent:
     return Agent(name="cowork", model=AdaptiveModel(ctx.lead_model, ctx.client, ctx.gate, ctx.before), tools=tools,
                  model_settings=settings(ctx, profile["tokens"], profile["effort"], True),
                  instructions=instructions(ctx.job, ctx.space, escalation=ctx.escalation, plan_text=read_plan(ctx.space),
-                                           history=recap(ctx.job), phone=ctx.phone, research=ctx.research_status))
+                                           history=recap(ctx.job), phone=ctx.phone, research=ctx.research_status,
+                                           connected=ctx.state.get("connector_notes", "")))
 
 
 def build(job: dict, client, gate: asyncio.Semaphore, space: sandbox.Workspace, state: dict | None = None) -> Agent:
@@ -106,9 +130,13 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
     client = hub.async_client()
     session = SQLiteSession(f"{job['id']}-attempt-{job['attempts']}", db_path=store.DATA / "sessions.db")
     state: dict = {}
+    connections = AsyncExitStack()
     try:
+        if space.is_owner:
+            await open_connectors(job, space, state, connections)
         try:
-            async with asyncio.timeout(profile["seconds"]):
+            async with asyncio.timeout(profile["seconds"]) as timer:
+                state["timer"] = timer  # ask_user moves the deadline by the time spent waiting for the user
                 result = await Runner.run(build(job, client, gate, space, state), job["task"], max_turns=profile["turns"],
                                           session=session, run_config=RUN_CONFIG,
                                           error_handlers=out_of_turns(client, gate, profile["tokens"], job["id"]))
@@ -137,5 +165,9 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
         return answer
     finally:
         release_gpus(job["id"])
+        try:
+            await connections.aclose()  # the owner's MCP servers for this task
+        except Exception as error:
+            print(f"[cowork] closing MCP servers failed: {type(error).__name__}", flush=True)
         session.close()
         await client.close()

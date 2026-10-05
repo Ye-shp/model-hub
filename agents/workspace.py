@@ -82,6 +82,8 @@ def init() -> None:
         db.execute("CREATE INDEX IF NOT EXISTS jobs_thread ON jobs(project, thread, created_at)")
         db.execute("CREATE INDEX IF NOT EXISTS events_job ON events(job_id, id)")
         db.commit()
+    import asking  # questions a running Cowork task asks its user (asking.py)
+    asking.init()
     import coordination
     coordination.init()
 

@@ -27,10 +27,24 @@ Owner commands: `/connections` (status of everything) · `/connect claude TOKEN`
 `/connect codex` · `/connect x USERNAME auth_token=… ct0=…` · `/connect instagram USER_ID ACCESS_TOKEN` ·
 `/connect tiktok OPEN_ID ACCESS_TOKEN` (add `refresh_token=… client_key=… client_secret=…` for automatic renewal) ·
 `/connect bluesky HANDLE APP_PASSWORD` · `/connect github TOKEN` · `/connect telegram BOT_TOKEN` (use Cowork from
-Telegram). Approve a drafted post with `approve post N`."""
+Telegram) · `/connect mcp NAME URL [bearer=KEY]` or `/connect mcp NAME stdio COMMAND… [env:KEY=value]` (MCP servers) ·
+`/connect api NAME BASE_URL [bearer=KEY] [header="Name: value"] [about="…"]` (HTTP APIs). Approve a drafted post with `approve post N`."""
 
 SKIP = {"model", "usage", "queued", "completed", "failed", "interrupted", "cancelled", "resumed", "frontier-call", "partial",
         "next-phase"}
+
+
+def question_text(question: dict) -> str:
+    """A question from a running task (asking.py on the controller), as the chat shows it."""
+    lines = ["❓ **Cowork has a question**", "", str(question.get("question") or "")]
+    options = question.get("options") or []
+    if options:
+        lines += [""] + [f"{n}. {option}" for n, option in enumerate(options, 1)] + ["", "Reply with a number or your own answer."]
+    else:
+        lines += ["", "Reply in this chat to answer."]
+    lines.append(f"_The task is paused and waits up to {question.get('wait_minutes') or 30} minutes; after that it "
+                 "continues with its best assumption._")
+    return "\n".join(lines)
 
 
 class LostContact(Exception):
@@ -249,6 +263,12 @@ class Pipe:
                             last_status = text
                     if state["status"] not in {"queued", "running"} and not state["events"]:
                         break
+                    if state.get("question") and state["status"] == "running":
+                        # The task asked the user something (ask_user). End this reply with the question; the
+                        # user's next message in this chat is sent to the task as the answer.
+                        await self._status(emit, "Waiting for your answer", done=True)
+                        yield ("\n\n---\n\n" if shown else "") + self._plan_block(plan) + question_text(state["question"])
+                        return
                     if time.monotonic() - last_keepalive > 15 and body.get("stream"):
                         last_keepalive = time.monotonic()
                         yield "data: " + json.dumps({"choices": [{"index": 0, "delta": {}, "finish_reason": None}]}) + "\n\n"
@@ -324,6 +344,14 @@ class Pipe:
                     tools = social["tools"]
                     rows.append(f"- **Research tools**: {tools['state']}" + (f" ({tools.get('detail')})" if tools.get("detail") else ""))
                     try:
+                        connected = await self._call(client, "GET", "/api/connections/tools")
+                        for name, item in connected["mcp"].items():
+                            rows.append(f"- **MCP {name}**: {item['transport']} ({item['target']})")
+                        for name, item in connected["api"].items():
+                            rows.append(f"- **API {name}**: {item['host']} ({', '.join(item['methods'])})")
+                    except (httpx.HTTPError, ValueError, KeyError):
+                        pass
+                    try:
                         telegram = await self._call(client, "GET", "/api/connections/telegram")
                         rows.append("- **Telegram**: " + (("@" + str(telegram["bot"]) + (" (paired)" if telegram["paired"] else
                                                                                         " (waiting for /start <code>)"))
@@ -334,6 +362,39 @@ class Pipe:
                                                  "`/connect claude <token>`. To connect Codex: send `/connect codex`.", ""] +
                                      [f"- {social['help'][k]}" for k in social["help"]] +
                                      ["", "Disconnect an account with `/connect <name> off`."])
+                    return
+                if command.split()[:2] in (["/connect", "mcp"], ["/connect", "api"]):
+                    if tier != "owner":
+                        yield "Only the owner can manage connections."
+                        return
+                    kind = command.split()[1]
+                    text = request_text.split(None, 2)[2] if len(request_text.split(None, 2)) == 3 else ""
+                    if kind == "mcp" and len(text.split()) >= 2 and text.split()[1].lower() != "off":
+                        await self._status(emit, "Connecting to the MCP server and listing its tools…")
+                    try:
+                        result = await self._call(client, "POST", "/api/connections/tools", json={"kind": kind, "text": text},
+                                                  timeout=180)
+                    except ValueError as error:
+                        yield f"Not saved: {connection_error(error, request_text)}"
+                        return
+                    if result["removed"]:
+                        yield f"**{result['name']}** ({kind.upper()}) disconnected."
+                        return
+                    if kind == "api":
+                        yield (f"API **{result['name']}** saved ({result['host']}, {', '.join(result['methods'])}). Cowork can "
+                               "call it with call_api from your next task; the keys stay on the box. You can delete this message.")
+                        return
+                    check = result.get("check") or {}
+                    if check.get("tools"):
+                        yield (f"MCP server **{result['name']}** connected: {len(check['tools'])} tools "
+                               f"({', '.join(t.split('__', 1)[-1] for t in check['tools'][:12])}"
+                               f"{'…' if len(check['tools']) > 12 else ''}). Cowork uses them from your next task. "
+                               "You can delete this message; any keys are stored only on the box.")
+                    else:
+                        reason = check.get("error") or check.get("note") or "it didn't list any tools"
+                        yield (f"Saved **{result['name']}**, but connecting failed just now: {connection_error(reason, request_text)}. "
+                               "Check the URL/command and keys, then send the command again (or `/connect mcp "
+                               f"{result['name']} off`).")
                     return
                 if command.startswith("/connect telegram"):
                     if tier != "owner":
@@ -406,6 +467,17 @@ class Pipe:
                             "If it says device codes are disabled, enable *device code authorization for Codex* in "
                             "ChatGPT → Settings → Security, then send `/connect codex` again.")
                     return
+
+                if request_text and not command.startswith("/") and command not in {"status", "continue watching"}:
+                    waiting = await self._call(client, "GET", "/api/thread/active", params={
+                        "project": project, "thread": thread, "requested_by": user.get("email") or ""})
+                    if waiting.get("question") and waiting.get("job"):
+                        # The running task asked a question: this message is its answer, not a new task.
+                        await self._call(client, "POST", f"/api/jobs/{waiting['job']['id']}/answer", json={"answer": request_text})
+                        await self._status(emit, "Answer sent; the task continues…")
+                        async for piece in self._follow(client, waiting["job"]["id"], emit, body, (user, __request__, __metadata__)):
+                            yield piece
+                        return
 
                 if command in {"status", "/status", "continue watching"}:
                     active = (await self._call(client, "GET", "/api/thread/active", params={
