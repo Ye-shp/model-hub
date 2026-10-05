@@ -53,6 +53,15 @@ class SocialIn(BaseModel):
     words: list[str] = Field(default_factory=list, max_length=8)
 
 
+class ConnectorIn(BaseModel):
+    kind: Literal["mcp", "api"]
+    text: str = Field(min_length=1, max_length=8000)
+
+
+class AnswerIn(BaseModel):
+    answer: str = Field(min_length=1, max_length=8000)
+
+
 class TelegramIn(BaseModel):
     token: str = Field(min_length=3, max_length=120)  # a @BotFather token, or "off"
 
@@ -402,7 +411,9 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         if not rows:
             raise HTTPException(404, "Task not found")
         following = ws.query("SELECT id FROM jobs WHERE parent=? ORDER BY created_at LIMIT 1", (job,))
+        import asking
         return {**rows[0], "plan": coordination.plan(job), "next_job": following[0]["id"] if following else None,
+                "question": asking.pending(job) if rows[0]["status"] == "running" else None,
                 "events": ws.query("SELECT id,kind,detail,created_at FROM events WHERE job_id=? AND id>? ORDER BY id LIMIT 200", (job, after)),
                 "artifacts": ws.query("SELECT id,name,media_type FROM artifacts WHERE job_id=? ORDER BY created_at,rowid", (job,))}
 
@@ -412,7 +423,17 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         project = resolve_project(project, requested_by)
         rows = ws.query("""SELECT id,status,created_at FROM jobs WHERE project=? AND thread=? AND status IN ('running','queued')
                            ORDER BY (status='running') DESC, created_at LIMIT 1""", (project, thread))
-        return {"job": rows[0] if rows else None}
+        import asking
+        question = asking.pending(rows[0]["id"]) if rows and rows[0]["status"] == "running" else None
+        return {"job": rows[0] if rows else None, "question": question}
+
+    @app.post("/api/jobs/{job}/answer")
+    def answer_question(job: str, body: AnswerIn):
+        """The user's reply to the question a running task asked (ask_user)."""
+        import asking
+        if not ws.query("SELECT 1 FROM jobs WHERE id=?", (job,)):
+            raise HTTPException(404, "Task not found")
+        return asking.answer(job, body.answer)
 
     @app.post("/api/workspace/upload", status_code=201)
     def upload(body: UploadIn):
@@ -456,6 +477,24 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
                 import logging
                 logging.getLogger("audience_worker").warning("Credentials saved; analytics retries could not be resumed.")
                 result["audience_retry_warning"] = "Credentials saved; analytics retries could not be resumed yet."
+        return result
+
+    @app.get("/api/connections/tools")
+    def tool_connections():
+        import connectors
+        return connectors.summary()
+
+    @app.post("/api/connections/tools")
+    async def connect_tool(body: ConnectorIn):
+        """/connect mcp … and /connect api … from an owner chat. A new MCP server is tried once and its tools listed."""
+        import connectors, sandbox
+        result = connectors.configure(body.kind, body.text)
+        if body.kind == "mcp" and not result["removed"]:
+            try:
+                async with asyncio.timeout(150):
+                    result["check"] = await connectors.check_mcp(result["name"], sandbox.Workspace("owner", "connections").prepare())
+            except Exception as error:
+                result["check"] = {"error": f"{type(error).__name__}: {str(error)[:200]}"}
         return result
 
     @app.get("/api/connections/telegram")

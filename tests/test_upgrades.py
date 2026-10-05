@@ -270,7 +270,7 @@ class ConsoleTests(Base):
         note = ws.save_note("default", "Tone", "casual", "preference")
         self.assertTrue(client.post(f"/api/memories/{note}", headers=AUTH, json={"title": "Tone", "content": "formal", "kind": "preference"}).json()["updated"])
         self.assertEqual(ws.memories("default")[0]["content"], "formal")
-        self.assertEqual(client.get("/api/thread/active", headers=AUTH, params={"project": "default", "thread": "chat-c"}).json(), {"job": None})
+        self.assertEqual(client.get("/api/thread/active", headers=AUTH, params={"project": "default", "thread": "chat-c"}).json(), {"job": None, "question": None})
 
 
 class PipeRetryTests(Base):

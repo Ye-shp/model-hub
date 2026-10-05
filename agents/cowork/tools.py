@@ -283,6 +283,47 @@ def _generate_image(ctx: ToolContext):
     return generate_image
 
 
+# ---- asking the user ----
+MAX_QUESTIONS = 5
+
+
+def _ask_user(ctx: ToolContext):
+    @function_tool
+    async def ask_user(question: str, options: list[str] | None = None, wait_minutes: int = 30) -> str:
+        """Ask the user one question and wait for the answer, when you can't proceed well without it: the request is
+        ambiguous in a way that changes the result, you need information only they have, or a choice is theirs to
+        make. Give 2-6 short options when the likely answers are clear (they can still reply in their own words).
+        Don't ask what you can find out or sensibly decide yourself. The task clock stops while you wait; after
+        wait_minutes (1-240) without an answer you get told to continue with your best assumption."""
+        import asking
+        ctx.budget.active()
+        asked_so_far = ctx.state.get("questions", 0)
+        if asked_so_far >= MAX_QUESTIONS:
+            return ("You've already asked the user several questions in this task. Decide the rest yourself and state "
+                    "your assumptions in your final reply.")
+        ctx.state["questions"] = asked_so_far + 1
+        asked = asking.ask(ctx.job_id, question, options, wait_minutes)
+        ctx.log("tool", "Waiting for your answer: " + describe(question, 140))
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        timer = ctx.state.get("timer")
+        deadline = timer.when() if timer is not None else None
+        if deadline is not None:
+            timer.reschedule(None)  # the task's time limit is paused while waiting for the user
+        try:
+            result = await asking.wait(asked["id"], ctx.budget.active)
+        finally:
+            if deadline is not None:
+                timer.reschedule(deadline + (loop.time() - started))
+        if result["status"] == "answered":
+            ctx.log("tool", "Got your answer: " + describe(result["answer"], 140))
+            return f"The user answered: {result['answer']}"
+        ctx.log("tool", "No answer; continuing with the best assumption")
+        return (f"No answer after {result['wait_minutes']} minutes. Continue with the most reasonable assumption and say "
+                "clearly in your final reply which assumption you made, so the user can correct it.")
+    return ask_user
+
+
 # ---- helpers ----
 def settings(ctx: ToolContext, tokens: int, effort: str, parallel: bool) -> ModelSettings:
     return ModelSettings(max_tokens=tokens, parallel_tool_calls=parallel, include_usage=True,
@@ -412,7 +453,8 @@ def build_tools(ctx: ToolContext) -> list:
     delegate, delegate_many = _delegate(ctx, run_helper), _delegate_many(ctx, run_helper)
 
     tools = workspace_tools + [share_file] + research_tools + [recall, remember, recent_posts, topic_stats, update_plan,
-                                                               queue_next_phase, delegate, delegate_many]
+                                                               queue_next_phase, delegate, delegate_many, _ask_user(ctx)]
+    tools += ctx.state.get("connector_tools", [])  # the owner's MCP servers and APIs (connectors.py), opened by run_job
     if job["allow_images"]:
         tools.append(_generate_image(ctx))
 
