@@ -315,7 +315,7 @@ def create_job(project: str, task: str, skill: str, profile: str = "balanced", a
     load_skill(skill)
     if profile not in PROFILES or not project_exists(project):
         raise ValueError("Unknown project or speed profile")
-    limit = 120000 if skill == "cowork" else 16000  # Cowork tasks carry the chat so far
+    limit = 120000 if skill in {"cowork", "tor-fetcher"} else 16000  # Cowork tasks carry the chat so far
     if not task.strip() or len(task) > limit:
         raise ValueError(f"Write a task up to {limit} characters")
     if thread is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", thread):

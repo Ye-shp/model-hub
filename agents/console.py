@@ -392,7 +392,7 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
     @app.post("/api/jobs", status_code=201)
     def new_job(body: JobIn):
         # For Cowork, allow_frontier means "may hand work to Claude Code / Codex" (checked when it runs).
-        if body.allow_frontier and not hub.FRONTIER_MODEL and body.skill != "cowork":
+        if body.allow_frontier and not hub.FRONTIER_MODEL and body.skill not in {"cowork", "tor-fetcher"}:
             raise ValueError("Configure FRONTIER_MODEL before enabling paid advice")
         data = body.model_dump()
         data["project"] = resolve_project(body.project, body.requested_by, body.thread)
