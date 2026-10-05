@@ -208,13 +208,15 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         import audience_worker
         with controller_lock():
             ws.recover_jobs()
+            import tor_service
+            tor = tor_service.start()  # Tor for read_onion_page when the image's supervisor doesn't run it
             task = asyncio.create_task(serve(runner or run_job, lambda: bool(hub.HUB_URL and hub.HUB_KEY)))
             telegram = asyncio.create_task(telegram_bot.serve())  # idle until /connect telegram
             metrics = asyncio.create_task(audience_worker.serve())  # durable checkpoints, independent of chat timeouts
             try:
                 yield
             finally:
-                for running in (task, telegram, metrics):
+                for running in (task, telegram, metrics, *([tor] if tor else [])):
                     running.cancel()
                     with suppress(asyncio.CancelledError):
                         await running
@@ -773,6 +775,8 @@ def system_health(sandbox) -> dict:
         report["code"] = (Path(code) / "active").read_text().strip() if code else None
     except OSError:
         report["code"] = None
+    import tor_service
+    report["tor"] = tor_service.status()
     report["jobs"] = ws.query("SELECT status, COUNT(*) AS n FROM jobs WHERE status IN ('running','queued') GROUP BY status")
     return report
 

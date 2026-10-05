@@ -13,7 +13,8 @@ import web
 
 @lru_cache(maxsize=1)
 def _fetcher():
-    path = Path(__file__).resolve().parents[1] / "tools" / "tor" / "fetch.py"
+    import tor_service
+    path = tor_service.kit_dir() / "fetch.py"
     spec = importlib.util.spec_from_file_location("hub_tor_fetcher", path)
     if spec is None or spec.loader is None:
         raise RuntimeError("The Tor toolkit is missing from this deployment")
@@ -33,6 +34,10 @@ async def read_page(url: str, offset: int = 0, max_chars: int = 12000) -> dict:
     # Hub mode has a private socket. Never fall back to the standalone TCP proxy.
     if not os.environ.get("TOR_SOCKS_SOCKET"):
         raise RuntimeError("The Hub Tor reader is unavailable; check the Tor service deployment")
+    import tor_service
+    service = tor_service.status()
+    if service["managed_by"] == "controller" and service["state"] != "running":
+        raise RuntimeError(f"The Hub Tor service is {service['state']}" + (f": {service['detail']}" if service["detail"] else ""))
     result = await asyncio.to_thread(_fetcher().fetch, url, timeout=60, rotate=False,
                                     http_only=True, max_bytes=web.MAX_BYTES)
     if not 200 <= result["status"] < 300:

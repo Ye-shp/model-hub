@@ -16,13 +16,13 @@ REPO = os.environ.get("HUB_REPO", "Ye-shp/model-hub")
 PARTS = ("agents/", "integrations/", "skills/", "console/", "deploy/", "tools/tor/")
 
 
-def extract(archive: bytes, target: Path) -> int:
-    """Unpack only the app folders, refusing links and paths that leave the target."""
+def extract(archive: bytes, target: Path, parts: tuple[str, ...] = PARTS) -> int:
+    """Unpack only the app folders (parts), refusing links and paths that leave the target."""
     count = 0
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
         for member in tar.getmembers():
             name = member.name.split("/", 1)[1] if "/" in member.name else ""
-            if not name.startswith(PARTS) or not (member.isfile() or member.isdir()):
+            if not name.startswith(parts) or not (member.isfile() or member.isdir()):
                 continue
             destination = (target / name).resolve()
             if not destination.is_relative_to(target.resolve()):
