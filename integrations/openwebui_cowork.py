@@ -1,6 +1,6 @@
 """
 title: Qwen Cowork
-description: Type what you want done. Qwen plans it and does the work with a shell, files, the web, helper agents, images, and Claude Code or Codex when it needs them.
+description: Type what you want done. Qwen plans it and uses its workspace, web, helpers and connected services. Owners can sign in to Higgsfield with /connect higgsfield.
 author: Model Hub
 version: 1.0.0
 """
@@ -10,6 +10,7 @@ import io
 import json
 import re
 import time
+from urllib.parse import urlparse
 
 try:
     import httpx2 as httpx
@@ -27,7 +28,8 @@ Owner commands: `/connections` (status of everything) · `/connect claude TOKEN`
 `/connect codex` · `/connect x USERNAME auth_token=… ct0=…` · `/connect instagram USER_ID ACCESS_TOKEN` ·
 `/connect tiktok OPEN_ID ACCESS_TOKEN` (add `refresh_token=… client_key=… client_secret=…` for automatic renewal) ·
 `/connect bluesky HANDLE APP_PASSWORD` · `/connect github TOKEN` · `/connect telegram BOT_TOKEN` (use Cowork from
-Telegram) · `/connect mcp NAME URL [bearer=KEY]` or `/connect mcp NAME stdio COMMAND… [env:KEY=value]` (MCP servers) ·
+Telegram) · `/connect higgsfield` (sign in with your existing account; `off` disconnects) ·
+`/connect mcp NAME URL [bearer=KEY]` or `/connect mcp NAME stdio COMMAND… [env:KEY=value]` (MCP servers) ·
 `/connect api NAME BASE_URL [bearer=KEY] [header="Name: value"] [about="…"]` (HTTP APIs). Approve a drafted post with `approve post N`."""
 
 SKIP = {"model", "usage", "queued", "completed", "failed", "interrupted", "cancelled", "resumed", "frontier-call", "partial",
@@ -62,6 +64,26 @@ def connection_error(error, request_text: str) -> str:
     for value in sorted((v for v in values if v), key=len, reverse=True):
         text = text.replace(value, "[redacted]")
     return text
+
+
+def higgsfield_tools(state: dict) -> list[str]:
+    tools = state.get("tools")
+    return [name for name in tools if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name)] \
+        if isinstance(tools, list) else []
+
+
+def higgsfield_connected(state: dict) -> str:
+    tools = higgsfield_tools(state)
+    summary = (f": {len(tools)} tools ({', '.join(name.split('__', 1)[-1] for name in tools[:12])}"
+               f"{'…' if len(tools) > 12 else ''})") if tools else ""
+    return f"**Higgsfield** connected{summary}. Cowork uses its tools from your next task."
+
+
+def hide_higgsfield_auth(text: str) -> str:
+    """Sign-in links remain clickable in chat but never enter later task prompts."""
+    pattern = r"https://clerk\.higgsfield\.ai/oauth/authorize(?:\?[^\s<>)]*)?"
+    pattern += r"|https?://[^\s<>)]*/api/connections/higgsfield/callback\?[^\s<>)]*"
+    return re.sub(pattern, "(Higgsfield sign-in details, hidden)", text, flags=re.IGNORECASE)
 
 
 class Pipe:
@@ -344,8 +366,19 @@ class Pipe:
                     tools = social["tools"]
                     rows.append(f"- **Research tools**: {tools['state']}" + (f" ({tools.get('detail')})" if tools.get("detail") else ""))
                     try:
+                        higgsfield = await self._call(client, "GET", "/api/connections/higgsfield")
+                        state = "connected" if higgsfield.get("connected") else (
+                            "sign-in pending" if higgsfield.get("status") in {"connecting", "awaiting_sign_in"} else "not connected")
+                        count = len(higgsfield_tools(higgsfield))
+                        rows.append(f"- **Higgsfield**: {state}" + (f" ({count} tools)" if count else "") +
+                                    (" (`/connect higgsfield`)" if not higgsfield.get("connected") else ""))
+                    except (httpx.HTTPError, ValueError, KeyError):
+                        rows.append("- **Higgsfield**: unavailable (`/connect higgsfield`)")
+                    try:
                         connected = await self._call(client, "GET", "/api/connections/tools")
                         for name, item in connected["mcp"].items():
+                            if name == "higgsfield":  # shown through the native account connection above
+                                continue
                             rows.append(f"- **MCP {name}**: {item['transport']} ({item['target']})")
                         for name, item in connected["api"].items():
                             rows.append(f"- **API {name}**: {item['host']} ({', '.join(item['methods'])})")
@@ -362,6 +395,41 @@ class Pipe:
                                                  "`/connect claude <token>`. To connect Codex: send `/connect codex`.", ""] +
                                      [f"- {social['help'][k]}" for k in social["help"]] +
                                      ["", "Disconnect an account with `/connect <name> off`."])
+                    return
+                if command.split()[:2] == ["/connect", "higgsfield"]:
+                    if tier != "owner":
+                        yield "Only the owner can manage connections."
+                        return
+                    words = command.split()
+                    if len(words) > 3 or (len(words) == 3 and words[2] != "off"):
+                        yield "Use `/connect higgsfield` to sign in with your existing account, or `/connect higgsfield off` to disconnect."
+                        return
+                    action = "disconnect" if len(words) == 3 else "connect"
+                    await self._status(emit, "Disconnecting Higgsfield…" if action == "disconnect" else "Checking Higgsfield sign-in…")
+                    try:
+                        state = await self._call(client, "POST", "/api/connections/higgsfield", json={"action": action}, timeout=180)
+                    except (httpx.HTTPError, ValueError):
+                        yield "Higgsfield could not be reached. Send `/connect higgsfield` to try again."
+                        return
+                    if action == "disconnect":
+                        yield "Higgsfield disconnected." if not state.get("connected") and not state.get("error") else \
+                              "Higgsfield could not disconnect. Try `/connect higgsfield off` again."
+                        return
+                    if state.get("connected"):
+                        yield higgsfield_connected(state)
+                        return
+                    url = state.get("authorization_url")
+                    target = urlparse(url) if isinstance(url, str) else None
+                    if target and target.scheme == "https" and target.hostname == "clerk.higgsfield.ai" \
+                            and not target.username and not target.password and target.path == "/oauth/authorize" \
+                            and len(url) <= 8000 and not any(char in url for char in '\r\n<>"()'):
+                        yield (f"[Sign in to Higgsfield]({url}) with your existing account and approve Cowork. "
+                               "After sign-in, return here and send `/connect higgsfield` to check the connection. "
+                               "Your credentials stay on the hub.")
+                    elif state.get("status") in {"connecting", "awaiting_sign_in"} and not state.get("error"):
+                        yield "Higgsfield sign-in is still pending. Send `/connect higgsfield` again to check it."
+                    else:
+                        yield "Higgsfield could not connect. Send `/connect higgsfield` to try again."
                     return
                 if command.split()[:2] in (["/connect", "mcp"], ["/connect", "api"]):
                     if tier != "owner":
@@ -498,6 +566,7 @@ class Pipe:
                     text = re.sub(r"<details[\s\S]*?</details>", "", text).strip()
                     if text.lower().startswith("/connect"):  # sign-ins never go to the model
                         text = "(connection command, hidden)"
+                    text = hide_higgsfield_auth(text)
                     entry = f"{message['role'].upper()}: {text}" + (" [image attached]" if pictures else "")
                     if used + len(entry) > self.valves.HISTORY_CHARACTERS:
                         history.append("(earlier messages omitted)")
@@ -507,7 +576,7 @@ class Pipe:
                 parts = []
                 if history:
                     parts.append("CONVERSATION SO FAR (earlier turns of this chat):\n" + "\n\n".join(reversed(history)))
-                parts.append("CURRENT REQUEST:\n" + (request_text or "(see attached files)"))
+                parts.append("CURRENT REQUEST:\n" + (hide_higgsfield_auth(request_text) or "(see attached files)"))
                 if attached:
                     parts.append("FILES THE USER JUST ATTACHED (in your workspace):\n" + "\n".join(f"- {p}" for p in attached))
                 profile = self.valves.OWNER_PROFILE if tier == "owner" else self.valves.GUEST_PROFILE
