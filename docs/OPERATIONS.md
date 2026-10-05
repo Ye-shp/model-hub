@@ -16,6 +16,8 @@ On a persistent **Vast volume**, set `DATA_DIR=/persist/data` and `COWORK_ROOT=/
 
 Covers `agents/`, `integrations/`, `skills/`, `console/` and `deploy/webui_*`.
 
+The Tor reader (`read_onion_page`) also arrives this way: on an image older than the Tor change the controller installs and runs Tor itself (`agents/tor_service.py`, state on the System page), so no recycle is needed for it.
+
 1. Push to `main`.
 2. In any Qwen Cowork chat, as the owner: `/update-code <full commit sha>`.
 3. Restart the instance (`vastai reboot instance <id>`), not recycle. Running tasks are marked interrupted; reply **continue** in their chats.
