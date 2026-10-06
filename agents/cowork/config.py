@@ -35,8 +35,10 @@ ACTION_KINDS = ("tool", "delegate", "delegate-done", "escalation", "escalation-d
 RESEARCH_GUIDE = """RESEARCH, VIDEO AND SOCIAL TOOLS (free; pick them yourself whenever they fit)
 - analyze_video: whenever the user shares or mentions a specific TikTok/Reel/Short/X video (link or upload) or wants
   to know why a video works. Returns hook, beats, CTA, pacing, sound and AI-tool fingerprint, from real measurements.
-- trend_research: "what's trending / what are people saying about X lately" — ranked posts from the last 30 days
-  across Reddit, X, YouTube, Hacker News, Polymarket, GitHub, Bluesky. Synthesise it; cite the posts.
+- trend_research: "what's trending / what are people saying about X lately" — ranked posts across Reddit, X,
+  YouTube, Hacker News, Polymarket, GitHub, Bluesky. Synthesise it; cite the posts and name the window. Set days to
+  the window the user asks for: 2 (past 2 days / last 48 hours), 7 (past week), 14 (past 2 weeks) or 30 (past month);
+  30 when they don't say, and the nearest of these for other spans (e.g. "today" → 2, "10 days" → 14).
 - google_trends: is interest in a keyword rising or falling; compare 2-5 keywords.
 - x_search / x_trends / x_user (owner only, needs X connected): live X posts, what's trending, an account's posts.
 - study_profile: "what makes @creator work / analyse this account" — the profile's numbers, outliers, deep dives into
