@@ -160,6 +160,17 @@ class ChatMemoryMigrationTests(unittest.TestCase):
         self.assertEqual(ws.query("SELECT content FROM notes WHERE id=101")[0]["content"], "Preserved content 101")
         self.assertEqual(ws.memories("default", thread="chat-b")[0]["id"], new)
 
+    def test_an_interrupted_upgrade_is_retried_on_the_next_start(self):
+        # A crash after the copy table was created but before the commit leaves it behind next to the old notes.
+        db = sqlite3.connect(store.DATA / "hub.db")
+        db.execute("CREATE TABLE notes_scoped (id INTEGER PRIMARY KEY, project TEXT NOT NULL, title TEXT NOT NULL)")
+        db.commit()
+        db.close()
+        ws.init()
+        after = ws.query("SELECT * FROM notes ORDER BY id")
+        self.assertEqual([{k: v for k, v in n.items() if k != "thread"} for n in after], self.before)
+        self.assertFalse(ws.query("SELECT name FROM sqlite_master WHERE name='notes_scoped'"))
+
 
 if __name__ == "__main__":
     unittest.main()
