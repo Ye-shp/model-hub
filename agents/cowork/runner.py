@@ -9,6 +9,7 @@ from agents import Agent, ModelSettings, Runner, SQLiteSession
 
 import escalate
 import hub
+import reasoning
 import sandbox
 import store
 import workspace as ws
@@ -207,6 +208,7 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
     state: dict = {}
     connections = AsyncExitStack()
     task_input = job["task"]
+    reasoning_token = reasoning.begin(job["id"])
     try:
         if space.is_owner:
             await open_connectors(job, space, state, connections)
@@ -277,6 +279,7 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
             ws.event(job["id"], "next-phase", nxt)
         return answer
     finally:
+        reasoning.end(reasoning_token)
         cancel_background(state)
         release_gpus(job["id"])
         try:

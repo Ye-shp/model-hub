@@ -130,7 +130,8 @@ class HiggsfieldCommandTests(unittest.TestCase):
                 {"role": "user", "content": "Make a cover. My browser returned "
                     "https://console.example.test/api/connections/higgsfield/callback?code=private-code&state=private-state"},
             ]}
-            return [part async for part in self.pipe.pipe(body, __user__={"role": "admin", "id": "owner"})]
+            return [part async for part in self.pipe.pipe(body, __user__={"role": "admin", "id": "owner"},
+                                                         __chat_id__="signin-history-chat")]
         asyncio.run(run())
         self.assertEqual(len(submitted), 1)
         for secret in ("pending-state", "client_id", "code_challenge", "private-code", "private-state"):

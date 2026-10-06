@@ -16,6 +16,10 @@ On a persistent **Vast volume**, set `DATA_DIR=/persist/data` and `COWORK_ROOT=/
 
 Covers `agents/`, `integrations/`, `skills/`, `console/` and `deploy/webui_*`.
 
+The chat-memory update adds a conversation scope to saved notes on controller startup. Note IDs, contents and embeddings are retained. Historical notes with an unambiguous job/chat source return to that chat; uncertain notes remain visible in the console and are excluded from ordinary chat recall. Old versions already overwritten by the former shared-title rule cannot be recovered. Standard chat IDs keep their existing workspace folders; unusual IDs use a collision-resistant folder name. Take the normal controller-database backup before deploying a schema update.
+
+Tool-enabled chat needs a saved conversation. Open WebUI's temporary chats use a browser-wide socket ID, so the Pipe asks the user to turn off Temporary Chat or save the conversation instead of sharing its files and memory with other temporary chats.
+
 The Tor reader (`read_onion_page`) also arrives this way: on an image older than the Tor change the controller installs and runs Tor itself (`agents/tor_service.py`, state on the System page), so no recycle is needed for it.
 
 1. Push to `main`.

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import coordination
 import sandbox
@@ -13,8 +14,57 @@ from .context import _cut, describe
 
 
 def current_request(task: str) -> str:
-    marker = "CURRENT REQUEST:\n"
-    return task.split(marker, 1)[1] if marker in task else task
+    # Earlier chat messages can quote this header too. The pipe appends its own
+    # canonical header after the history, so only the last complete boundary wins.
+    markers = list(re.finditer(r"(?:\A|(?:\r?\n){2})CURRENT REQUEST:\r?\n", task))
+    return task[markers[-1].end():] if markers else task
+
+
+_RESUME_REQUEST = re.compile(
+    r"^(?:please\s+)?(?:continue\b|resume\b|keep\s+going\b|carry\s+on\b|go\s+on\b|pick\s+up\s+(?:where|from)\b)",
+    re.IGNORECASE)
+_RESUME_REFERENCES = {
+    "a", "an", "the", "this", "that", "our", "my", "your", "previous", "old", "earlier", "last", "unfinished",
+    "stopped", "interrupted", "work", "task", "project", "phase", "request", "from", "where", "you", "we", "it",
+    "left", "off", "with", "on", "to", "and", "working", "doing", "now", "please",
+}
+_ACTIVITY_WORDS = {"explaining": "explain", "building": "build", "writing": "write", "fixing": "fix",
+                   "making": "make", "researching": "research", "analyzing": "analyze", "analysing": "analyse"}
+
+
+def _resume_applies(request: str, previous: dict) -> bool:
+    match = _RESUME_REQUEST.match(request)
+    if not match:
+        return False
+
+    def words(text):
+        return {_ACTIVITY_WORDS.get(word, word) for word in re.findall(r"[\w-]+", text.casefold())}
+
+    # "Continue" and "resume the work" refer to the preceding task. A specific
+    # new subject ("continue explaining comets") must not revive an unrelated app.
+    subject = words(request[match.end():]) - _RESUME_REFERENCES
+    return not subject or subject <= words(current_request(previous.get("task") or ""))
+
+
+def _previous_to_continue(job: dict) -> list[dict]:
+    """A parent phase, or the preceding task when the user asks to resume it."""
+    if not job.get("thread"):
+        return []
+    automatic = (job.get("task") or "").lstrip().startswith(("AUTOMATIC NEXT PHASE", "AUTOMATIC CONTINUATION"))
+    if automatic:
+        if not job.get("parent"):
+            return []
+        # Another request can be queued between phases. Continue this task's own
+        # parent rather than accidentally adopting that intervening request.
+        return ws.query("SELECT * FROM jobs WHERE id=? AND project=? AND thread=?",
+                        (job["parent"], job["project"], job["thread"]))
+    request = current_request(job.get("task") or "").strip()
+    if not _RESUME_REQUEST.match(request):
+        return []
+    rows = ws.query("""SELECT * FROM jobs WHERE project=? AND thread=? AND id!=? AND created_at<=?
+                       ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+                    (job["project"], job["thread"], job["id"], job.get("created_at") or store.now()))
+    return rows if rows and _resume_applies(request, rows[0]) else []
 
 
 def _attempt_summary(title: str, job: dict, events: list[dict], result: str = "") -> str:
@@ -52,17 +102,16 @@ def recap(job: dict) -> str:
             events = ws.query("SELECT kind,detail FROM events WHERE job_id=? AND id<? ORDER BY id", (job["id"], starts[-1]["id"]))
             previous = ws.query("SELECT * FROM jobs WHERE id=?", (job["id"],))[0]
             parts.append(_attempt_summary("AN EARLIER ATTEMPT OF THIS SAME TASK", {**previous, "status": "stopped"}, events))
-    if job.get("thread"):
-        rows = ws.query("""SELECT * FROM jobs WHERE project=? AND thread=? AND id!=? AND created_at<=?
-                           ORDER BY created_at DESC, rowid DESC LIMIT 1""",
-                        (job["project"], job["thread"], job["id"], job.get("created_at") or store.now()))
-        if rows:
-            previous = rows[0]
-            partial = ws.query("SELECT detail FROM events WHERE job_id=? AND kind='partial' LIMIT 1", (previous["id"],))
-            if previous["status"] in {"failed", "interrupted", "cancelled"} or partial:
-                events = ws.query("SELECT kind,detail FROM events WHERE job_id=? ORDER BY id", (previous["id"],))
-                parts.append(_attempt_summary("THE PREVIOUS TASK IN THIS CHAT STOPPED BEFORE FINISHING", previous, events,
-                                              previous.get("result") or ""))
+    rows = _previous_to_continue(job)
+    if rows:
+        previous = rows[0]
+        partial = ws.query("SELECT detail FROM events WHERE job_id=? AND kind='partial' LIMIT 1", (previous["id"],))
+        stopped = previous["status"] in {"failed", "interrupted", "cancelled"} or partial
+        if stopped or previous["id"] == job.get("parent"):
+            events = ws.query("SELECT kind,detail FROM events WHERE job_id=? ORDER BY id", (previous["id"],))
+            title = ("THE PREVIOUS TASK IN THIS CHAT STOPPED BEFORE FINISHING" if stopped else
+                     "THE PREVIOUS PHASE OF THIS SAME WORK")
+            parts.append(_attempt_summary(title, previous, events, previous.get("result") or ""))
     if not parts:
         return ""
     return ("\n\n".join(parts) + "\n\nContinue from where that work stopped: check the files it made (list_files) and don't "
