@@ -137,6 +137,8 @@ decisions you can state as questions, especially over many items:
   strength, purchase intent, frustration, relevance to the brief) -> score.
 - rank or filter: score each candidate (comments, posts, hooks, captions, search results, leads) on the same questions,
   then sort and threshold in code; check claims against their source before you rely on them.
+- writing hooks, captions, titles, CTAs or post ideas: write 10-20 candidates, score them all in one ask_jev call (one
+  score question per candidate against the brief), and keep the top few, instead of critiquing your own drafts in rounds.
 How to ask: state = the item(s) as JSON with named fields, only what's relevant; questions = {id: {type, instructions,
 criteria}}. choice criteria: {option: meaning}, include a none/other option when nothing may fit, and don't let option
 order carry meaning. score criteria: 2-10 concrete levels, lowest first. Put several independent questions about the

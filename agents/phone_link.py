@@ -235,12 +235,23 @@ def agent_tools(job: dict, log, budget, request_text: str, client, gate) -> list
     from cowork import tier_for
 
     space = sandbox.Workspace(tier_for(job), job.get("thread") or "console")
-    allowed = approved(request_text)
+    approval = {"regex": approved(request_text), "checked": None}
     shots = {"n": 0}
 
-    def guard(x: int, y: int):
+    async def allowed() -> bool:
+        """The regex finds approval words; Jev (when connected) then confirms they aren't negated or hypothetical
+        ("don't post it", "should I post it?"). Jev can only withdraw an approval, never grant one."""
+        if not approval["regex"]:
+            return False
+        if approval["checked"] is None:
+            from cowork import judge
+            approval["checked"] = await judge.confirms_approval(
+                job, request_text, "post, publish, send, comment, follow, like or buy on the phone") is not False
+        return approval["checked"]
+
+    async def guard(x: int, y: int):
         label = risky_at(x, y, BRIDGE.last_screen.get("elements") or [])
-        if label and not allowed:
+        if label and not await allowed():
             raise PermissionError(f"Blocked: '{label}' looks like posting/sending/following/liking or buying. Ask the user "
                                   "to approve this exact action in their next message (for example 'approved, post it').")
 
@@ -268,7 +279,7 @@ def agent_tools(job: dict, log, budget, request_text: str, client, gate) -> list
     async def phone_tap(x: int, y: int) -> str:
         """Tap the screen at pixel (x, y). Taps on post/send/follow/like/buy buttons are refused without the user's approval."""
         budget.active()
-        guard(x, y)
+        await guard(x, y)
         log("phone", f"Tapping ({x}, {y})")
         await call("tap", x=int(x), y=int(y))
         await asyncio.sleep(1.2)
@@ -301,7 +312,7 @@ def agent_tools(job: dict, log, budget, request_text: str, client, gate) -> list
         budget.active()
         if key not in KEYS:
             raise ValueError("key must be one of: " + ", ".join(KEYS))
-        if key == "enter" and not allowed:
+        if key == "enter" and not await allowed():
             fields = [e for e in BRIDGE.last_screen.get("elements") or [] if e["input"]]
             if not any(re.search(r"search", f"{e['label']} {e['id']}", re.I) for e in fields):
                 raise PermissionError("Enter is only allowed in search fields without the user's approval (it could send a "

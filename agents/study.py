@@ -260,8 +260,13 @@ async def gather(source: str, platform: str, *, probe, social, x_signed_in: bool
 # ---------------------------------------------------------------------------------------------
 # The whole study
 # ---------------------------------------------------------------------------------------------
+SCREENED_OUT = 0.15  # Jev's probability of reusable know-how under which only a short summary is written
+SCREENED_NOTE = ("\n\nA pre-screen found no reusable know-how in this post. Unless you clearly see specific tactics, answer "
+                 "USEFUL: no and write only the Summary section.")
+
+
 async def study(source: str, project: str, *, probe, social, ask, small_jpeg, facts, log, x_signed_in: bool,
-                save: str = "auto", write_file=None) -> dict:
+                save: str = "auto", write_file=None, screen=None) -> dict:
     """Study one post and (when useful) save it. Returns a dict the tool turns into its reply."""
     is_url = source.startswith(("http://", "https://"))
     platform, label = links.platform_of(source) if is_url else ("upload", "uploaded video")
@@ -277,8 +282,16 @@ async def study(source: str, project: str, *, probe, social, ask, small_jpeg, fa
     for frame in material["frames"][:8]:  # slides and on-screen steps are often clearer in the frames than in OCR
         content.append({"type": "text", "text": f"Keyframe at {frame['at']} s:"})
         content.append({"type": "image_url", "image_url": {"url": small_jpeg(frame["path"])}})
-    log("tool", "Extracting what's useful")
-    found = parse(await ask(content))
+    # Jev pre-screens the post: one with no reusable tactics gets a short summary instead of the full extraction.
+    chance = await screen(material["text"] + "\n\n" + comments_block(material["comments"], material["comments_note"])) \
+        if screen and save == "auto" else None
+    if chance is not None and chance < SCREENED_OUT:
+        log("tool", "No reusable tactics found; writing a short summary")
+        content[0]["text"] += SCREENED_NOTE
+        found = parse(await ask(content, max_tokens=1200))
+    else:
+        log("tool", "Extracting what's useful")
+        found = parse(await ask(content))
     keep = save == "always" or (save == "auto" and found["useful"])
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     document = "\n".join([
@@ -451,7 +464,8 @@ def overview(platform_label: str, profile: dict, posts: list[dict], stats: dict,
 
 
 async def study_profile(source: str, project: str, *, probe, social, ask, small_jpeg, facts, log, x_signed_in: bool,
-                        posts: int = 30, deep_dive: int = 5, save: str = "auto", write_file=None, refresh_days: int = 14) -> dict:
+                        posts: int = 30, deep_dive: int = 5, save: str = "auto", write_file=None, refresh_days: int = 14,
+                        screen=None) -> dict:
     """Study a creator's profile: their recent posts' numbers plus deep dives into the best ones, into one playbook."""
     found_profile = links.profile_of(source)
     if not found_profile:

@@ -40,6 +40,7 @@ Pick **Qwen Cowork** in the chat site's model list for projects, or **Qwen (chat
 Behind the scenes:
 
 - **Long runs:** old tool output is shortened before every model call, so long runs don't overflow the context.
+- **Jev (TypeSafe):** when connected (`/connect typesafe <key>`), the hub hands its yes/no and ranking decisions to Jev instead of a slow Qwen call: whether to ask questions first, whether a request goes to Claude (named, or mainly a coding job), whether the final reply is complete (one fix round if not), whether to continue after a limit, which trend-research results matter, which posts are worth a full study, and whether an approval to post is real. See [Jev](docs/JEV.md).
 - **Both GPUs:** each task's lead agent goes to the less busy GPU (alternating when both are idle) and its helpers to the other. Independent parts go to background helpers (`start_helpers`) that work on the second GPU while the lead keeps going; `delegate_many` runs several and waits. The kickoff questions are decided on the helper GPU. Routine steps, like reading files or results, use short thinking; planning and fixing errors use full thinking.
 - **Disk:** new work is refused when disk space runs low, but deleting files still works.
 
