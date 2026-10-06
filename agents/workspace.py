@@ -120,6 +120,8 @@ def _migrate_note_threads(db) -> None:
         return next(iter(threads)) if len(threads) == 1 else ""
 
     rows = list(db.execute("SELECT * FROM notes"))
+    # A run interrupted before its commit leaves this (empty) table behind; notes itself is untouched then.
+    db.execute("DROP TABLE IF EXISTS notes_scoped")
     db.execute("""CREATE TABLE notes_scoped (
       id INTEGER PRIMARY KEY, project TEXT NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL,
       kind TEXT NOT NULL, sources TEXT NOT NULL DEFAULT '[]', updated_at TEXT NOT NULL,
