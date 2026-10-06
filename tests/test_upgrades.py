@@ -464,6 +464,46 @@ class ResearchToolTests(Base):
         self.assertIn("analyze_video", names)
         self.assertFalse(names & {"x_search", "draft_post", "publish_post"})
 
+    def test_trend_research_uses_the_chosen_window(self):
+        import research_tools
+        space = sandbox.Workspace("owner", "chat-trends").prepare()
+        job = {"id": "t" * 32, "project": "default", "profile": "fast", "allow_frontier": 0, "allow_images": 0,
+               "thread": "chat-trends", "task": "CURRENT REQUEST:\ntrends"}
+
+        class Budget:
+            def active(self): pass
+            def before(self, name): pass
+
+        tools, _ = research_tools.build_tools(job, space, None, asyncio.Semaphore(1), lambda *a: None, Budget(), "", "qwen-2")
+        tool = {t.name: t for t in tools}["trend_research"]
+
+        async def invoke(args):
+            from agents.tool_context import ToolContext
+            ctx = ToolContext(context=None, tool_name=tool.name, tool_call_id="c1", tool_arguments=json.dumps(args))
+            return await tool.on_invoke_tool(ctx, json.dumps(args))
+
+        launched = []
+
+        class Process:
+            async def communicate(self):
+                return b"# report", b""
+
+        async def fake_exec(*args, **kwargs):
+            launched.append(list(args))
+            return Process()
+
+        refused = asyncio.run(invoke({"topic": "ai video ads", "days": 5}))
+        self.assertIn("2, 7, 14, 30", refused)
+        with patch.object(research_tools.toolbox, "wait_ready", lambda: None), \
+                patch.object(research_tools.asyncio, "create_subprocess_exec", fake_exec):
+            for days in (2, 7, 14, 30):
+                reply = asyncio.run(invoke({"topic": "ai video ads", "days": days}))
+                self.assertIn(f"the last {days} days", reply)
+                self.assertEqual(launched[-1][launched[-1].index("--days") + 1], str(days))
+            asyncio.run(invoke({"topic": "ai video ads"}))
+        self.assertEqual(launched[-1][launched[-1].index("--days") + 1], "30")
+        self.assertEqual(len(launched), 5)
+
     def test_video_report_facts_include_measurements(self):
         import research_tools
         text = research_tools.facts({"source": "u", "video": {"duration": 9.0, "width": 720, "height": 1280, "fps": 25, "has_audio": True},

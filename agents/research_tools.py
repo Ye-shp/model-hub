@@ -1,7 +1,7 @@
 """Qwen Cowork's research, video-analysis and posting tools (all free). See toolbox.py for install and sign-ins.
 
   analyze_video     a TikTok/Reel/Short/X link or uploaded file -> hook, beats, CTA, pacing, sound, AI-tool fingerprint
-  trend_research    last 30 days across Reddit, X, YouTube, Hacker News, Polymarket, GitHub, Bluesky (last30days engine)
+  trend_research    the last 2, 7, 14 or 30 days across Reddit, X, YouTube, Hacker News, Polymarket, GitHub, Bluesky (last30days engine)
   study_link        one post (TikTok, Reel, X thread, Reddit thread, YouTube, article) + its top comments -> the useful
                     UGC / go-to-market know-how, saved to the project's knowledge base (see study.py); list_knowledge
   study_profile     a creator's profile: recent posts' numbers + deep dives into the outliers -> one playbook, saved too
@@ -168,6 +168,9 @@ def facts(report: dict) -> str:
     return "\n".join(lines)
 
 
+TREND_WINDOWS = (2, 7, 14, 30)  # trend_research look-back choices, in days
+
+
 def build_tools(job: dict, space, client, gate, log, budget, request_text: str, helper_model: str) -> tuple[list, str]:
     """Function tools plus a line for the instructions saying which sign-ins are connected."""
     init()
@@ -226,13 +229,16 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
     # ---- trend research ----
     @function_tool
     async def trend_research(topic: str, intent: str = "balanced", subqueries: list[str] | None = None,
-                             subreddits: str = "", x_handles: str = "", depth: str = "default") -> str:
-        """What people are saying and engaging with in the last 30 days about a topic, ranked by real engagement:
+                             subreddits: str = "", x_handles: str = "", depth: str = "default", days: int = 30) -> str:
+        """What people are saying and engaging with recently about a topic, ranked by real engagement:
         Reddit, X, YouTube (with transcripts), Hacker News, Polymarket, GitHub and Bluesky (whichever are reachable).
         topic: keyword-style (how posts are titled, no dates). intent: breaking_news | product | comparison | how_to |
         opinion | prediction | concept | balanced. subqueries: 0-3 extra keyword angles. subreddits / x_handles:
-        optional comma-separated names to search directly. depth: quick | default | deep. Takes 1-5 minutes; the
-        result is evidence to synthesise, and is saved under research/."""
+        optional comma-separated names to search directly. depth: quick | default | deep. days: how far back to look,
+        one of 2 (past 2 days), 7 (past week), 14 (past 2 weeks) or 30 (past month, the default); use the window the
+        user asked for. Takes 1-5 minutes; the result is evidence to synthesise, and is saved under research/."""
+        if days not in TREND_WINDOWS:
+            return f"days must be one of {', '.join(map(str, TREND_WINDOWS))} (past 2 days, week, 2 weeks or month)."
         budget.active()
         freshness = {"breaking_news": "strict_recent", "prediction": "strict_recent", "concept": "evergreen_ok",
                      "how_to": "evergreen_ok"}.get(intent, "balanced_recent")
@@ -250,7 +256,8 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
         work.mkdir(parents=True, exist_ok=True)
         plan_file = work / f"{job_id}-{int(time.time())}.json"
         plan_file.write_text(json.dumps(plan))
-        args = [str(toolbox.PYTHON), str(toolbox.LAST30DAYS), topic, "--emit=compact", "--plan", str(plan_file)]
+        args = [str(toolbox.PYTHON), str(toolbox.LAST30DAYS), topic, "--emit=compact", "--plan", str(plan_file),
+                "--days", str(days)]
         if depth in {"quick", "deep"}:
             args.append(f"--{depth}")
         if subreddits.strip():
@@ -262,7 +269,7 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
         if not owner:  # friends don't use the owner's accounts
             for key in ("AUTH_TOKEN", "CT0", "BSKY_HANDLE", "BSKY_APP_PASSWORD", "SCRAPECREATORS_API_KEY", "GITHUB_TOKEN"):
                 env.pop(key, None)
-        log("tool", f"Researching the last 30 days: {topic[:100]}")
+        log("tool", f"Researching the last {days} days: {topic[:100]}")
         process = await asyncio.create_subprocess_exec(*args, env=env, cwd=str(toolbox.TOOLS_DIR / "home"),
                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                                                        start_new_session=True)
@@ -277,8 +284,8 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
         text = out.decode(errors="replace").strip()
         if not text:
             return "Trend research produced nothing: " + err.decode(errors="replace")[-1500:]
-        saved = space.write_text(f"research/{slug(topic)}-{time.strftime('%Y%m%d-%H%M')}.md", text)
-        return text[:16000] + f"\n\n({saved}. Synthesise this into findings with sources; don't paste it whole.)"
+        saved = space.write_text(f"research/{slug(topic)}-{days}d-{time.strftime('%Y%m%d-%H%M')}.md", text)
+        return text[:16000] + f"\n\n(Window: the last {days} days. {saved}. Synthesise this into findings with sources; don't paste it whole.)"
 
     # ---- studying posts and profiles into the knowledge base ----
     def study_kit(folder: str) -> dict:
