@@ -16,6 +16,9 @@ LEAD_MODEL = os.environ.get("COWORK_LEAD_MODEL", "auto")
 HELPER_MODEL = os.environ.get("COWORK_HELPER_MODEL", "auto")
 MAX_PARALLEL_HELPERS = int(os.environ.get("COWORK_MAX_PARALLEL_HELPERS", "4"))
 MAX_CHAIN = {"owner": int(os.environ.get("COWORK_MAX_PHASES", "6")), "friend": int(os.environ.get("COWORK_FRIEND_MAX_PHASES", "2"))}
+# When a task hits its time or step limit, the next part starts by itself in the same chat (no "continue" needed),
+# up to this many times in a row.
+AUTO_CONTINUE = int(os.environ.get("COWORK_AUTO_CONTINUE", "4"))
 PLAN_FILE = "plan.md"
 PLAN_LIMIT = 10_000
 

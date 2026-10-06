@@ -170,9 +170,32 @@ class ContinuityTests(Base):
                  patch.object(escalate, "available", return_value="off"):
                 return job, await cowork.run_job(job)
         job, answer = asyncio.run(scenario())
-        self.assertIn("Stopped at the 0-minute time limit", answer)
+        # The owner's task carries on by itself: the next part is queued in the same chat with the same request.
+        self.assertIn("the next part has started automatically", answer)
         self.assertIn("Report: started the long download.", answer)
         self.assertTrue(ws.query("SELECT 1 FROM events WHERE job_id=? AND kind='partial'", (job["id"],)))
+        child = ws.query("SELECT * FROM jobs WHERE parent=?", (job["id"],))[0]
+        self.assertTrue(child["task"].startswith("AUTOMATIC CONTINUATION 1 of up to"))
+        self.assertTrue(child["task"].rstrip().endswith("Long job"))
+        self.assertEqual((child["thread"], child["skill"]), ("chat-t", "cowork"))
+        self.assertIn("STOPPED BEFORE FINISHING", cowork.recap(child))
+        # Continuations don't ask kickoff questions or hand the request to Claude again.
+        self.assertFalse(cowork.may_ask_first(child["task"]))
+
+        # After the allowed number of automatic continuations it stops and waits for "continue".
+        with patch.object(cowork.runner, "AUTO_CONTINUE", 0):
+            async def again():
+                ws.create_job("default", "CURRENT REQUEST:\nLong job", "cowork", "fast", thread="chat-t2")
+                job = ws.claim_job()
+                while job and job["thread"] != "chat-t2":
+                    ws.finish_job(job["id"], "cancelled")
+                    job = ws.claim_job()
+                with patch.dict(cowork.PROFILES["fast"], seconds=2), patch.object(hub, "async_client", return_value=fake_client(handler)), \
+                     patch.object(escalate, "available", return_value="off"):
+                    return job, await cowork.run_job(job)
+            job, answer = asyncio.run(again())
+        self.assertIn("Stopped at the 0-minute time limit", answer)
+        self.assertFalse(ws.query("SELECT 1 FROM jobs WHERE parent=?", (job["id"],)))
 
 
 class AccountTests(Base):
