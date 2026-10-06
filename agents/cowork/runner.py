@@ -7,20 +7,22 @@ from contextlib import AsyncExitStack
 
 from agents import Agent, ModelSettings, Runner, SQLiteSession
 
+import escalate
 import hub
 import sandbox
 import store
 import workspace as ws
 from crew import CallBudget
 
-from .config import PLAN_FILE, PROFILES
+from .config import AUTO_CONTINUE, PLAN_FILE, PROFILES
 from .context import RUN_CONFIG, describe, replayable, trim_items
-from .continuity import read_plan, recap
+from .continuity import current_request, read_plan, recap
 from .effort import AdaptiveModel
 from .gpu import assign_gpus, release_gpus
+from .intent import is_automatic, wants_claude
 from .prompt import STOP_WRAP_UP, WRAP_UP, instructions
 from .tier import tier_for
-from .tools import StopTask, ToolContext, build_tools, settings
+from .tools import StopTask, ToolContext, build_tools, cancel_background, settings
 
 
 async def open_connectors(job: dict, space: sandbox.Workspace, state: dict, stack: AsyncExitStack) -> None:
@@ -45,9 +47,12 @@ async def open_connectors(job: dict, space: sandbox.Workspace, state: dict, stac
     state["connector_notes"] = "\n".join(notes + api_notes)
 
 
-def out_of_turns(client, gate, tokens: int, job_id: str):
-    """When an agent runs out of turns, keep its work: one last tool-free call writes the report."""
+def out_of_turns(client, gate, tokens: int, job_id: str, state: dict | None = None):
+    """When an agent runs out of turns, keep its work: one last tool-free call writes the report. With state (the lead
+    agent's), the task is marked so that it continues automatically (see run_job)."""
     async def handler(data):
+        if state is not None:
+            state["out_of_steps"] = True
         ws.event(job_id, "tool", "Out of steps; writing up what was done")
         writer = Agent(name="wrap-up", model=hub.model("qwen", client, gate), instructions="Write the final report requested.",
                        model_settings=ModelSettings(max_tokens=tokens, include_usage=True, extra_body={"reasoning_effort": "low"}))
@@ -74,7 +79,9 @@ def make_agent(ctx: ToolContext, tools: list) -> Agent:
                  model_settings=settings(ctx, profile["tokens"], profile["effort"], True),
                  instructions=instructions(ctx.job, ctx.space, escalation=ctx.escalation, plan_text=read_plan(ctx.space),
                                            history=recap(ctx.job), phone=ctx.phone, research=ctx.research_status,
-                                           connected=ctx.state.get("connector_notes", ""), jev=ctx.state.get("jev", False)))
+                                           connected=ctx.state.get("connector_notes", ""), jev=ctx.state.get("jev", False),
+                                           claude_requested=wants_claude(ctx.job.get("task") or "")
+                                           and not ctx.state.get("claude_done")))
 
 
 def build(job: dict, client, gate: asyncio.Semaphore, space: sandbox.Workspace, state: dict | None = None) -> Agent:
@@ -123,6 +130,74 @@ async def wrap_up(client, gate, profile: dict, job: dict, session, reason: str) 
                 "\n".join("- " + describe(d, 140) for d in done))
 
 
+def auto_continues(job: dict) -> int:
+    """How many automatic continuations in a row led up to this task."""
+    count, current = 0, job
+    while current and str(current.get("task") or "").startswith("AUTOMATIC CONTINUATION") and count < 50:
+        count += 1
+        rows = ws.query("SELECT * FROM jobs WHERE id=?", (current.get("parent"),)) if current.get("parent") else []
+        current = rows[0] if rows else None
+    return count
+
+
+def queue_continuation(job: dict, reason: str) -> str | None:
+    """After a time or step limit, start the next part in the same chat by itself (the owner's Cowork tasks only).
+    The new task gets a recap of this one (continuity.recap) and the same request."""
+    if job.get("skill") != "cowork" or tier_for(job) != "owner":
+        return None
+    done = auto_continues(job)
+    if done >= AUTO_CONTINUE:
+        return None
+    nxt = ws.create_job(job["project"], f"AUTOMATIC CONTINUATION {done + 1} of up to {AUTO_CONTINUE} (the previous task in "
+                        f"this chat stopped because {reason}; carry on from where it stopped).\n\nCURRENT REQUEST:\n"
+                        + current_request(job.get("task") or ""), "cowork", job["profile"], bool(job["allow_frontier"]),
+                        bool(job["allow_images"]), thread=job.get("thread"), requested_by=job.get("requested_by"),
+                        parent=job["id"])
+    ws.event(job["id"], "next-phase", nxt)
+    return nxt
+
+
+BRIEF_INLINE_BYTES = 60_000
+
+
+def handoff_brief(job: dict, space: sandbox.Workspace, extra: str) -> str:
+    """Everything Claude Code needs when the user's message asks for it: the chat so far, the request, the plan."""
+    parts = [job.get("task") or ""]
+    if extra:
+        parts.append(extra.strip())
+    plan = read_plan(space)
+    if plan:
+        parts.append(f"PROJECT PLAN ({PLAN_FILE} in this folder):\n{plan}")
+    earlier = recap(job)
+    if earlier:
+        parts.append(earlier)
+    parts.append("The user explicitly asked for Claude in their current request. Do the part of the request they "
+                 "assigned to Claude; when they gave Claude the whole request, do all of it. Files the user attached are "
+                 "in uploads/. Save deliverables as files in this folder.")
+    brief = "\n\n".join(parts)
+    if len(brief.encode("utf-8")) <= BRIEF_INLINE_BYTES:
+        return brief
+    # A command-line argument can't hold a long chat: the whole brief goes in a file, the request stays inline.
+    space.write_text(".claude-brief.md", brief)
+    return ("The full brief for this request (the conversation so far, the request, the project plan and earlier work) "
+            "is in .claude-brief.md in this folder: read it first.\n\nCURRENT REQUEST:\n"
+            + current_request(job.get("task") or "")[-20000:] + "\n\n" + parts[-1])
+
+
+async def direct_claude(job: dict, space: sandbox.Workspace, state: dict, extra: str) -> dict | None:
+    """The user named Claude: hand the request to Claude Code first, rather than leaving that to Qwen's judgment."""
+    task = job.get("task") or ""
+    if not (space.is_owner and job.get("allow_frontier") and wants_claude(task)) or is_automatic(task):
+        return None
+    if escalate.available("claude") is not None:
+        ws.event(job["id"], "tool", "You asked for Claude, but " + escalate.available("claude"))
+        return None
+    ws.event(job["id"], "tool", "Handing your request to Claude Code (you asked for Claude)")
+    result = await escalate.run("claude", space, job["id"], handoff_brief(job, space, extra))
+    state["claude_done"] = True
+    return result
+
+
 async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
     gate = gate or asyncio.Semaphore(4)
     profile = PROFILES[job["profile"]]
@@ -131,15 +206,42 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
     session = SQLiteSession(f"{job['id']}-attempt-{job['attempts']}", db_path=store.DATA / "sessions.db")
     state: dict = {}
     connections = AsyncExitStack()
+    task_input = job["task"]
     try:
         if space.is_owner:
             await open_connectors(job, space, state, connections)
+        state["lead"], state["helper"] = assign_gpus(job["id"])
+
+        def still_running():
+            rows = ws.query("SELECT status FROM jobs WHERE id=?", (job["id"],))
+            if not rows or rows[0]["status"] != "running":
+                raise RuntimeError("This task is no longer running")
+
+        # Questions before starting a new request (decided on the helper GPU; the clock hasn't started yet).
+        if job.get("skill") == "cowork" and job.get("attempts", 1) == 1:
+            from .kickoff import clarify
+            task_input += await clarify(job, client, gate, state["helper"], still_running)
+        # The user asked for Claude: it does that work first; Qwen then checks, shares and reports.
+        handed = await direct_claude(job, space, state, task_input[len(job["task"]):])
+        if handed is not None:
+            if not handed.get("ok"):
+                why = handed.get("error") or ("it timed out" if handed.get("timed_out") else
+                                              f"it exited with code {handed.get('exit_code')}")
+                ws.event(job["id"], "partial", f"the Claude Code hand-off failed ({why})")
+                return (f"⚠️ **Claude Code couldn't do this: {why}.**\n\n" + (handed.get("summary") or "").strip()[:3000]
+                        + "\n\nSend the request again to retry with Claude, or tell me to do it myself instead.")
+            task_input += ("\n\nCLAUDE CODE HAS ALREADY WORKED ON THIS REQUEST (you asked for Claude, so it was handed "
+                           "over first). Its report:\n" + (handed.get("summary") or "(no summary)") +
+                           "\n\nNow check the files it made (list_files, open or run them), share the deliverables "
+                           "with share_file, finish any part of the request the user did NOT give to Claude, and reply. "
+                           "If its work is broken or incomplete, send the fixes back to it with ask_claude rather than "
+                           "redoing its part yourself.")
         try:
             async with asyncio.timeout(profile["seconds"]) as timer:
-                state["timer"] = timer  # ask_user moves the deadline by the time spent waiting for the user
-                result = await Runner.run(build(job, client, gate, space, state), job["task"], max_turns=profile["turns"],
+                state["timer"] = timer  # ask_user and hand-offs move the deadline by the time spent waiting
+                result = await Runner.run(build(job, client, gate, space, state), task_input, max_turns=profile["turns"],
                                           session=session, run_config=RUN_CONFIG,
-                                          error_handlers=out_of_turns(client, gate, profile["tokens"], job["id"]))
+                                          error_handlers=out_of_turns(client, gate, profile["tokens"], job["id"], state))
             usage = result.context_wrapper.usage
             ws.event(job["id"], "usage", json.dumps({"requests": usage.requests, "input_tokens": usage.input_tokens,
                                                      "output_tokens": usage.output_tokens}))
@@ -147,15 +249,26 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
         except Exception as error:
             if state.get("stop"):
                 reason, header = state["stop"], f"⚠️ **Stopped: {state['stop']}.**"
+                ws.event(job["id"], "partial", reason)
             elif isinstance(error, TimeoutError):
-                reason = f"the {profile['seconds'] // 60}-minute time limit was reached"
-                header = (f"⏱ **Stopped at the {profile['seconds'] // 60}-minute time limit.** Reply **continue** to keep "
-                          "going: the next task picks up from here.")
+                minutes = profile["seconds"] // 60
+                reason = f"the {minutes}-minute time limit was reached"
+                ws.event(job["id"], "partial", reason)
+                if queue_continuation(job, reason):
+                    header = f"⏱ **Reached the {minutes}-minute limit for one task; the next part has started automatically.**"
+                else:
+                    header = (f"⏱ **Stopped at the {minutes}-minute time limit.** Reply **continue** to keep going: the "
+                              "next task picks up from here.")
             else:
                 raise
-            ws.event(job["id"], "partial", reason)
             ws.event(job["id"], "tool", "Writing up what was done")
             return header + "\n\n" + await wrap_up(client, gate, profile, job, session, reason)
+        if state.get("out_of_steps") and not state.get("next"):
+            reason = f"it used all {profile['turns']} steps"
+            ws.event(job["id"], "partial", reason)
+            if queue_continuation(job, reason):
+                answer = "🔁 **Used all steps for one task; the next part has started automatically.**\n\n" + answer
+            return answer
         if state.get("next"):
             nxt = ws.create_job(job["project"], "AUTOMATIC NEXT PHASE (queued by the previous task in this chat; the "
                                 f"project plan is in {PLAN_FILE}).\n\nCURRENT REQUEST:\n" + state["next"], "cowork",
@@ -164,6 +277,7 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
             ws.event(job["id"], "next-phase", nxt)
         return answer
     finally:
+        cancel_background(state)
         release_gpus(job["id"])
         try:
             await connections.aclose()  # the owner's MCP servers for this task

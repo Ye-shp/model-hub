@@ -3,7 +3,7 @@
 A self-hosted AI workspace on rented GPUs. Two abliterated Qwen3.8-27B models run around the clock, and **Qwen Cowork** turns them into an agent that does real work: it plans, uses a shell, files, the web, parallel helper agents, image generation, your Android phone, and hands hard parts to Claude Code or Codex.
 
 ```text
-You / invited friends ─▶ hub.handydandy.cc ── Cloudflare Access ─┐
+You (owner only) ──────▶ hub.handydandy.cc ── Cloudflare Access ─┐
 Owner only ────────────▶ console.handydandy.cc ─ Access ─────────┤  Cloudflare Tunnel (outbound only)
 Programs, phone bridge ─▶ api.handydandy.cc ── API / bridge key ─┤
                                                                  ▼
@@ -14,12 +14,13 @@ Chat box (Vast, 2× V100 32 GB)                                   Image box (Vas
 
 ## Using it
 
-Pick **Qwen Cowork** in the chat site's model list. (**Qwen (chat)** is the plain model with no tools.)
+Pick **Qwen Cowork** in the chat site's model list for projects, or **Qwen (chat)** for conversation: chat has the same tools (web, shell, files, images, helpers, Claude Code) and uses them when they help, but answers directly instead of planning. Both are for the owner only.
 
 - **Just say what you want done.** Each chat has its own folder on the box, so follow-up messages build on earlier files. Attached files land in `uploads/`.
-- **Big projects:** ask for a plan first. Cowork keeps `plan.md` in the chat folder and does one phase per task. When a phase finishes, it can start the next one automatically in the same chat: up to 6 phases in a row for you, 2 for friends. After that, reply **continue**.
-- **Claude Code / Codex:** say "use Claude Code for …" to hand work over. If a hand-off fails, the task stops right away and reports what happened. `/connections` shows their status.
-- **If a task stops early** (time limit or failed hand-off), you still get a report. Reply **continue** and the next task gets a summary of what was done, so finished steps aren't redone.
+- **Questions first:** for a new request that leaves real choices open (audience, platform, format, scope, tone), Cowork asks up to three questions before starting and waits up to 30 minutes for the answer; with no answer it starts on its own assumptions and says which. Say "just do it" to skip the questions.
+- **Big projects:** ask for a plan first. Cowork keeps `plan.md` in the chat folder and does one phase per task. When a phase finishes, it can start the next one automatically in the same chat: up to 6 phases in a row. After that, reply **continue**.
+- **Claude Code / Codex:** say "use Claude for …" (or "have Claude …", "ask Claude to …") and the request goes straight to Claude Code; Qwen then checks the files, shares them and does any part you kept for it. Qwen also hands substantial coding and long-form writing to Claude by itself. The task clock pauses while Claude works. If a hand-off fails, the task stops right away and reports what happened. `/connections` shows their status. Telegram tasks can use Claude too.
+- **Time limits:** a Cowork task runs up to 2 hours (Qwen (chat): 20 minutes). When it hits the limit or runs out of steps, you get a report and the next part starts by itself in the same chat with a summary of what was done, up to 4 times in a row (`COWORK_AUTO_CONTINUE`). After that, or after a failed hand-off, reply **continue**.
 - **If the page reloads or loses contact**, send **status** to follow the task that's still running.
 - **Research and video tools (free):** Cowork decides when to use these.
   - `analyze_video` breaks down a TikTok, Reel, Short or X video (link or upload): hook, beats, CTA, cut rate, on-screen text, voiceover, sound, AI-tool fingerprint.
@@ -38,9 +39,8 @@ Pick **Qwen Cowork** in the chat site's model list. (**Qwen (chat)** is the plai
 Behind the scenes:
 
 - **Long runs:** old tool output is shortened before every model call, so long runs don't overflow the context.
-- **Both GPUs:** each task's lead agent goes to the less busy GPU and its helpers to the other. Multi-part work is handed to several helpers at once (`delegate_many`), spread over both GPUs. Routine steps, like reading files or results, use short thinking; planning and fixing errors use full thinking.
+- **Both GPUs:** each task's lead agent goes to the less busy GPU (alternating when both are idle) and its helpers to the other. Independent parts go to background helpers (`start_helpers`) that work on the second GPU while the lead keeps going; `delegate_many` runs several and waits. The kickoff questions are decided on the helper GPU. Routine steps, like reading files or results, use short thinking; planning and fixing errors use full thinking.
 - **Disk:** new work is refused when disk space runs low, but deleting files still works.
-- **Friends:** each invited friend has their own sandbox user, folders and memory, with a 5 GB allowance.
 
 ## Console (console.handydandy.cc)
 

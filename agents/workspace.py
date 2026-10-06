@@ -309,13 +309,17 @@ def bounded_json(items: list[dict], limit: int = 12000) -> str:
                        "hint": "Request fewer/specific records if omitted is nonzero."}, ensure_ascii=False)
 
 
+# Skills run by the Cowork agent (agents/cowork): "chat" is Qwen (chat), the same agent in a conversational mode.
+AGENT_SKILLS = frozenset({"cowork", "tor-fetcher", "chat"})
+
+
 def create_job(project: str, task: str, skill: str, profile: str = "balanced", allow_frontier: bool = False, allow_images: bool = False,
                thread: str | None = None, requested_by: str | None = None, parent: str | None = None) -> str:
     from skills import load_skill
     load_skill(skill)
     if profile not in PROFILES or not project_exists(project):
         raise ValueError("Unknown project or speed profile")
-    limit = 120000 if skill in {"cowork", "tor-fetcher"} else 16000  # Cowork tasks carry the chat so far
+    limit = 120000 if skill in AGENT_SKILLS else 16000  # Cowork tasks carry the chat so far
     if not task.strip() or len(task) > limit:
         raise ValueError(f"Write a task up to {limit} characters")
     if thread is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", thread):

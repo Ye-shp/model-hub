@@ -325,7 +325,6 @@ class AudienceIntegrationTests(unittest.TestCase):
         spec.loader.exec_module(module)
         pipe = module.Pipe()
         pipe.valves.OWNER_KEY = "k" * 40
-        pipe.valves.ALLOWED_EMAILS = "friend@example.com"
         pipe._client = lambda: httpx.AsyncClient(transport=httpx.ASGITransport(app=self.client.app), base_url="http://testserver",
                                                 headers=AUTH)
         return pipe

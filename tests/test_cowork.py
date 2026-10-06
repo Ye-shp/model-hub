@@ -34,7 +34,7 @@ class Base(unittest.TestCase):
         if sandbox.IS_ROOT:
             sandbox.USERS.update(owner="nobody", guest="nobody", friend="nobody")
         ws.init()
-        cowork._leads.clear()
+        cowork._leads.clear(); cowork._last.clear()
 
     def tearDown(self):
         import toolbox
@@ -251,17 +251,30 @@ class PipeTests(Base):
         self.assertIn("earlier answer", job["task"])
         self.assertTrue(job["task"].rstrip().endswith("Make me a table"))
 
-    def test_friends_use_their_own_project_and_strangers_are_refused(self):
+    def test_only_the_owner_can_use_it(self):
         body = {"messages": [{"role": "user", "content": "hello"}]}
-        reply, _, _ = self.collect(body, {"role": "user", "email": "stranger@example.com"})
-        self.assertIn("invited", reply)
-        self.pipe.valves.ALLOWED_EMAILS = "friend@example.com"
-        reply, _, job = self.collect(body, {"role": "user", "email": "Friend@example.com"})
-        # Each friend has their own project and sandbox account.
-        self.assertEqual((job["project"], job["allow_frontier"]), (sandbox.friend_account("friend@example.com"), 0))
-        self.assertEqual(cowork.tier_for(job), job["project"])
-        reply, _, _ = self.collect({"messages": [{"role": "user", "content": "/connect codex"}]}, {"role": "user", "email": "friend@example.com"})
-        self.assertIn("Only the owner", reply)
+        for user in ({"role": "user", "email": "stranger@example.com"}, {"role": "pending", "email": "friend@example.com"}):
+            reply = asyncio.run(self._reply(body, user))
+            self.assertIn("Only the owner", reply)
+        self.assertEqual(ws.query("SELECT id FROM jobs"), [])
+
+    def test_chat_mode_starts_a_chat_task_with_the_same_tools(self):
+        self.pipe.valves.MODE = "chat"
+        body = {"messages": [{"role": "user", "content": "What's the weather in Addis today?"}]}
+        reply, _, job = self.collect(body, {"role": "admin", "email": "me@example.com", "id": "u1"})
+        self.assertIn("Here is your table.", reply)
+        self.assertEqual((job["skill"], job["project"], job["allow_frontier"]), ("chat", "default", 1))
+        space = sandbox.Workspace("owner", "t").prepare()
+        fake = AsyncOpenAI(api_key="t", base_url="https://fake.invalid/v1")
+        with patch.object(escalate, "available", return_value=None):
+            agent = cowork.build({**job, "id": "c" * 32}, fake, asyncio.Semaphore(1), space)
+        names = {t.name for t in agent.tools}
+        self.assertTrue({"web_search", "run_shell", "ask_claude", "start_helpers", "collect_helpers"} <= names)
+        self.assertIn("You are Qwen, chatting", agent.instructions)
+        self.assertNotIn("Real tasks: call update_plan first", agent.instructions)
+
+    async def _reply(self, body, user):
+        return "".join([chunk async for chunk in self.pipe.pipe(body, __user__=user, __metadata__={"chat_id": "chat-p"})])
 
 
 class ConnectionTests(Base):

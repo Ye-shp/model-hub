@@ -87,13 +87,17 @@ def hide_higgsfield_auth(text: str) -> str:
     return re.sub(pattern, "(Higgsfield sign-in details, hidden)", text, flags=re.IGNORECASE)
 
 
+CHAT_HELP = """**Qwen (chat)** — talk to Qwen. It answers directly and uses the same tools as Cowork (web, shell and files,
+images, helpers, Claude Code) when they make the answer better. Each chat has its own workspace folder.
+For long projects with plans and phases, use **Qwen Cowork**. Owner commands (`/connections`, `/connect …`) work here too."""
+
+
 class Pipe:
     class Valves(BaseModel):
         CONTROLLER_URL: str = Field(default="http://127.0.0.1:8787", description="Agent controller, from the chat site's server")
         OWNER_KEY: str = Field(default="", description="Controller owner key (set by the hub on start)")
-        ALLOWED_EMAILS: str = Field(default="", description="Comma-separated invited users; admins are always allowed")
-        OWNER_PROFILE: str = Field(default="balanced", description="fast (20 min), balanced (60 min) or deep (2 h) for admins")
-        GUEST_PROFILE: str = Field(default="balanced", description="Time budget for invited users")
+        MODE: str = Field(default="cowork", description="cowork (autonomous projects) or chat (conversation, same tools)")
+        OWNER_PROFILE: str = Field(default="deep", description="fast (20 min), balanced (60 min) or deep (2 h)")
         ALLOW_IMAGES: bool = False
         OWNER_ESCALATION: bool = Field(default=True, description="Let the owner's tasks hand work to Claude Code / Codex")
         HISTORY_CHARACTERS: int = Field(default=60000, ge=2000, le=110000, description="How much of the chat is sent along")
@@ -119,11 +123,10 @@ class Pipe:
             raise ValueError(f"Controller HTTP {response.status_code} {str(detail)[:200]}".strip())
         return response.json()
 
-    def _tier(self, user: dict):
-        if user.get("role") == "admin":
-            return "owner"
-        allowed = {e.strip().lower() for e in self.valves.ALLOWED_EMAILS.split(",") if e.strip()}
-        return "guest" if (user.get("email") or "").lower() in allowed else None
+    @staticmethod
+    def _tier(user: dict):
+        """Only the site's admin (the owner) can use it."""
+        return "owner" if user.get("role") == "admin" else None
 
     @staticmethod
     def _text(content) -> tuple[str, list[str]]:
@@ -316,9 +319,9 @@ class Pipe:
             identity = state.get("next_job") if state["status"] == "completed" else None
             if identity:
                 shown += 1
-                text += (f"\n\n---\n\n**Phase {shown + 1} started automatically** (from plan.md). It keeps going in this "
-                         "chat; press stop to end it.\n\n")
-                await self._status(emit, f"Phase {shown + 1} starting…")
+                text += (f"\n\n---\n\n**Part {shown + 1} started automatically.** It keeps going in this chat; press "
+                         "stop to end it.\n\n")
+                await self._status(emit, f"Part {shown + 1} starting…")
             yield text
         await self._status(emit, {"completed": "Done", "cancelled": "Stopped"}.get(state["status"], "Stopped early"), done=True)
 
@@ -331,14 +334,15 @@ class Pipe:
         user = __user__ or {}
         tier = self._tier(user)
         if not tier:
-            yield "Qwen Cowork is available to the site's administrators and invited users."
+            yield "Only the owner can use this model."
             return
         if len(self.valves.OWNER_KEY) < 32:
             yield "Qwen Cowork isn't configured yet (missing controller key). Restart the hub or set the Pipe's valves."
             return
         messages = [m for m in body.get("messages", []) if m.get("role") in {"user", "assistant"}]
+        chat = self.valves.MODE == "chat"
         if not messages or messages[-1]["role"] != "user":
-            yield HELP
+            yield CHAT_HELP if chat else HELP
             return
         request_text, images = self._text(messages[-1].get("content"))
         request_text = request_text.strip()
@@ -349,7 +353,7 @@ class Pipe:
         try:
             async with self._client() as client:
                 if command in {"/help", "help"} or (not request_text and not images and not __files__):
-                    yield HELP
+                    yield CHAT_HELP if chat else HELP
                     return
                 if command in {"/connections", "/connect"}:
                     if tier != "owner":
@@ -599,9 +603,9 @@ class Pipe:
                 parts.append("CURRENT REQUEST:\n" + (hide_higgsfield_auth(request_text) or "(see attached files)"))
                 if attached:
                     parts.append("FILES THE USER JUST ATTACHED (in your workspace):\n" + "\n".join(f"- {p}" for p in attached))
-                profile = self.valves.OWNER_PROFILE if tier == "owner" else self.valves.GUEST_PROFILE
+                profile = self.valves.OWNER_PROFILE
                 job = await self._call(client, "POST", "/api/jobs", json={
-                    "project": project, "task": "\n\n".join(parts), "skill": "cowork",
+                    "project": project, "task": "\n\n".join(parts), "skill": "chat" if chat else "cowork",
                     "profile": profile if profile in {"fast", "balanced", "deep"} else "balanced",
                     "allow_frontier": tier == "owner" and self.valves.OWNER_ESCALATION, "allow_images": self.valves.ALLOW_IMAGES,
                     "thread": thread, "requested_by": user.get("email") or user.get("name") or ""})

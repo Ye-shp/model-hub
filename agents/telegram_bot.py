@@ -314,9 +314,11 @@ async def handle(message: dict) -> None:
     parts.append("CURRENT REQUEST:\n" + (text or "Study the attached file."))
     if attached:
         parts.append("FILES THE USER JUST ATTACHED (in your workspace):\n" + "\n".join(f"- {p}" for p in attached))
-    profile = os.environ.get("TELEGRAM_PROFILE", "balanced")
-    job = ws.create_job(PROJECT, "\n\n".join(parts), "cowork", profile if profile in {"fast", "balanced", "deep"} else "balanced",
-                        allow_images=True, thread=thread, requested_by="telegram")
+    profile = os.environ.get("TELEGRAM_PROFILE", "deep")
+    # The bot is paired to the owner's Telegram account, so its tasks may hand work to Claude Code like the chat site's.
+    job = ws.create_job(PROJECT, "\n\n".join(parts), "cowork", profile if profile in {"fast", "balanced", "deep"} else "deep",
+                        allow_frontier=os.environ.get("COWORK_ESCALATION") != "false", allow_images=True, thread=thread,
+                        requested_by="telegram")
     pending = load().get("pending", {})
     pending[job] = chat
     update(pending=pending)

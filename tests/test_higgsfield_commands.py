@@ -53,7 +53,6 @@ class HiggsfieldCommandTests(unittest.TestCase):
         self.client = TestClient(self.app)
         self.pipe = Pipe()
         self.pipe.valves.OWNER_KEY = KEY
-        self.pipe.valves.ALLOWED_EMAILS = "friend@example.test"
         self.pipe._client = lambda: httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app),
                                                     base_url="http://testserver", headers=AUTH)
 

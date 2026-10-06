@@ -237,9 +237,10 @@ def _update_plan(ctx: ToolContext):
         steps_now = coordination.update_plan(ctx.job_id, steps, active_index, completed_indices)
         pending = [s["title"] for s in steps_now if s["status"] != "completed"]
         reply = json.dumps(steps_now)
-        if len(pending) >= 3 and ctx.state["delegations"] == 0:
-            reply += ("\nReminder: the second GPU is idle. If any of these pending steps don't depend on each other, run "
-                      "them now as helpers in one delegate_many call instead of one by one.")
+        if len(pending) >= 2 and ctx.state["delegations"] == 0:
+            reply += (f"\nReminder: the second GPU ({ctx.helper_model}) is idle. Hand the pending steps that don't need "
+                      "this conversation or each other's results to start_helpers now (they run in the background "
+                      "while you do the rest), or to delegate_many.")
         return reply
     return update_plan
 
@@ -298,6 +299,26 @@ def _generate_image(ctx: ToolContext):
     return generate_image
 
 
+# ---- pausing the task clock ----
+class paused_clock:
+    """The task's time limit doesn't run while it waits on someone else (the user's answer, Claude Code, Codex)."""
+    def __init__(self, ctx: ToolContext):
+        self.timer = ctx.state.get("timer")
+
+    async def __aenter__(self):
+        loop = asyncio.get_running_loop()
+        self.started = loop.time()
+        self.deadline = self.timer.when() if self.timer is not None else None
+        if self.deadline is not None:
+            self.timer.reschedule(None)
+        return self
+
+    async def __aexit__(self, *exc):
+        if self.deadline is not None:
+            self.timer.reschedule(self.deadline + (asyncio.get_running_loop().time() - self.started))
+        return False
+
+
 # ---- asking the user ----
 MAX_QUESTIONS = 5
 
@@ -319,17 +340,8 @@ def _ask_user(ctx: ToolContext):
         ctx.state["questions"] = asked_so_far + 1
         asked = asking.ask(ctx.job_id, question, options, wait_minutes)
         ctx.log("tool", "Waiting for your answer: " + describe(question, 140))
-        loop = asyncio.get_running_loop()
-        started = loop.time()
-        timer = ctx.state.get("timer")
-        deadline = timer.when() if timer is not None else None
-        if deadline is not None:
-            timer.reschedule(None)  # the task's time limit is paused while waiting for the user
-        try:
+        async with paused_clock(ctx):
             result = await asking.wait(asked["id"], ctx.budget.active)
-        finally:
-            if deadline is not None:
-                timer.reschedule(deadline + (loop.time() - started))
         if result["status"] == "answered":
             ctx.log("tool", "Got your answer: " + describe(result["answer"], 140))
             return f"The user answered: {result['answer']}"
@@ -407,13 +419,78 @@ def _delegate_many(ctx: ToolContext, run_helper):
     return delegate_many
 
 
+def _start_helpers(ctx: ToolContext, run_helper):
+    @function_tool
+    async def start_helpers(briefs: list[str]) -> str:
+        """Start 1-4 helper agents in the BACKGROUND on the other GPU and return at once, so you keep working while
+        they do. Each brief must be self-contained: goal, input files, the output file to write, what done looks
+        like. Get their reports with collect_helpers (always before your final reply)."""
+        ctx.budget.active()
+        briefs = [b.strip() for b in briefs if b and b.strip()]
+        if not briefs:
+            raise ValueError("Give at least one brief")
+        running = ctx.state.setdefault("background", {})
+        busy = sum(1 for item in running.values() if not item["task"].done())
+        if busy + len(briefs) > MAX_PARALLEL_HELPERS:
+            raise ValueError(f"At most {MAX_PARALLEL_HELPERS} background helpers at once ({busy} running); "
+                             "collect_helpers first")
+        started = []
+        for brief in briefs:
+            ident = f"h{len(running) + 1}"
+            running[ident] = {"brief": brief, "task": asyncio.ensure_future(run_helper(brief, ctx.helper_model)),
+                              "collected": False}
+            started.append(ident)
+        return (f"Started {', '.join(started)} on {ctx.helper_model}. Keep working on other steps; call collect_helpers "
+                "to get their reports.")
+    return start_helpers
+
+
+def _collect_helpers(ctx: ToolContext):
+    @function_tool
+    async def collect_helpers(wait_seconds: int = 900) -> str:
+        """Reports from background helpers (start_helpers). Waits up to wait_seconds (0-1800) for the running ones,
+        returns every finished report not collected before, and lists any still running."""
+        ctx.budget.active()
+        running = ctx.state.get("background") or {}
+        pending = [item["task"] for item in running.values() if not item["task"].done()]
+        if pending and wait_seconds > 0:
+            await asyncio.wait(pending, timeout=max(0, min(wait_seconds, 1800)))
+        parts, still = [], []
+        for ident, item in running.items():
+            if not item["task"].done():
+                still.append(ident)
+                continue
+            if item["collected"]:
+                continue
+            item["collected"] = True
+            try:
+                report = item["task"].result()
+            except BaseException as error:  # noqa: BLE001  (a stopped or failed helper)
+                report = f"Helper failed: {type(error).__name__}"
+            parts.append(f"### {ident}: {item['brief'][:80]}\n{sandbox.trim(report, 8000)}")
+        if not parts and not still:
+            return "No background helpers to collect."
+        if still:
+            parts.append("Still running: " + ", ".join(still) + ". Call collect_helpers again for them.")
+        return "\n\n".join(parts)
+    return collect_helpers
+
+
+def cancel_background(state: dict) -> None:
+    """Stop background helpers the lead never collected (the task ended)."""
+    for item in (state.get("background") or {}).values():
+        if not item["task"].done():
+            item["task"].cancel()
+
+
 # ---- hand-off to frontier agents ----
 def _hand_off(ctx: ToolContext):
     async def hand_off(kind: str, task: str) -> str:
         ctx.budget.active()
         label = "Claude Code" if kind == "claude" else "Codex"
         ctx.log("tool", f"Asking {label}: {task[:120]}")
-        result = await escalate.run(kind, ctx.space, ctx.job_id, task)
+        async with paused_clock(ctx):
+            result = await escalate.run(kind, ctx.space, ctx.job_id, task)
         if not result.get("ok"):
             why = result.get("error") or ("it timed out" if result.get("timed_out") else
                                           f"it exited with code {result.get('exit_code')}")
@@ -504,7 +581,9 @@ def build_tools(ctx: ToolContext) -> list:
     delegate, delegate_many = _delegate(ctx, run_helper), _delegate_many(ctx, run_helper)
 
     tools = workspace_tools + [share_file] + research_tools + [recall, remember, recent_posts, topic_stats, update_plan,
-                                                               queue_next_phase, delegate, delegate_many, _ask_user(ctx)]
+                                                               queue_next_phase, delegate, delegate_many,
+                                                               _start_helpers(ctx, run_helper), _collect_helpers(ctx),
+                                                               _ask_user(ctx)]
     tools += jev_tools
     tools += ctx.state.get("connector_tools", [])  # the owner's MCP servers and APIs (connectors.py), opened by run_job
     if job["allow_images"]:
