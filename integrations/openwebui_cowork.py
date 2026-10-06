@@ -29,6 +29,7 @@ Owner commands: `/connections` (status of everything) · `/connect claude TOKEN`
 `/connect tiktok OPEN_ID ACCESS_TOKEN` (add `refresh_token=… client_key=… client_secret=…` for automatic renewal) ·
 `/connect bluesky HANDLE APP_PASSWORD` · `/connect github TOKEN` · `/connect telegram BOT_TOKEN` (use Cowork from
 Telegram) · `/connect higgsfield` (sign in with your existing account; `off` disconnects) ·
+`/connect typesafe API_KEY` (Jev, TypeSafe's judgment model; `off` disconnects) ·
 `/connect mcp NAME URL [bearer=KEY]` or `/connect mcp NAME stdio COMMAND… [env:KEY=value]` (MCP servers) ·
 `/connect api NAME BASE_URL [bearer=KEY] [header="Name: value"] [about="…"]` (HTTP APIs). Approve a drafted post with `approve post N`."""
 
@@ -355,9 +356,11 @@ class Pipe:
                         yield "Only the owner can manage connections."
                         return
                     info = await self._call(client, "GET", "/api/connections")
-                    rows = [f"- **{'Claude Code' if k == 'claude' else 'Codex'}**: "
+                    labels = {"claude": ("Claude Code", "tasks"), "codex": ("Codex", "tasks"), "jev": ("Jev (TypeSafe)", "requests")}
+                    rows = [f"- **{labels.get(k, (k, ''))[0]}**: "
                             f"{'connected' if v['signed_in'] else 'not connected'}{'' if v['installed'] else ' (not installed)'}; "
-                            f"{v['used_today']}/{v['daily_limit']} tasks in the last 24 h" for k, v in info.items()]
+                            f"{v['used_today']}/{v['daily_limit']} {labels.get(k, (k, 'tasks'))[1]} in the last 24 h"
+                            for k, v in info.items()]
                     social = await self._call(client, "GET", "/api/connections/social")
                     names = {"x": "X", "instagram": "Instagram (posting)", "tiktok": "TikTok (analytics)", "bluesky": "Bluesky", "github": "GitHub",
                              "scrapecreators": "ScrapeCreators (optional)"}
@@ -508,6 +511,23 @@ class Pipe:
                         return
                     staged = await self._call(client, "POST", "/api/admin/code", json={"ref": parts[1]})
                     yield f"Staged `{staged['staged'][:12]}` ({staged['files']} files). Restart the instance (not recycle) to run it."
+                    return
+                if command.split()[:2] == ["/connect", "typesafe"]:
+                    if tier != "owner":
+                        yield "Only the owner can manage connections."
+                        return
+                    key = request_text.split(None, 2)[2].strip() if len(request_text.split(None, 2)) == 3 else ""
+                    if not key:
+                        yield "Send `/connect typesafe <your TypeSafe API key>` (it starts with apikey_), or `/connect typesafe off`."
+                        return
+                    try:
+                        info = await self._call(client, "POST", "/api/connections/typesafe", json={"token": key})
+                    except ValueError as error:
+                        yield f"Not saved: {connection_error(error, request_text)}"
+                        return
+                    yield ("Jev (TypeSafe) is connected. Cowork will use it for classifying, ranking, scoring and checking "
+                           "when that fits, and Claude Code gets the key for TypeSafe builds. You can delete this message from "
+                           "the chat (the key is stored only on the box)." if info.get("signed_in") else "Jev (TypeSafe) is disconnected.")
                     return
                 if command.startswith("/connect claude"):
                     if tier != "owner":

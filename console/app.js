@@ -518,7 +518,7 @@ async function loadPeople() {
   $('people').replaceChildren(head, ...rows);
   const c = o.connections || {};
   if (c.error) kv('connections', [['Status', c.error]]);
-  else kv('connections', Object.entries(c).map(([k, v]) => [k === 'claude' ? 'Claude Code' : 'Codex', `${v.signed_in ? 'connected' : 'not connected'}${v.installed ? '' : ' (not installed)'} · ${v.used_today}/${v.daily_limit} today`]));
+  else kv('connections', Object.entries(c).map(([k, v]) => [({claude: 'Claude Code', codex: 'Codex', jev: 'Jev (TypeSafe)'})[k] || k, `${v.signed_in ? 'connected' : 'not connected'}${v.installed ? '' : ' (not installed)'} · ${v.used_today}/${v.daily_limit} today`]));
   try {
     const [social, posts] = await Promise.all([api('connections/social'), api('posts')]);
     const names = {x: 'X', instagram: 'Instagram posting', tiktok: 'TikTok analytics', bluesky: 'Bluesky', github: 'GitHub', scrapecreators: 'ScrapeCreators'};

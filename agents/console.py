@@ -49,6 +49,10 @@ class TokenIn(BaseModel):
     token: str = Field(min_length=20, max_length=400)
 
 
+class KeyIn(BaseModel):
+    token: str = Field(min_length=2, max_length=400)  # an API key, or "off"
+
+
 class SocialIn(BaseModel):
     service: str = Field(min_length=1, max_length=40)
     words: list[str] = Field(default_factory=list, max_length=8)
@@ -645,6 +649,13 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         import escalate
         escalate.save_claude_token(body.token)
         return escalate.status()["claude"]
+
+    @app.post("/api/connections/typesafe")
+    def connect_typesafe(body: KeyIn):
+        """/connect typesafe <API key> (or off) from an owner chat: Jev for Cowork, and TYPESAFE_API_KEY for Claude Code."""
+        import jev
+        jev.save_key(body.token)
+        return jev.status()
 
     @app.post("/api/admin/code")
     async def stage_code(body: CodeIn):
