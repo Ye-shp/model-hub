@@ -74,7 +74,7 @@ def make_agent(ctx: ToolContext, tools: list) -> Agent:
                  model_settings=settings(ctx, profile["tokens"], profile["effort"], True),
                  instructions=instructions(ctx.job, ctx.space, escalation=ctx.escalation, plan_text=read_plan(ctx.space),
                                            history=recap(ctx.job), phone=ctx.phone, research=ctx.research_status,
-                                           connected=ctx.state.get("connector_notes", "")))
+                                           connected=ctx.state.get("connector_notes", ""), jev=ctx.state.get("jev", False)))
 
 
 def build(job: dict, client, gate: asyncio.Semaphore, space: sandbox.Workspace, state: dict | None = None) -> Agent:

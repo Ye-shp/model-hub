@@ -350,7 +350,7 @@ def make_helper(ctx: ToolContext, model: str, helper_tools: list) -> Agent:
     return Agent(name="helper", model=AdaptiveModel(model, ctx.client, ctx.gate, ctx.before),
                  tools=helper_tools,
                  model_settings=settings(ctx, profile["tokens"], "low" if profile["effort"] == "low" else "medium", False),
-                 instructions=instructions(ctx.job, ctx.space, helper=True))
+                 instructions=instructions(ctx.job, ctx.space, helper=True, jev=ctx.state.get("jev", False)))
 
 
 def _run_helper(ctx: ToolContext, helper_tools: list):
@@ -434,6 +434,35 @@ def _ask_claude(ctx: ToolContext, hand_off):
     return ask_claude
 
 
+def _ask_jev(ctx: ToolContext):
+    @function_tool
+    async def ask_jev(state_json: str, questions_json: str) -> str:
+        """Ask Jev (TypeSafe's System One model) typed questions about some state, for classifying, routing, ranking,
+        scoring or checking items. Fast and cheap; see JEV in your instructions. state_json: the item(s) as JSON (an
+        object with named fields) or plain text. questions_json: {"id": {"type": "noul" | "choice" | "score",
+        "instructions": "...", "criteria": ...}} where choice criteria = {"option": "meaning", ...}, score criteria =
+        ["lowest level", ..., "highest level"] (2-10), noul criteria optional {"true": "...", "false": "..."}. Several
+        questions per call are answered in parallel. Returns each answer with probabilities and confidence."""
+        import jev
+        ctx.budget.active()
+        try:
+            state = json.loads(state_json)
+        except ValueError:
+            state = state_json  # plain text is valid state
+        try:
+            questions = jev.check_questions(json.loads(questions_json))
+        except ValueError as error:
+            return f"Not sent to Jev: {error}"
+        ctx.log("tool", "Asking Jev: " + ", ".join(list(questions)[:8]))
+        ws.event(ctx.job_id, "escalation", "jev: " + ", ".join(list(questions)[:8]))
+        result = await jev.ask(state, questions)
+        ws.event(ctx.job_id, "escalation-done", "jev: " + ("finished" if "answers" in result else "failed"))
+        if "error" in result:
+            return f"Jev failed: {result['error']}. Make this judgment yourself instead and say Jev was unavailable."
+        return json.dumps(result, ensure_ascii=False)
+    return ask_jev
+
+
 def _ask_codex(ctx: ToolContext, hand_off):
     @function_tool
     async def ask_codex(task: str) -> str:
@@ -466,11 +495,17 @@ def build_tools(ctx: ToolContext) -> list:
     # never posting.
     helper_research = [t for t in research_list if t.name not in research_module.OWNER_ONLY_TOOLS]
 
-    run_helper = _run_helper(ctx, workspace_tools + research_tools + helper_research)
+    # Jev (TypeSafe), for the owner's tasks that may use paid frontier models; helpers get it too for bulk judgments.
+    import jev
+    ctx.state["jev"] = bool(space.is_owner and job["allow_frontier"] and jev.available() is None)
+    jev_tools = [_ask_jev(ctx)] if ctx.state["jev"] else []
+
+    run_helper = _run_helper(ctx, workspace_tools + research_tools + helper_research + jev_tools)
     delegate, delegate_many = _delegate(ctx, run_helper), _delegate_many(ctx, run_helper)
 
     tools = workspace_tools + [share_file] + research_tools + [recall, remember, recent_posts, topic_stats, update_plan,
                                                                queue_next_phase, delegate, delegate_many, _ask_user(ctx)]
+    tools += jev_tools
     tools += ctx.state.get("connector_tools", [])  # the owner's MCP servers and APIs (connectors.py), opened by run_job
     if job["allow_images"]:
         tools.append(_generate_image(ctx))

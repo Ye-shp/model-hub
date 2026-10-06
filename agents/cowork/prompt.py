@@ -1,6 +1,8 @@
 """The system prompt."""
 from __future__ import annotations
 
+import re
+
 from datetime import datetime, timezone
 
 import sandbox
@@ -10,7 +12,8 @@ from .config import PLAN_FILE, PROFILES, RESEARCH_GUIDE, TOOLBOX
 
 
 def instructions(job: dict, space: sandbox.Workspace, helper: bool = False, escalation: list[str] | None = None,
-                 plan_text: str = "", history: str = "", phone: bool = False, research: str = "", connected: str = "") -> str:
+                 plan_text: str = "", history: str = "", phone: bool = False, research: str = "", connected: str = "",
+                 jev: bool = False) -> str:
     now = datetime.now(timezone.utc)
     today = f"{now:%A %d %B %Y} (it is {now.year}: search for {now.year} information, not earlier years, when asked about 'now')"
     shared = ("Deliverables: write them as files in the workspace (reports .md/.docx/.pdf, tables .csv/.xlsx, code, media) "
@@ -24,6 +27,14 @@ def instructions(job: dict, space: sandbox.Workspace, helper: bool = False, esca
         if job.get("skill") == "tor-fetcher" or ".onion" in (job.get("task") or "").lower():
             from skills import load_skill
             tor_guidance += ["", "TOR PAGE READING", load_skill("tor-fetcher")["instructions"]]
+    jev_guidance = []
+    if jev:
+        import jev as jev_module
+        jev_guidance = ["", jev_module.GUIDE]
+        task_text = (job.get("task") or "").lower()
+        if not helper and ("typesafe" in task_text or re.search(r"\bjev\b", task_text)):
+            from skills import load_skill
+            jev_guidance += ["", "BUILDING WITH TYPESAFE (the skill Claude Code also has)", load_skill("typesafe")["instructions"]]
     if helper:
         return (f"You are a helper agent working for Qwen Cowork on one sub-task. Today is {today}.\n"
                 f"Workspace folder (shared with the lead agent): {space.dir}\n{TOOLBOX}\n\n"
@@ -32,7 +43,8 @@ def instructions(job: dict, space: sandbox.Workspace, helper: bool = False, esca
                 "Do the sub-task completely with your tools. Look up anything current on the web and keep source URLs. "
                 "Save substantial output to files in the workspace. Your final message goes back to the lead agent: "
                 "give the findings or result, the file paths you wrote, and sources. Never invent results or sources."
-                + ("\n" + "\n".join(tor_guidance) if tor_guidance else ""))
+                + ("\n" + "\n".join(tor_guidance) if tor_guidance else "")
+                + ("\n".join(jev_guidance) if jev_guidance else ""))
     minutes = PROFILES[job["profile"]]["seconds"] // 60
     lines = [
         "You are Qwen Cowork, an autonomous assistant running on your owner's own GPU server. The user tells you what they "
@@ -87,6 +99,7 @@ def instructions(job: dict, space: sandbox.Workspace, helper: bool = False, esca
                   "or when the user asks for Claude or ChatGPT/Codex. Don't use them for things you can do yourself: they are "
                   "rate-limited. Give a complete brief (goal, files, constraints, what done looks like), then check what they "
                   "produced before reporting back. If a hand-off fails, the task stops and reports it."]
+    lines += jev_guidance
     if research:
         lines += ["", RESEARCH_GUIDE, research]
     if connected:

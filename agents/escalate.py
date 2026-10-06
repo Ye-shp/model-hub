@@ -57,7 +57,46 @@ def claude_env() -> dict:
     saved = token_file()
     if saved.is_file():  # a token sent from the chat wins over the instance setting (it is the newer one)
         env["CLAUDE_CODE_OAUTH_TOKEN"] = saved.read_text().strip()
+    import jev
+    if jev.api_key():  # for TypeSafe integrations Claude Code builds and tests (see CLAUDE_PLUGINS)
+        env["TYPESAFE_API_KEY"] = jev.api_key()
     return {**QUIET, **env}
+
+
+# Claude Code plugins installed for the owner's sandbox user before its first hand-off (kept in its home folder):
+# (marketplace source, plugin@marketplace).
+CLAUDE_PLUGINS = [("typesafe-ai/skills", "typesafe@typesafe-ai")]
+
+
+async def ensure_claude_plugins(workspace: Workspace, job_id: str | None = None) -> list[str]:
+    """Install any missing CLAUDE_PLUGINS once; a failure is logged and retried on the next hand-off, never fatal."""
+    import store
+    marker = store.DATA / "claude-plugins.json"  # root-only, beside the Claude token
+    try:
+        done = set(json.loads(marker.read_text()))
+    except (OSError, ValueError):
+        done = set()
+    installed = []
+    for source, plugin in CLAUDE_PLUGINS:
+        if plugin in done:
+            continue
+        ok = True
+        for command in ([binary("claude"), "plugin", "marketplace", "add", source],
+                        [binary("claude"), "plugin", "install", plugin]):
+            result = await workspace.run(command, timeout=300, extra_env=claude_env())
+            text = result["output"].lower()
+            if result["exit_code"] != 0 and "already" not in text:
+                ok = False
+                if job_id:
+                    ws.event(job_id, "tool", f"Claude Code plugin {plugin} not installed yet: {trim(result['output'], 300)}")
+                break
+        if ok:
+            done.add(plugin)
+            installed.append(plugin)
+    if installed:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps(sorted(done)))
+    return installed
 
 
 def codex_env() -> dict:
@@ -72,6 +111,7 @@ def status() -> dict:
         "codex": {"installed": bool(binary("codex")),
                   "signed_in": bool(codex_env()) or (home / ".codex" / "auth.json").is_file(),
                   "used_today": used_today("codex"), "daily_limit": DAILY["codex"]},
+        "jev": __import__("jev").status(),
     }
 
 
@@ -103,6 +143,7 @@ async def run(kind: str, workspace: Workspace, job_id: str, task: str, timeout: 
     started = time.monotonic()
     prompt = BRIEFING + task
     if kind == "claude":
+        await ensure_claude_plugins(workspace, job_id)
         command = [binary("claude"), "-p", prompt, "--output-format", "json", "--dangerously-skip-permissions",
                    "--max-turns", os.environ.get("CLAUDE_MAX_TURNS", "60")]
         if os.environ.get("CLAUDE_MODEL"):
