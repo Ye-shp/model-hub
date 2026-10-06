@@ -24,6 +24,8 @@ def load_env(path: Path = HERE / ".env") -> None:
 
 
 load_env()
+import reasoning  # Its storage imports must see HUB_DATA_DIR from agents/.env.
+
 # The Agents SDK uploads traces to OpenAI by default. Keep everything on your own hardware.
 set_tracing_disabled(True)
 
@@ -58,9 +60,15 @@ class StreamingModel(OpenAIChatCompletionsModel):
             if self.before_call:
                 self.before_call(self.model)
             response = None
-            async for event in super(StreamingModel, self).stream_response(*args, **kwargs):
-                if event.type == "response.completed":
-                    response = event.response
+            thoughts = reasoning.buffer(self.model)
+            try:
+                async for event in super(StreamingModel, self).stream_response(*args, **kwargs):
+                    if event.type in reasoning.REASONING_DELTAS:
+                        thoughts.append(event.delta)
+                    elif event.type == "response.completed":
+                        response = event.response
+            finally:
+                thoughts.close()
             if response is None or not response.output:
                 raise RuntimeError("Model stream ended without a complete response. Try a smaller task or output limit.")
             raw = response.usage

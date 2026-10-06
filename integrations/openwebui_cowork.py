@@ -6,6 +6,7 @@ version: 1.0.0
 """
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import re
@@ -34,7 +35,7 @@ Telegram) · `/connect higgsfield` (sign in with your existing account; `off` di
 `/connect api NAME BASE_URL [bearer=KEY] [header="Name: value"] [about="…"]` (HTTP APIs). Approve a drafted post with `approve post N`."""
 
 SKIP = {"model", "usage", "queued", "completed", "failed", "interrupted", "cancelled", "resumed", "frontier-call", "partial",
-        "next-phase"}
+        "next-phase", "reasoning"}
 
 
 def question_text(question: dict) -> str:
@@ -85,6 +86,21 @@ def hide_higgsfield_auth(text: str) -> str:
     pattern = r"https://clerk\.higgsfield\.ai/oauth/authorize(?:\?[^\s<>)]*)?"
     pattern += r"|https?://[^\s<>)]*/api/connections/higgsfield/callback\?[^\s<>)]*"
     return re.sub(pattern, "(Higgsfield sign-in details, hidden)", text, flags=re.IGNORECASE)
+
+
+def assistant_history(text: str) -> str:
+    """Keep prior replies, excluding displayed reasoning and generated progress blocks."""
+    text = re.sub(r"<details\b[^>]*>[\s\S]*?(?:</details\s*>|$)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<(think|thinking|reason|reasoning|thought)\b[^>]*>[\s\S]*?(?:</\1\s*>|$)",
+                  "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<\|begin_of_thought\|>[\s\S]*?(?:<\|end_of_thought\|>|$)", "", text)
+    return text.strip()
+
+
+def reasoning_delta(text: str) -> str:
+    """Open WebUI's native expandable Thinking output; never a status description."""
+    return "data: " + json.dumps({"choices": [{"index": 0, "delta": {"reasoning_content": text},
+                                             "finish_reason": None}]}) + "\n\n"
 
 
 CHAT_HELP = """**Qwen (chat)** — talk to Qwen. It answers directly and uses the same tools as Cowork (web, shell and files,
@@ -144,9 +160,21 @@ class Pipe:
         return "\n".join(texts), images
 
     @staticmethod
-    def _thread(metadata: dict, chat_id) -> str:
-        raw = chat_id or (metadata or {}).get("chat_id") or (metadata or {}).get("session_id") or "chat"
-        return re.sub(r"[^A-Za-z0-9_-]", "-", str(raw))[:80] or "chat"
+    def _thread(metadata: dict, chat_id, body: dict = None) -> str | None:
+        metadata, body = metadata or {}, body or {}
+        nested = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+        candidates = (chat_id, metadata.get("chat_id"), body.get("chat_id"), nested.get("chat_id"))
+        raw = next((value for value in candidates if isinstance(value, str) and value.strip()), None)
+        if raw is None:
+            return None  # a browser session is shared by multiple chats; it is not a conversation ID
+        if raw.startswith(("temporary:", "local:")):
+            return None  # Open WebUI gives temporary chats a browser-wide socket ID
+        # Keep ordinary existing IDs/folders. Hash unusual/long IDs instead of
+        # sanitizing/truncating distinct conversations into the same workspace.
+        prefix = "id-sha256-"
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,80}", raw) and not raw.startswith(("-", prefix)) and not raw.endswith("-"):
+            return raw
+        return prefix + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     async def _status(self, emit, text: str, done: bool = False):
         if emit:
@@ -283,6 +311,10 @@ class Pipe:
                     plan = state.get("plan") or plan
                     for event in state["events"]:
                         after = max(after, event["id"])
+                        if event["kind"] == "reasoning":
+                            if body.get("stream", True) and event.get("detail"):
+                                yield reasoning_delta(event["detail"])
+                            continue
                         text = self._describe(event, plan)
                         if text and text != last_status:
                             await self._status(emit, text)
@@ -348,7 +380,7 @@ class Pipe:
         request_text = request_text.strip()
         command = request_text.lower()
         project = "default" if tier == "owner" else "friends"
-        thread = self._thread(__metadata__, __chat_id__)
+        thread = self._thread(__metadata__, __chat_id__, body)
         emit = __event_emitter__
         try:
             async with self._client() as client:
@@ -560,6 +592,13 @@ class Pipe:
                             "ChatGPT → Settings → Security, then send `/connect codex` again.")
                     return
 
+                if thread is None:
+                    await self._status(emit, "This conversation has no chat ID", done=True)
+                    yield ("I couldn't identify this conversation, so I haven't started a task or opened a shared workspace. "
+                           "If Temporary Chat is enabled, turn it off or save this conversation first. "
+                           "Otherwise refresh the page or open a new chat and try again.")
+                    return
+
                 if request_text and not command.startswith("/") and command not in {"status", "continue watching"}:
                     waiting = await self._call(client, "GET", "/api/thread/active", params={
                         "project": project, "thread": thread, "requested_by": user.get("email") or ""})
@@ -587,7 +626,8 @@ class Pipe:
                 history, used = [], 0
                 for message in reversed(messages[:-1]):
                     text, pictures = self._text(message.get("content"))
-                    text = re.sub(r"<details[\s\S]*?</details>", "", text).strip()
+                    if message["role"] == "assistant":
+                        text = assistant_history(text)
                     if text.lower().startswith("/connect"):  # sign-ins never go to the model
                         text = "(connection command, hidden)"
                     text = hide_higgsfield_auth(text)

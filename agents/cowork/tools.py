@@ -166,21 +166,21 @@ def _read_onion_page(ctx: ToolContext):
     return read_onion_page
 
 
-# ---- project memory and collected posts ----
+# ---- chat memory and shared collected posts ----
 def _recall(ctx: ToolContext):
     @function_tool
     def recall(query: str = "") -> str:
-        """Search saved project memory: the user's preferences, decisions and facts from earlier work."""
-        return ws.bounded_json(ws.memories(ctx.project, query), limit=8000)
+        """Search preferences, decisions and facts saved in this chat only."""
+        return ws.bounded_json(ws.memories(ctx.project, query, thread=ctx.space.thread), limit=8000)
     return recall
 
 
 def _remember(ctx: ToolContext):
     @function_tool
     def remember(title: str, content: str, kind: str = "fact") -> str:
-        """Save a lasting note to project memory. kind: fact, decision, preference, checkpoint or question."""
+        """Save a lasting note in this chat only. kind: fact, decision, preference, checkpoint or question."""
         ctx.budget.active()
-        identity = ws.save_note(ctx.project, title, content, kind, [f"job:{ctx.job_id}"])
+        identity = ws.save_note(ctx.project, title, content, kind, [f"job:{ctx.job_id}"], thread=ctx.space.thread)
         ctx.log("memory", f"Saved note: {title}")
         return f"Saved memory {identity}"
     return remember

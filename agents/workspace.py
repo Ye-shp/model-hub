@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS notes (
   id INTEGER PRIMARY KEY, project TEXT NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL,
   kind TEXT NOT NULL, sources TEXT NOT NULL DEFAULT '[]', updated_at TEXT NOT NULL,
-  UNIQUE(project, title)
+  thread TEXT NOT NULL DEFAULT '', UNIQUE(project, thread, title)
 );
 CREATE TABLE IF NOT EXISTS documents (
   id TEXT PRIMARY KEY, project TEXT NOT NULL, title TEXT NOT NULL, source TEXT NOT NULL,
@@ -81,11 +81,53 @@ def init() -> None:
                 db.execute(f"ALTER TABLE jobs ADD COLUMN {name} TEXT")
         db.execute("CREATE INDEX IF NOT EXISTS jobs_thread ON jobs(project, thread, created_at)")
         db.execute("CREATE INDEX IF NOT EXISTS events_job ON events(job_id, id)")
+        _migrate_note_threads(db)
         db.commit()
     import asking  # questions a running Cowork task asks its user (asking.py)
     asking.init()
     import coordination
     coordination.init()
+
+
+def _migrate_note_threads(db) -> None:
+    """Preserve old notes and their IDs, assigning only provable chat origins.
+
+    The old project/title constraint must be replaced so two chats can save the
+    same title. Unattributable or mixed sources stay in the preserved global pool;
+    an ordinary chat never reads that pool implicitly.
+    """
+    if "thread" in {r[1] for r in db.execute("PRAGMA table_info(notes)")}:
+        return
+    jobs = {r["id"]: dict(r) for r in db.execute("SELECT id,project,thread FROM jobs")}
+
+    def origin(note):
+        try:
+            sources = json.loads(note["sources"])
+        except (ValueError, TypeError):
+            return ""
+        if not isinstance(sources, list) or not sources:
+            return ""
+        threads = set()
+        for source in sources:
+            if not isinstance(source, str) or not source.startswith("job:"):
+                return ""
+            job = jobs.get(source[4:])
+            thread = (job or {}).get("thread")
+            if not job or job["project"] != note["project"] or not isinstance(thread, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", thread):
+                return ""
+            # The workspace uses sandbox.clean_thread's stripped folder name.
+            threads.add(thread.strip("-"))
+        return next(iter(threads)) if len(threads) == 1 else ""
+
+    rows = list(db.execute("SELECT * FROM notes"))
+    db.execute("""CREATE TABLE notes_scoped (
+      id INTEGER PRIMARY KEY, project TEXT NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL,
+      kind TEXT NOT NULL, sources TEXT NOT NULL DEFAULT '[]', updated_at TEXT NOT NULL,
+      thread TEXT NOT NULL DEFAULT '', UNIQUE(project, thread, title))""")
+    db.executemany("INSERT INTO notes_scoped(id,project,title,content,kind,sources,updated_at,thread) VALUES (?,?,?,?,?,?,?,?)",
+                   [(r["id"], r["project"], r["title"], r["content"], r["kind"], r["sources"], r["updated_at"], origin(r)) for r in rows])
+    db.execute("DROP TABLE notes")
+    db.execute("ALTER TABLE notes_scoped RENAME TO notes")
 
 
 def query(sql: str, params: tuple = ()) -> list[dict]:
@@ -115,19 +157,23 @@ def create_project(name: str, brief: str = "") -> str:
     return project
 
 
-def save_note(project: str, title: str, content: str, kind: str = "fact", sources: list[str] | None = None) -> int:
+def save_note(project: str, title: str, content: str, kind: str = "fact", sources: list[str] | None = None,
+              thread: str | None = None) -> int:
     if not project_exists(project):
         raise ValueError("Unknown project")
     if kind not in {"fact", "decision", "preference", "checkpoint", "question"}:
         raise ValueError("Unknown memory kind")
     if not title.strip() or len(title) > 160 or len(content) > 12000:
         raise ValueError("Memory title/content exceeds its limit")
+    if thread is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", thread):
+        raise ValueError("Invalid memory thread")
+    scope = thread or ""
     with connection() as db, db:
-        db.execute("""INSERT INTO notes(project,title,content,kind,sources,updated_at) VALUES (?,?,?,?,?,?)
-          ON CONFLICT(project,title) DO UPDATE SET content=excluded.content,kind=excluded.kind,
+        db.execute("""INSERT INTO notes(project,title,content,kind,sources,updated_at,thread) VALUES (?,?,?,?,?,?,?)
+          ON CONFLICT(project,thread,title) DO UPDATE SET content=excluded.content,kind=excluded.kind,
           sources=excluded.sources,updated_at=excluded.updated_at""",
-                   (project, title, content, kind, json.dumps(sources or []), store.now()))
-        note = db.execute("SELECT id FROM notes WHERE project=? AND title=?", (project, title)).fetchone()[0]
+                   (project, title, content, kind, json.dumps(sources or []), store.now(), scope))
+        note = db.execute("SELECT id FROM notes WHERE project=? AND thread=? AND title=?", (project, scope, title)).fetchone()[0]
     embed_note(note, project, f"{title}\n{content}")
     return note
 
@@ -216,19 +262,23 @@ def _mix(cos: float, keyword: float, vector_weight: float) -> float:
     return vector_weight * (cos + 1) / 2 + (1 - vector_weight) * keyword
 
 
-def memories(project: str, search: str = "", limit: int = 10) -> list[dict]:
+def memories(project: str, search: str = "", limit: int = 10, thread: str | None = None) -> list[dict]:
+    """Project-wide for the console/teams, or strictly one chat when thread is supplied."""
     limit = max(1, min(limit, 30))
-    like = ("SELECT * FROM notes WHERE project=? AND (title LIKE ? OR content LIKE ?) ORDER BY updated_at DESC, id DESC LIMIT ?",
-            (project, f"%{search}%", f"%{search}%", limit))
+    if thread is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", thread):
+        raise ValueError("Invalid memory thread")
+    scope, params = ("project=?", (project,)) if thread is None else ("project=? AND thread=?", (project, thread))
+    like = (f"SELECT * FROM notes WHERE {scope} AND (title LIKE ? OR content LIKE ?) ORDER BY updated_at DESC, id DESC LIMIT ?",
+            (*params, f"%{search}%", f"%{search}%", limit))
     if not search:
         return query(*like)
     qvec = (_embed_texts([search]) or [None])[0]
     if qvec is None:
         return query(*like)
-    hits = {r["id"]: i for i, r in enumerate(query("SELECT id FROM notes WHERE project=? AND (title LIKE ? OR content LIKE ?) "
-                                                    "ORDER BY updated_at DESC, id DESC", like[1][:3]), 1)}
+    hits = {r["id"]: i for i, r in enumerate(query(f"SELECT id FROM notes WHERE {scope} AND (title LIKE ? OR content LIKE ?) "
+                                                    "ORDER BY updated_at DESC, id DESC", like[1][:-1]), 1)}
     stored = vectors(project, "note", dim=len(qvec))
-    notes = query("SELECT * FROM notes WHERE project=? ORDER BY updated_at DESC, id DESC", (project,))
+    notes = query(f"SELECT * FROM notes WHERE {scope} ORDER BY updated_at DESC, id DESC", params)
     scored = []
     for position, note in enumerate(notes):
         cos = semantic.cosine(qvec, stored[f"note:{note['id']}"]) if f"note:{note['id']}" in stored else -1.0
