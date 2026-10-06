@@ -269,6 +269,11 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
         if not owner:  # friends don't use the owner's accounts
             for key in ("AUTH_TOKEN", "CT0", "BSKY_HANDLE", "BSKY_APP_PASSWORD", "SCRAPECREATORS_API_KEY", "GITHUB_TOKEN"):
                 env.pop(key, None)
+        from cowork import judge
+        if judge.enabled(job):  # the engine's reranker scores each result's relevance with Jev (vendor lib/jev_rerank.py)
+            import jev
+            env.update(TYPESAFE_API_KEY=jev.api_key(), TYPESAFE_URL=jev.URL, TYPESAFE_MODEL=jev.MODEL)
+            ws.event(job_id, "escalation", "jev: trend research ranking")
         log("tool", f"Researching the last {days} days: {topic[:100]}")
         process = await asyncio.create_subprocess_exec(*args, env=env, cwd=str(toolbox.TOOLS_DIR / "home"),
                                                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -294,11 +299,11 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
         async def run_social(command: str, args: dict) -> dict:
             return await toolbox.run_social(command, args, 300)
 
-        async def ask(content: list) -> str:
+        async def ask(content: list, max_tokens: int = 6000) -> str:
             budget.before(helper_model)
             async with gate:
                 response = await client.chat.completions.create(
-                    model=helper_model, messages=[{"role": "user", "content": content}], max_tokens=6000,
+                    model=helper_model, messages=[{"role": "user", "content": content}], max_tokens=max_tokens,
                     temperature=0.3, extra_body={"reasoning_effort": "medium"})
             return response.choices[0].message.content or ""
 
@@ -306,7 +311,12 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
             report, _, error = await probe(src, 10, folder)
             return report, error
 
+        async def screen(material: str):
+            from cowork import judge
+            return await judge.useful_know_how(job, material)
+
         return {"probe": video, "social": run_social, "ask": ask, "small_jpeg": small_jpeg, "facts": facts, "log": log,
+                "screen": screen,
                 "x_signed_in": owner and links.get("x", {}).get("connected", False),
                 "write_file": lambda text: space.write_text(f"{folder}/notes.md", text)}
 
@@ -574,6 +584,10 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
             if not approved_post(request_text, post_id):
                 raise PermissionError(f"Not approved: the user's current message must approve post {post_id} "
                                       f"(e.g. \"approve post {post_id}\"). Ask them.")
+            from cowork import judge
+            if await judge.confirms_approval(job, request_text, f"publish draft post #{post_id}") is False:
+                raise PermissionError(f"Not approved: the message mentions post {post_id} but doesn't clearly approve "
+                                      "publishing it now (negated, conditional or a question). Ask the user to confirm.")
             media = json.loads(post["media"] or "[]")
             log("tool", f"Publishing post #{post_id} to {post['platform']}")
             if post["platform"] == "x":

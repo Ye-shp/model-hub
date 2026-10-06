@@ -1,8 +1,8 @@
 """Before a new request starts: decide whether to ask the user anything first, and ask it in one go.
 
-Left to itself the lead agent almost never calls ask_user, so the decision is made here instead: one short model call
-(on the helper GPU, so the lead's GPU isn't held up) reads the request and either returns up to three questions or
-none. The questions go to the chat as one message; the task waits for the reply (or carries on with its own
+Left to itself the lead agent almost never calls ask_user, so the decision is made here instead. With Jev connected,
+Jev first decides whether questions are needed at all (most requests: no, so no model call); otherwise, or when they
+are, one short model call (on the helper GPU, so the lead's GPU isn't held up) writes up to three questions or none. The questions go to the chat as one message; the task waits for the reply (or carries on with its own
 assumptions when none comes) and then starts with the answers in hand.
 """
 from __future__ import annotations
@@ -21,6 +21,7 @@ from .intent import may_ask_first
 
 MAX_QUESTIONS = 3
 WAIT_MINUTES = 30
+SKIP_BELOW = 0.35  # Jev's probability that questions would change the result, under which none are asked
 PROMPT = """You decide whether an AI work assistant should ask its user anything BEFORE starting a request.
 Read the conversation and the current request. Ask when the answer would really change what gets made and the user
 hasn't said it: who the audience is, the platform or format, length or scope, tone or style, which of several valid
@@ -71,6 +72,13 @@ async def questions_for(job: dict, client, gate, model: str) -> list[dict]:
     """Questions worth asking before starting, or [] (also on any failure: asking is never worth failing a task)."""
     task = job.get("task") or ""
     if not may_ask_first(task):
+        return []
+    # Jev answers "does this need questions at all?" in seconds; the Qwen call below (which writes the questions)
+    # then only runs when it does. Without Jev, Qwen decides both.
+    from . import judge
+    chance = await judge.needs_questions(job)
+    if chance is not None and chance < SKIP_BELOW:
+        ws.event(job["id"], "tool", "No questions needed; starting")
         return []
     decider = Agent(name="kickoff", model=hub.model(model, client, gate), instructions=PROMPT,
                     model_settings=ModelSettings(max_tokens=2048, include_usage=True, extra_body={"reasoning_effort": "low"}))

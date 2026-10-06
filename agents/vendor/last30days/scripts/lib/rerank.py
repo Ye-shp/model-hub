@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 
-from . import http, providers, query, schema
+from . import http, jev_rerank, providers, query, schema
 
 
 # Penalty applied when a candidate does not mention the primary entity
@@ -94,6 +94,15 @@ def rerank_candidates(
         except (ValueError, KeyError, json.JSONDecodeError, OSError, http.HTTPError) as exc:
             import sys
             print(f"[Rerank] LLM reranking failed, using local fallback: {type(exc).__name__}: {exc}", file=sys.stderr)
+            _apply_fallback_scores(shortlisted, primary_entity=primary_entity)
+    elif shortlisted and model and jev_rerank.available():  # model is None in mock runs
+        # Model Hub: no reasoning provider here, so Jev (TypeSafe) scores relevance (lib/jev_rerank.py).
+        try:
+            _apply_llm_scores(shortlisted, jev_rerank.score(topic, plan, shortlisted, primary_entity,
+                                                            INTENT_SCORING_HINTS.get(plan.intent, "")))
+        except (ValueError, KeyError, TypeError, OSError, http.HTTPError) as exc:
+            import sys
+            print(f"[Rerank] Jev reranking failed, using local fallback: {type(exc).__name__}", file=sys.stderr)
             _apply_fallback_scores(shortlisted, primary_entity=primary_entity)
     else:
         _apply_fallback_scores(shortlisted, primary_entity=primary_entity)

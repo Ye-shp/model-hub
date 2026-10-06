@@ -161,8 +161,16 @@ def queue_continuation(job: dict, reason: str) -> str | None:
 BRIEF_INLINE_BYTES = 60_000
 
 
-def handoff_brief(job: dict, space: sandbox.Workspace, extra: str) -> str:
-    """Everything Claude Code needs when the user's message asks for it: the chat so far, the request, the plan."""
+WHY_CLAUDE = {
+    "asked": "The user explicitly asked for Claude in their current request. Do the part of the request they assigned to "
+             "Claude; when they gave Claude the whole request, do all of it.",
+    "code": "This request is mainly a software job, so the assistant handed it to you. Do all of it: build, run and test "
+            "the code, and fix what fails.",
+}
+
+
+def handoff_brief(job: dict, space: sandbox.Workspace, extra: str, why: str = "asked") -> str:
+    """Everything Claude Code needs when the request goes to it: the chat so far, the request, the plan."""
     parts = [job.get("task") or ""]
     if extra:
         parts.append(extra.strip())
@@ -172,9 +180,7 @@ def handoff_brief(job: dict, space: sandbox.Workspace, extra: str) -> str:
     earlier = recap(job)
     if earlier:
         parts.append(earlier)
-    parts.append("The user explicitly asked for Claude in their current request. Do the part of the request they "
-                 "assigned to Claude; when they gave Claude the whole request, do all of it. Files the user attached are "
-                 "in uploads/. Save deliverables as files in this folder.")
+    parts.append(WHY_CLAUDE[why] + " Files the user attached are in uploads/. Save deliverables as files in this folder.")
     brief = "\n\n".join(parts)
     if len(brief.encode("utf-8")) <= BRIEF_INLINE_BYTES:
         return brief
@@ -186,17 +192,48 @@ def handoff_brief(job: dict, space: sandbox.Workspace, extra: str) -> str:
 
 
 async def direct_claude(job: dict, space: sandbox.Workspace, state: dict, extra: str) -> dict | None:
-    """The user named Claude: hand the request to Claude Code first, rather than leaving that to Qwen's judgment."""
+    """Hand the request to Claude Code first when the user asked for Claude or (decided by Jev) it's mainly a coding
+    job, rather than leaving that to Qwen's judgment. Without Jev, only an explicit request for Claude counts."""
     task = job.get("task") or ""
-    if not (space.is_owner and job.get("allow_frontier") and wants_claude(task)) or is_automatic(task):
+    if not (space.is_owner and job.get("allow_frontier")) or is_automatic(task):
+        return None
+    from . import judge
+    if judge.enabled(job):
+        why, _ = await judge.claude_route(job)
+    else:
+        why = "asked" if wants_claude(task) else None
+    state["claude_route"] = why
+    if why is None:
         return None
     if escalate.available("claude") is not None:
-        ws.event(job["id"], "tool", "You asked for Claude, but " + escalate.available("claude"))
+        if why == "asked":
+            ws.event(job["id"], "tool", "You asked for Claude, but " + escalate.available("claude"))
         return None
-    ws.event(job["id"], "tool", "Handing your request to Claude Code (you asked for Claude)")
-    result = await escalate.run("claude", space, job["id"], handoff_brief(job, space, extra))
+    ws.event(job["id"], "tool", "Handing your request to Claude Code " +
+             ("(you asked for Claude)" if why == "asked" else "(it's mainly a coding job)"))
+    result = await escalate.run("claude", space, job["id"], handoff_brief(job, space, extra, why))
     state["claude_done"] = True
     return result
+
+
+def shared_files(job_id: str) -> list[str]:
+    return [r["name"] for r in ws.query("SELECT name FROM artifacts WHERE job_id=? ORDER BY created_at,rowid", (job_id,))]
+
+
+async def continue_after(job: dict, reason: str, report: str) -> bool:
+    """Queue the next part after a limit, unless Jev reads the report as finished (or blocked on the user)."""
+    from . import judge
+    done = await judge.finished(job, report)
+    if done is not None and done >= 0.8:
+        ws.event(job["id"], "tool", "The work looks finished; not continuing automatically")
+        return False
+    return bool(queue_continuation(job, reason))
+
+
+def log_usage(job_id: str, result) -> None:
+    usage = result.context_wrapper.usage
+    ws.event(job_id, "usage", json.dumps({"requests": usage.requests, "input_tokens": usage.input_tokens,
+                                          "output_tokens": usage.output_tokens}))
 
 
 async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
@@ -232,8 +269,9 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
                 ws.event(job["id"], "partial", f"the Claude Code hand-off failed ({why})")
                 return (f"⚠️ **Claude Code couldn't do this: {why}.**\n\n" + (handed.get("summary") or "").strip()[:3000]
                         + "\n\nSend the request again to retry with Claude, or tell me to do it myself instead.")
-            task_input += ("\n\nCLAUDE CODE HAS ALREADY WORKED ON THIS REQUEST (you asked for Claude, so it was handed "
-                           "over first). Its report:\n" + (handed.get("summary") or "(no summary)") +
+            task_input += ("\n\nCLAUDE CODE HAS ALREADY WORKED ON THIS REQUEST (" +
+                           ("you asked for Claude" if state.get("claude_route") == "asked" else "it's mainly a coding job") +
+                           ", so it was handed over first). Its report:\n" + (handed.get("summary") or "(no summary)") +
                            "\n\nNow check the files it made (list_files, open or run them), share the deliverables "
                            "with share_file, finish any part of the request the user did NOT give to Claude, and reply. "
                            "If its work is broken or incomplete, send the fixes back to it with ask_claude rather than "
@@ -241,13 +279,22 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
         try:
             async with asyncio.timeout(profile["seconds"]) as timer:
                 state["timer"] = timer  # ask_user and hand-offs move the deadline by the time spent waiting
-                result = await Runner.run(build(job, client, gate, space, state), task_input, max_turns=profile["turns"],
-                                          session=session, run_config=RUN_CONFIG,
-                                          error_handlers=out_of_turns(client, gate, profile["tokens"], job["id"], state))
-            usage = result.context_wrapper.usage
-            ws.event(job["id"], "usage", json.dumps({"requests": usage.requests, "input_tokens": usage.input_tokens,
-                                                     "output_tokens": usage.output_tokens}))
-            answer = str(result.final_output)
+                agent = build(job, client, gate, space, state)
+                handlers = out_of_turns(client, gate, profile["tokens"], job["id"], state)
+                result = await Runner.run(agent, task_input, max_turns=profile["turns"], session=session,
+                                          run_config=RUN_CONFIG, error_handlers=handlers)
+                log_usage(job["id"], result)
+                answer = str(result.final_output)
+                # Jev checks the reply against the request; one fix round when it falls short (Cowork only).
+                if job.get("skill") == "cowork" and not state.get("next") and not state.get("out_of_steps"):
+                    from . import judge
+                    gap = await judge.reply_gap(job, answer, shared_files(job["id"]))
+                    if gap:
+                        ws.event(job["id"], "tool", "Quality check: the reply falls short; finishing the missing parts")
+                        result = await Runner.run(agent, gap, max_turns=max(10, profile["turns"] // 3), session=session,
+                                                  run_config=RUN_CONFIG, error_handlers=handlers)
+                        log_usage(job["id"], result)
+                        answer = str(result.final_output)
         except Exception as error:
             if state.get("stop"):
                 reason, header = state["stop"], f"⚠️ **Stopped: {state['stop']}.**"
@@ -256,11 +303,14 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
                 minutes = profile["seconds"] // 60
                 reason = f"the {minutes}-minute time limit was reached"
                 ws.event(job["id"], "partial", reason)
-                if queue_continuation(job, reason):
+                ws.event(job["id"], "tool", "Writing up what was done")
+                report = await wrap_up(client, gate, profile, job, session, reason)
+                if await continue_after(job, reason, report):
                     header = f"⏱ **Reached the {minutes}-minute limit for one task; the next part has started automatically.**"
                 else:
                     header = (f"⏱ **Stopped at the {minutes}-minute time limit.** Reply **continue** to keep going: the "
                               "next task picks up from here.")
+                return header + "\n\n" + report
             else:
                 raise
             ws.event(job["id"], "tool", "Writing up what was done")
@@ -268,7 +318,7 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
         if state.get("out_of_steps") and not state.get("next"):
             reason = f"it used all {profile['turns']} steps"
             ws.event(job["id"], "partial", reason)
-            if queue_continuation(job, reason):
+            if await continue_after(job, reason, answer):
                 answer = "🔁 **Used all steps for one task; the next part has started automatically.**\n\n" + answer
             return answer
         if state.get("next"):
