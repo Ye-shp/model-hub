@@ -121,6 +121,12 @@ class ChatPipeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NativeThinkingTests(unittest.IsolatedAsyncioTestCase):
+    def test_decision_status_is_not_mislabeled_as_codex(self):
+        for actor, label in (("jev", "Jev"), ("claude", "Claude Code"), ("codex", "Codex"), ("other", "other")):
+            with self.subTest(actor=actor):
+                text = Pipe()._describe({"kind": "escalation", "detail": f"{actor}: route to Claude?"}, [])
+                self.assertEqual(text, f"{label} is working on: route to Claude?")
+
     async def follow(self, stream=True):
         pipe = Pipe()
         statuses, polls = [], []

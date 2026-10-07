@@ -272,7 +272,8 @@ class Pipe:
                 return "Shared a file"
         if kind == "escalation":
             agent, _, task = detail.partition(":")
-            return f"{'Claude Code' if agent == 'claude' else 'Codex'} is working on:{task}"
+            label = {"claude": "Claude Code", "codex": "Codex", "jev": "Jev"}.get(agent, agent)
+            return f"{label} is working on:{task}"
         return detail
 
     async def _poll(self, client, identity: str, after: int, emit) -> dict:

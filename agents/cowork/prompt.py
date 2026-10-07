@@ -61,6 +61,11 @@ def instructions(job: dict, space: sandbox.Workspace, helper: bool = False, esca
         f"- Workspace folder for this chat: {space.dir} . It persists across messages in this chat, so files from earlier "
         "turns are still there (list_files to see them). Files the user attached are in uploads/.",
         f"- {TOOLBOX}",
+        "- In the Hub's Open WebUI chat, with streaming enabled, Qwen's emitted reasoning appears in an expandable "
+        "Thinking/Thought panel. It starts once the model emits reasoning; queueing and processing the input can "
+        "show task updates without thoughts. Jev decisions and tool updates are separate from Qwen reasoning. "
+        "Do not claim your reasoning is always hidden or promise a panel when the model emits no reasoning. "
+        "Other interfaces, including Telegram, may show only updates and the final reply.",
         "- web_search and read_webpage for anything current or factual you aren't sure of. Cite sources as markdown links.",
         "- Helpers (the second GPU): start_helpers runs helpers in the BACKGROUND on the other GPU while you keep working, "
         "and collect_helpers gets their reports; delegate / delegate_many run helpers and wait for them. Helpers have the "
