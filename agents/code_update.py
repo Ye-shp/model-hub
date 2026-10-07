@@ -13,7 +13,7 @@ except ImportError:
     import httpx
 
 REPO = os.environ.get("HUB_REPO", "Ye-shp/model-hub")
-PARTS = ("agents/", "integrations/", "skills/", "console/", "deploy/", "tools/tor/")
+PARTS = ("agents/", "integrations/", "skills/", "console/", "deploy/", "tools/tor/", "tools/automation/")
 
 
 def extract(archive: bytes, target: Path, parts: tuple[str, ...] = PARTS) -> int:
@@ -27,6 +27,9 @@ def extract(archive: bytes, target: Path, parts: tuple[str, ...] = PARTS) -> int
             destination = (target / name).resolve()
             if not destination.is_relative_to(target.resolve()):
                 raise ValueError(f"Unsafe path in archive: {member.name}")
+            relative = destination.relative_to(target.resolve()).as_posix()
+            if not any(relative == part.rstrip("/") or relative.startswith(part) for part in parts):
+                raise ValueError(f"Unsafe path outside app folders in archive: {member.name}")
             if member.isdir():
                 destination.mkdir(parents=True, exist_ok=True)
                 continue
@@ -58,4 +61,15 @@ async def stage(ref: str) -> dict:
     for old in root.iterdir():  # keep this one and the previous few
         if old.is_dir() and old.name != ref and len(list(root.iterdir())) > 5:
             shutil.rmtree(old, ignore_errors=True)
-    return {"staged": ref, "files": files, "next": "restart the instance (not recycle) to run it"}
+    result = {"staged": ref, "files": files, "next": "restart the instance (not recycle) to run it"}
+    if (final / "tools" / "automation").is_dir():
+        # A code overlay does not install packages. Explicit Cowork setup can prepare
+        # them in place after restart without replacing the instance or its data.
+        import automation_runtime
+        readiness = automation_runtime.ready()
+        result["phone_automation"] = {
+            "ready": readiness["ready"], "missing": readiness["missing"],
+            "next": "After restart, use explicit Cowork setup/configure to prepare missing dependencies "
+                    "in place. Keep this instance and its persistent volume; no memory reset or new image is required.",
+        }
+    return result

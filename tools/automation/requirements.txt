@@ -1,12 +1,12 @@
 # Core (needed even for dry-run)
-PyYAML>=6.0
-tzdata>=2024.1          # IANA tz database (zoneinfo on minimal images / Windows)
+PyYAML==6.0.3
+tzdata==2026.4          # IANA tz database (zoneinfo on minimal images / Windows)
 
 # Live mode only -- imported lazily, so dry-run/CLI work without a phone
-uiautomator2>=3.0       # drives the native IG/TikTok apps via UI/accessibility events
+uiautomator2==3.7.0     # drives the native IG/TikTok apps via UI/accessibility events
 requests>=2.31          # used by uiautomator2 / optional health pings
 
 # NOT pip-installable: scrcpy is a binary (screen mirroring / recording).
 #   apt install scrcpy adb      (or see setup/instance_setup.sh)
 # Optional binary: ffmpeg (TikTok re-encode step).
-# Dev: pytest>=8
+# Offline tests: pip install -r requirements-test.txt

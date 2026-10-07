@@ -215,6 +215,7 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         toolbox.install_in_background()  # free research/video/social tools, once (kept across restarts)
         import telegram_bot
         import audience_worker
+        import social_automation
         with controller_lock():
             ws.recover_jobs()
             import tor_service
@@ -222,10 +223,11 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
             task = asyncio.create_task(serve(runner or run_job, lambda: bool(hub.HUB_URL and hub.HUB_KEY)))
             telegram = asyncio.create_task(telegram_bot.serve())  # idle until /connect telegram
             metrics = asyncio.create_task(audience_worker.serve())  # durable checkpoints, independent of chat timeouts
+            posting = asyncio.create_task(social_automation.serve())  # one phone, approved persistent publications
             try:
                 yield
             finally:
-                for running in (task, telegram, metrics, *([tor] if tor else [])):
+                for running in (task, telegram, metrics, posting, *([tor] if tor else [])):
                     running.cancel()
                     with suppress(asyncio.CancelledError):
                         await running

@@ -32,8 +32,9 @@ jobs:
           python-version: '3.11'
       - name: Test the agent workspace and integrations offline
         run: |
-          python -m pip install -r agents/requirements.txt
+          python -m pip install -r agents/requirements.txt -r tools/automation/requirements-test.txt
           python -m unittest discover -s tests -p 'test_*.py' -v
+          python -m pytest tools/automation/tests -q
       - name: Free runner disk space for the CUDA image
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
       - name: Name the image

@@ -30,7 +30,9 @@ import audience
 
 # Helper agents may inspect results, but only the lead receives lifecycle mutations or dataset exports.
 OWNER_ONLY_TOOLS = {"draft_post", "publish_post", "list_posts", "create_content_experiment", "track_content_variant",
-                    "confirm_post_published", "record_post_metrics", "export_content_preferences"}
+                    "confirm_post_published", "record_post_metrics", "export_content_preferences",
+                    "configure_phone_automation", "phone_automation_status", "schedule_post",
+                    "cancel_scheduled_post", "confirm_scheduled_post"}
 
 
 def performance_json(result: dict) -> str:
@@ -104,6 +106,31 @@ def approved_post(request_text: str, post_id: int) -> bool:
     text = (request_text or "").lower()
     return bool(re.search(rf"\b(approve[ds]?|yes,?\s*post|go ahead and post|publish)\b[^.\n]*#?\b{post_id}\b", text) or
                 re.search(rf"\b(post|draft)\s*#?{post_id}\b[^.\n]*\b(approved?|go|publish)\b", text))
+
+
+def owner_statement(request_text: str) -> str:
+    """Inspect direct prose only; quoted examples cannot authorize phone mutations."""
+    text = (request_text or "").lower().replace("\u2019", "'")
+    text = re.sub(r"```.*?```|`[^`]*`", "", text, flags=re.S)
+    text = re.sub(r'"[^"\n]*"|\u201c[^\u201d\n]*\u201d|(?<!\w)\x27[^\x27\n]+\x27(?!\w)', "", text)
+    return re.sub(r"(?m)^\s*>.*$", "", text)
+
+
+def uncertain_statement(text: str) -> bool:
+    prose = re.sub(r"https?://\S+", "", text)
+    return bool(re.search(r"\?|\b(if|unless|whether|maybe|perhaps|should|could|would|might)\b", prose))
+
+
+def direct_post_approval(request_text: str, post_id: int) -> bool:
+    """Fail closed when optional semantic approval checking is unavailable."""
+    text = owner_statement(request_text)
+    if uncertain_statement(text) or re.search(r"\b(not|no|never|without|don't|cannot|can't|won't|haven't)\b", text):
+        return False
+    prefix = r"(?:^|[.!;\n])\s*(?:(?:ok(?:ay)?|yes|please|i)\s*[,!:]?\s*)*"
+    target = rf"(?:draft|post)\s*#?{post_id}\b"
+    return bool(re.search(prefix + rf"(?:approve[ds]?\s+(?:the\s+)?{target}|"
+                          rf"(?:publish|post|go ahead and post)\s+(?:the\s+)?(?:{target}|#?{post_id}\b)|"
+                          rf"{target}\s+(?:is\s+)?approved\b)", text))
 
 
 def slug(text: str, limit: int = 40) -> str:
@@ -571,9 +598,107 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
             return (f"Draft #{post_id} saved ({platform}{', ' + kind if kind else ''}, {len(kept)} file(s)). Show the user the caption and "
                     f"files and tell them to reply \"approve post {post_id}\" to publish it. Do not publish it in this task.")
 
+        async def require_post_approval(post_id: int, action: str) -> None:
+            if not direct_post_approval(request_text, post_id):
+                raise PermissionError(f"Not approved: the user's current message must approve post {post_id} "
+                                      f"(e.g. \"approve post {post_id}\"). Ask them.")
+            from cowork import judge
+            if await judge.confirms_approval(job, request_text, action) is False:
+                raise PermissionError(f"Not approved: the message mentions post {post_id} but doesn't clearly approve "
+                                      "this publication (negated, conditional or a question). Ask the user to confirm.")
+
+        @function_tool
+        async def configure_phone_automation(device_serial: str, platform: str, username: str,
+                                              timezone_name: str = "America/New_York", country: str = "US") -> str:
+            """Configure the owner's single Android phone for native Instagram/TikTok posting over an existing
+            Tailscale or SSH ADB tunnel. device_serial: phone tailnet IP:port or localhost:forwarded_port; platform:
+            instagram | tiktok; username: the exact logged-in profile to verify. Use the user's supplied device/account
+            details, never guess them. Installs missing runtime dependencies in place; preserves memories and chats.
+            Configuring does not approve or publish any draft. Timezone/country must match the user's chosen account."""
+            budget.active()
+            import automation_runtime
+            import social_automation
+            await automation_runtime.ensure()
+            result = social_automation.configure(device_serial, platform, username, timezone_name, country)
+            log("phone", f"Configured native {platform} posting for @{username.lstrip('@')}")
+            return json.dumps(result, ensure_ascii=False)
+
+        @function_tool
+        def phone_automation_status() -> str:
+            """Inspect native phone configuration, runtime readiness and this project's persistent posting queue.
+            Queued/prepared/needs_confirmation means not confirmed published. Report holds and errors accurately.
+            This does not contact the phone, publish anything, or change existing memories."""
+            budget.active()
+            import social_automation
+            return json.dumps(social_automation.status(project), ensure_ascii=False)
+
+        @function_tool
+        async def schedule_post(post_id: int, account_id: str, run_at: str) -> str:
+            """Queue a saved draft the user approved by number in their CURRENT message. account_id is instagram or
+            tiktok, as returned by configure_phone_automation. run_at is an ISO timestamp WITH timezone; use the time
+            the user approved. The single-phone background worker continues after this chat ends. Exact caption,
+            media and account are bound to that approval. Queued is not published; check phone_automation_status.
+            A post needing confirmation must be reconciled, never scheduled again to guess whether it worked."""
+            budget.active()
+            await require_post_approval(post_id, f"schedule draft post #{post_id} on {account_id} at {run_at}")
+            import social_automation
+            result = social_automation.schedule(project, post_id, account_id, run_at, job_id)
+            log("phone", f"Scheduled draft #{post_id} on {account_id} at {run_at}")
+            return json.dumps(result, ensure_ascii=False)
+
+        @function_tool
+        async def cancel_scheduled_post(post_id: int, verified_not_published: bool = False) -> str:
+            """Cancel a queued native phone publication in this project. Already submitted posts cannot be canceled
+            or treated as deleted. For a held/manual result, verified_not_published may be true ONLY after the owner
+            explicitly checked that numbered post did not publish and discarded its native composer. That records
+            abandonment and releases the phone, retaining the draft/receipt; it never deletes a platform post."""
+            budget.active()
+            if verified_not_published:
+                text = owner_statement(request_text)
+                checked = re.search(r"\b(not\s+(posted|published|live)|never\s+(posted|published)|"
+                                    r"did(?:n't| not)\s+(post|publish))\b", text)
+                discarded = re.search(r"\b(discarded|cleared|closed)\b.{0,60}\b(composer|draft)\b|"
+                                      r"\b(composer|draft)\b.{0,60}\b(discarded|cleared|closed)\b", text)
+                disposal_denied = re.search(r"\b(not|never|haven't|hasn't|didn't|don't|can't|cannot|won't|will|without)\b"
+                                           r"(?:(?!\band\b)[^.!;\n]){0,80}\b(discarded|cleared|closed)\b", text)
+                if not checked or not discarded or disposal_denied or not re.search(rf"\b(post|draft)\s*#?{post_id}\b", text) or uncertain_statement(text):
+                    raise PermissionError("The owner must explicitly confirm this numbered post did not publish "
+                                          "and its prepared composer was discarded before releasing the phone.")
+                from cowork import judge
+                if await judge.confirms_approval(job, request_text, f"abandon draft post #{post_id} after verifying it did not publish") is False:
+                    raise PermissionError("The message does not confirm abandoning this unposted draft.")
+            import social_automation
+            result = social_automation.cancel(project, post_id, verified_not_published=verified_not_published)
+            log("phone", f"{'Abandoned' if verified_not_published else 'Canceled'} scheduled draft #{post_id}")
+            return json.dumps(result, ensure_ascii=False)
+
+        @function_tool
+        async def confirm_scheduled_post(post_id: int, remote_id: str, url: str, published_at: str) -> str:
+            """Reconcile a native post from the real platform link the OWNER provided in this message. Supply the
+            actual post ID and ISO publication time with timezone explicitly provided by the owner. Their message
+            must affirm this numbered draft was published. Never invent these or infer publication from
+            a home screen, transferred media or queued status. Clears an uncertain/manual result without republishing."""
+            budget.active()
+            text = owner_statement(request_text)
+            target = rf"(?:post|draft)\s*#?{post_id}\b"
+            affirmative = re.search(rf"(?:^|[.!;\n])\s*(?:i confirm (?:that )?)?{target}\s+(?:was |is |has been )?(?:posted|published)\b", text)
+            if (not url.strip() or url.strip() not in request_text or not affirmative or uncertain_statement(text)
+                    or re.search(r"\b(not|never|didn't|hasn't|haven't|cannot|can't)\b", text)
+                    or not published_at.strip() or published_at.strip() not in request_text):
+                raise PermissionError("The owner must confirm this numbered draft was published and provide its actual published post link "
+                                      "and ISO publication time in the current message.")
+            from cowork import judge
+            if await judge.confirms_approval(job, request_text, f"record draft post #{post_id} as published at {url}") is False:
+                raise PermissionError("The message does not confirm this draft's publication.")
+            import social_automation
+            result = social_automation.confirm(project, post_id, remote_id, url, published_at)
+            log("phone", f"Recorded publication evidence for draft #{post_id}")
+            return json.dumps(result, ensure_ascii=False)
+
         @function_tool
         async def publish_post(post_id: int) -> str:
-            """Publish a draft the user has approved in their current message ("approve post N")."""
+            """Publish a draft the user approved in their current message (\"approve post N\"). Configured native
+            TikTok posts are queued for the persistent phone worker; queued is not confirmed published."""
             budget.active()
             rows = ws.query("SELECT * FROM social_posts WHERE id=? AND project=?", (post_id, project))
             if not rows:
@@ -581,13 +706,12 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
             post = rows[0]
             if post["status"] == "published":
                 return f"Draft #{post_id} was already published: {post['result']}"
-            if not approved_post(request_text, post_id):
-                raise PermissionError(f"Not approved: the user's current message must approve post {post_id} "
-                                      f"(e.g. \"approve post {post_id}\"). Ask them.")
-            from cowork import judge
-            if await judge.confirms_approval(job, request_text, f"publish draft post #{post_id}") is False:
-                raise PermissionError(f"Not approved: the message mentions post {post_id} but doesn't clearly approve "
-                                      "publishing it now (negated, conditional or a question). Ask the user to confirm.")
+            await require_post_approval(post_id, f"publish draft post #{post_id}")
+            import social_automation
+            if post["platform"] == "tiktok" and social_automation.configured_account("tiktok"):
+                result = social_automation.schedule(project, post_id, "tiktok", store.now(), job_id)
+                log("phone", f"Queued native TikTok draft #{post_id}")
+                return json.dumps(result, ensure_ascii=False)
             media = json.loads(post["media"] or "[]")
             log("tool", f"Publishing post #{post_id} to {post['platform']}")
             if post["platform"] == "x":
@@ -618,7 +742,8 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
                             "WHERE project=? ORDER BY id DESC LIMIT ?", (project, max(1, min(limit, 30)),))
             return json.dumps(rows, ensure_ascii=False)
 
-        tools += [draft_post, publish_post, list_posts]
+        tools += [draft_post, publish_post, list_posts, configure_phone_automation, phone_automation_status,
+                  schedule_post, cancel_scheduled_post, confirm_scheduled_post]
 
     ready = "installed" if toolbox.ready() else "installing in the background (the first call may wait a few minutes)"
     status = ", ".join(f"{name} {'connected' if info['connected'] else 'not connected'}" for name, info in links.items()

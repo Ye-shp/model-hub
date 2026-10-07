@@ -6,3 +6,6 @@ ddgs==9.16.0
 trafilatura==2.2.0
 pypdf==6.19.0
 cryptography==50.0.1
+PyYAML==6.0.3
+tzdata==2026.4
+uiautomator2==3.7.0
