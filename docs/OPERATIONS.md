@@ -139,8 +139,12 @@ next message in that chat is the answer, not a new task. The task's time limit i
 /connect mcp <name> off
 ```
 
-The box connects once right away and lists the server's tools. Every owner task then gets them as `<name>__<tool>`
-(for example `memory__create_entities`). A server that's down is skipped and named in the task's instructions.
+The box connects once right away and lists the server's tools. Small catalogs are offered as `<name>__<tool>`
+(for example `memory__create_entities`). Large catalogs, including Higgsfield's, stay in the controller: Qwen gets
+compact tools to discover relevant capabilities, read an exact tool's complete schema in pages, and invoke it by its
+original name. This keeps ordinary chats from processing the entire media-tool catalog before their first thought.
+The account, available capabilities, and invocation checks are the same. A server that's down is skipped and named
+in the task's instructions.
 
 **HTTP APIs:**
 

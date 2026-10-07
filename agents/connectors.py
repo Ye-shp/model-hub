@@ -7,13 +7,15 @@ Set up from an owner Cowork chat (the chat site passes the text after the comman
     /connect api <name> <base url> [bearer=TOKEN] [header="Name: value"]... [query:key=value]... [methods=GET,POST] [about="…"]
     /connect mcp <name> off  ·  /connect api <name> off
 
-Entries live root-only in DATA/connectors.json. Only the owner's tasks get them. Every MCP tool is offered to the model as
-<server>__<tool>; APIs go through one call_api tool that adds the stored headers and query values itself, so keys never
-reach the model, and that only calls paths under the configured base URL.
+Entries live root-only in DATA/connectors.json. Only the owner's tasks get them. Small MCP catalogs are offered as
+<server>__<tool>. Large catalogs stay in the controller and expose compact discovery/invocation tools, so a connected
+media service does not fill every ordinary chat's prompt with schemas. APIs go through one call_api tool that adds the
+stored headers and query values itself, so keys never reach the model, and only calls paths under its configured base URL.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -33,6 +35,14 @@ METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 MAX_OUTPUT = 20000
 CONNECT_SECONDS = 90
 CALL_SECONDS = 180
+# Preserve the direct tool interface for small servers; cap all directly advertised
+# MCP catalogs in one job together. Large schemas remain available through paging.
+DIRECT_TOOL_LIMIT = 12
+DIRECT_CATALOG_CHARACTERS = 16000
+DISCOVERY_RESULTS = 8
+SCHEMA_PAGE_CHARACTERS = 6000
+DISCOVERY_OUTPUT_CHARACTERS = 12000
+MAX_MCP_TOOL_NAME = 256
 HIGGSFIELD_GUIDE = (
     "Higgsfield uses the owner's connected account. Use the discovered Higgsfield tools and their schemas; "
     "do not invent model or preset IDs. Inspect the model/preset and quote its cost before a requested generation. "
@@ -189,6 +199,12 @@ def tool_name(server: str, tool: str) -> str:
     return (server.replace("-", "_") + "__" + re.sub(r"[^A-Za-z0-9_-]", "_", tool))[:64]
 
 
+def catalog_tool_name(server: str, operation: str) -> str:
+    """Separate normalized server names and reserve room for the operation."""
+    digest = hashlib.sha256(server.encode("utf-8")).hexdigest()[:32]
+    return f"mcp_{digest}__{operation}"
+
+
 def _field(item, *names):
     """MCP SDK 1.x uses camelCase fields (inputSchema, isError), 2.x snake_case: accept both."""
     for name in names:
@@ -258,11 +274,130 @@ def wrap(server_name: str, server, tool, still_running, log, higgsfield: bool = 
                         params_json_schema=schema, on_invoke_tool=invoke, strict_json_schema=False)
 
 
+def discovery_tools(server_name: str, wrapped: list, remote: list, still_running) -> list:
+    """Keep a job's full MCP catalog private; discover and call exact upstream names.
+
+    Discovery is not an authorization gate: an exact name remembered from an earlier
+    task may still be called if it is in this task's current catalog. Unknown names
+    and ambiguous duplicate names never reach the remote server. Schema pages are
+    JSON string fragments with offsets, not shortened or invalid schema objects.
+    """
+    from agents import FunctionTool
+
+    catalog = {}
+    ambiguous = set()
+    for source, tool in zip(remote, wrapped):
+        if not isinstance(source.name, str) or not source.name or len(source.name) > MAX_MCP_TOOL_NAME:
+            continue
+        if source.name in catalog:
+            ambiguous.add(source.name)
+        else:
+            catalog[source.name] = tool
+    for name in ambiguous:
+        del catalog[name]
+
+    async def discover(context, arguments: str) -> str:
+        still_running()
+        try:
+            values = json.loads(arguments or "{}")
+            if not isinstance(values, dict):
+                raise ValueError()
+            query, name = values.get("query", ""), values.get("name", "")
+            offset, limit = values.get("offset", 0), values.get("limit", 5)
+            if (not isinstance(query, str) or not isinstance(name, str)
+                    or type(offset) is not int or offset < 0 or type(limit) is not int):
+                raise ValueError()
+        except (ValueError, TypeError):
+            return "Discovery needs query/name strings, a nonnegative integer offset, and an integer limit."
+        if name:
+            tool = catalog.get(name)
+            if tool is None:
+                return "Unknown or ambiguous tool name. Search this server's current catalog first."
+            schema = json.dumps(tool.params_json_schema, ensure_ascii=False, separators=(",", ":"))
+            if offset > len(schema):
+                return "Schema offset is outside the schema. Use the previous page's next_offset."
+            end = min(len(schema), offset + SCHEMA_PAGE_CHARACTERS)
+            def page(stop):
+                return json.dumps({"name": name, "description": tool.description, "schema_json": schema[offset:stop],
+                                   "offset": offset, "total_characters": len(schema),
+                                   "next_offset": stop if stop < len(schema) else None}, ensure_ascii=False)
+            # Schema strings contain quotes/backslashes that are escaped again in
+            # this outer JSON. Bound the actual serialized output, not just text.
+            output = page(end)
+            if len(output) > DISCOVERY_OUTPUT_CHARACTERS:
+                low, high = offset, end
+                while low < high:
+                    middle = (low + high + 1) // 2
+                    if len(page(middle)) <= DISCOVERY_OUTPUT_CHARACTERS:
+                        low = middle
+                    else:
+                        high = middle - 1
+                output = page(low)
+            return output
+        else:
+            words = re.findall(r"[\w]+", query.casefold())
+            matches = []
+            for tool_name_, tool in catalog.items():
+                haystack = (tool_name_ + " " + tool.description).casefold()
+                score = sum(word in haystack for word in words)
+                if not words or score:
+                    matches.append((score, tool_name_, tool))
+            matches.sort(key=lambda match: (-match[0], match[1]))
+            limit = max(1, min(limit, DISCOVERY_RESULTS))
+            selected = matches[offset:offset + limit]
+            while True:
+                end = offset + len(selected)
+                result = {"tools": [{"name": name_, "description": tool.description[:240]}
+                                    for _, name_, tool in selected],
+                          "total_matches": len(matches), "next_offset": end if end < len(matches) else None,
+                          "schema_help": "Request an exact name to read its complete schema_json in pages; join pages in offset order."}
+                output = json.dumps(result, ensure_ascii=False)
+                if len(output) <= DISCOVERY_OUTPUT_CHARACTERS or not selected:
+                    return output
+                selected.pop()
+
+    async def invoke(context, arguments: str) -> str:
+        still_running()
+        try:
+            values = json.loads(arguments or "{}")
+            if (not isinstance(values, dict) or not isinstance(values.get("name"), str)
+                    or not isinstance(values.get("arguments"), dict)):
+                raise ValueError()
+        except (ValueError, TypeError):
+            return "Invocation needs an exact tool name and an arguments JSON object."
+        tool = catalog.get(values["name"])
+        if tool is None:
+            return "Unknown or ambiguous tool name. Search this server's current catalog first."
+        # Reuse the existing callback, including cancellation checks, logging,
+        # call timeout, Higgsfield warnings and structured media result handling.
+        return await tool.on_invoke_tool(context, json.dumps(values["arguments"], ensure_ascii=False))
+
+    search_schema = {"type": "object", "properties": {
+        "query": {"type": "string", "description": "Words describing the capability to find; empty lists tools."},
+        "name": {"type": "string", "description": "Exact discovered upstream name to read its schema; empty searches."},
+        "offset": {"type": "integer", "minimum": 0,
+                   "description": "Result index for search, or character offset for schema_json paging."},
+        "limit": {"type": "integer", "minimum": 1, "maximum": DISCOVERY_RESULTS}}, "additionalProperties": False}
+    call_schema = {"type": "object", "properties": {"name": {"type": "string"},
+                   "arguments": {"type": "object", "additionalProperties": True}},
+                   "required": ["name", "arguments"], "additionalProperties": False}
+    return [FunctionTool(name=catalog_tool_name(server_name, "discover_tools"),
+                description=f"[{server_name} MCP] Find relevant connected tools. Request an exact name for its complete "
+                            "schema_json; follow next_offset and join pages. Discovery is read-only.",
+                params_json_schema=search_schema, on_invoke_tool=discover, strict_json_schema=False),
+            FunctionTool(name=catalog_tool_name(server_name, "invoke_tool"),
+                description=f"[{server_name} MCP] Call an exact current catalog tool name with its arguments object. "
+                            "Discover its schema first unless already known. Follow the user's authorization and "
+                            "the provider's requirements before submitting work.",
+                params_json_schema=call_schema, on_invoke_tool=invoke, strict_json_schema=False)]
+
+
 async def open_mcp(stack: AsyncExitStack, space, still_running, log) -> tuple[list, list[str]]:
     """Connect the owner's MCP servers for one task: (tools, notes for the prompt). Close by closing the stack."""
     if not space.is_owner:
         return [], []
     tools, notes = [], []
+    direct_count, direct_characters = 0, 0
     for name, entry in load()["mcp"].items():
         server = None
         is_higgsfield = entry.get("auth") == "higgsfield"
@@ -289,8 +424,22 @@ async def open_mcp(stack: AsyncExitStack, space, still_running, log) -> tuple[li
             log("tool", f"MCP server {name} is unavailable ({type(error).__name__})")
             continue
         wrapped = [wrap(name, server, tool, still_running, log, higgsfield=is_higgsfield) for tool in listed]
-        tools += wrapped
-        notes.append(f"- {name} (MCP): {len(wrapped)} tools, named {tool_name(name, '…')}")
+        size = sum(len(json.dumps({"description": tool.description, "schema": tool.params_json_schema},
+                                  ensure_ascii=False)) for tool in wrapped)
+        advertised_names = {tool.name for tool in tools}
+        unique = (len({tool.name for tool in wrapped}) == len(wrapped)
+                  and not any(tool.name in advertised_names for tool in wrapped))
+        if (unique and direct_count + len(wrapped) <= DIRECT_TOOL_LIMIT
+                and direct_characters + size <= DIRECT_CATALOG_CHARACTERS):
+            tools += wrapped
+            direct_count += len(wrapped)
+            direct_characters += size
+            notes.append(f"- {name} (MCP): {len(wrapped)} tools, named {tool_name(name, '…')}")
+        else:
+            tools += discovery_tools(name, wrapped, listed, still_running)
+            notes.append(f"- {name} (MCP): {len(wrapped)} tools available through {catalog_tool_name(name, 'discover_tools')} "
+                         f"and {catalog_tool_name(name, 'invoke_tool')}. Search for relevant capabilities, read the exact tool's "
+                         "schema_json pages, then invoke its original name with an arguments object.")
         if is_higgsfield:
             notes.append(HIGGSFIELD_GUIDE)
     return tools, notes

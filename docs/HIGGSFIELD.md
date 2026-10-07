@@ -9,7 +9,8 @@ it is separate from the developer API and does not need an API key.
 1. In an owner Qwen Cowork chat, send `/connect higgsfield`.
 2. Open the returned sign-in link and authorize **Model Hub Cowork** in Higgsfield.
 3. Return to Cowork and send `/connections`. Once connected, a new task gets
-   the tools and input schemas discovered from Higgsfield's server.
+   compact tools to discover and invoke the relevant Higgsfield tools. Full
+   input schemas are read when needed, rather than included in every chat.
 
 Ask Cowork to list available models or check your balance for a first read-only
 check. For generation, specify the requested image, video, or audio and any
