@@ -657,11 +657,11 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
                 text = owner_statement(request_text)
                 checked = re.search(r"\b(not\s+(posted|published|live)|never\s+(posted|published)|"
                                     r"did(?:n't| not)\s+(post|publish))\b", text)
-                discarded = re.search(r"\b(discarded|cleared|closed)\b.{0,60}\b(composer|draft)\b|"
-                                      r"\b(composer|draft)\b.{0,60}\b(discarded|cleared|closed)\b", text)
-                disposal_denied = re.search(r"\b(not|never|haven't|hasn't|didn't|don't|can't|cannot|won't|will|without)\b"
-                                           r"(?:(?!\band\b)[^.!;\n]){0,80}\b(discarded|cleared|closed)\b", text)
-                if not checked or not discarded or disposal_denied or not re.search(rf"\b(post|draft)\s*#?{post_id}\b", text) or uncertain_statement(text):
+                clause = r"(?:^|[.!;\n]|\band\b)\s*"
+                composer = r"(?:(?:the|its|my|that|native|prepared|tiktok|instagram)\s+)*(?:composer|draft)\b"
+                discarded = re.search(clause + rf"(?:i\s+(?:have\s+)?)?(?:already\s+)?(?:discarded|cleared|closed)\s+{composer}|"
+                                      + clause + rf"{composer}\s+(?:was|is|has been)\s+(?:discarded|cleared|closed)\b", text)
+                if not checked or not discarded or not re.search(rf"\b(post|draft)\s*#?{post_id}\b", text) or uncertain_statement(text):
                     raise PermissionError("The owner must explicitly confirm this numbered post did not publish "
                                           "and its prepared composer was discarded before releasing the phone.")
                 from cowork import judge

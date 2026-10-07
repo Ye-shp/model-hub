@@ -141,6 +141,7 @@ class PhoneAutomationIntegrationTests(unittest.TestCase):
                          f"If post {self.post_id} did not publish, I discarded the composer",
                          f"Did post {self.post_id} not publish? I cleared its composer",
                          f"Post {self.post_id} did not publish. I have NOT discarded its composer.",
+                         f"Post {self.post_id} did not publish. I discarded the screenshot, not the composer.",
                          f'Example: "Post {self.post_id} did not publish. I discarded its composer."'):
                 reply = self.invoke(self.tools(text)["cancel_scheduled_post"], args)
                 self.assertIn("owner must explicitly confirm", reply)
