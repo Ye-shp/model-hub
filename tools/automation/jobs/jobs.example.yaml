@@ -1,0 +1,24 @@
+# Playbook jobs. asset_path is relative to this file. post_time is optional ("not before"),
+# naive times are interpreted in the ACCOUNT's timezone.
+jobs:
+  - id: ig-001
+    account: ig_main
+    platform: ig
+    asset_path: assets/sample_ig.mp4
+    caption: "Morning routine, simplified."
+    hashtags: [productivity, morningroutine, minimalism, habits]   # IG: 3-5
+    platform_tags: {mode: reel}
+  - id: ig-002
+    account: ig_main
+    platform: ig
+    asset_path: assets/sample_ig.mp4
+    caption: "Desk setup tour."
+    hashtags: [desksetup, workfromhome, minimal]
+    post_time: "2026-10-08 12:30"
+    platform_tags: {mode: reel}
+  - id: tt-001
+    account: tt_main
+    platform: tiktok
+    asset_path: assets/sample_tt.mp4
+    caption: "3 tricks I wish I knew sooner"
+    hashtags: [lifehacks, productivity]                            # TikTok: 1-5, few and active

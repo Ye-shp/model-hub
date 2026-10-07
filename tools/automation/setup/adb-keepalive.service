@@ -1,0 +1,20 @@
+# Re-run `adb connect` so the tunnel endpoint is re-established after network changes / phone reboots. BEST-EFFORT.
+# Edit the address (tailnet IP:5555, or localhost:5555 for the SSH-tunnel option). Install:
+#   sudo cp setup/adb-keepalive.service /etc/systemd/system/ && sudo systemctl enable --now adb-keepalive
+# The loop is idempotent (adb connect on an already-connected device is a no-op). For immediate reaction to
+# network changes also drop a NetworkManager dispatcher script that runs `systemctl restart adb-keepalive`.
+[Unit]
+Description=Keep adb connected to the phone
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Environment=PHONE_ADDR=100.101.102.103:5555
+ExecStart=/bin/sh -c 'while true; do adb connect "$PHONE_ADDR" >/dev/null 2>&1; sleep 20; done'
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

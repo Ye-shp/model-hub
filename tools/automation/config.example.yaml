@@ -1,0 +1,64 @@
+# Copy to config.yaml and edit. If config.yaml is missing, this file is used (dry-run safe).
+dry_run: true                       # global safety switch; CLI --live overrides to false
+strict_one_account_per_device: false  # true = at most ONE account per phone (any platform).
+                                      # false = one account per (device, platform), e.g. 1 IG + 1 TikTok on the same phone/IP.
+
+# Phones the control plane can reach. serial == adb_addr when using adb over network.
+devices:
+  - serial: "100.101.102.103:5555"  # tailnet IP of the phone (Tailscale) or "localhost:5555" (SSH reverse tunnel)
+    adb_addr: "100.101.102.103:5555"
+    label: "pixel-1"
+
+instance:                           # the rented control instance (Ye-shp/model-hub)
+  name: "Ye-shp/model-hub"
+  state_dir: "state"                # runtime JSON lives in <state_dir>/runtime/
+  accounts_file: "state/accounts.yaml"   # falls back to accounts.example.yaml
+  jobs_file: "jobs/jobs.yaml"            # falls back to jobs.example.yaml
+  screenshots_dir: "screenshots"
+  adb_bin: "adb"
+  scrcpy_bin: "scrcpy"
+  # scrcpy>=3.0: --no-playback ; scrcpy 2.x: use --no-display instead.
+  scrcpy_args: ["--no-audio", "--no-playback"]
+  ffmpeg_bin: "ffmpeg"
+  reencode_tiktok: true             # re-encode + strip metadata before TikTok upload (needs ffmpeg)
+  instagram_package: "com.instagram.android"
+  tiktok_package: "com.zhiliaoapp.musically"   # "com.ss.android.ugc.trill" on some regional builds
+  log_level: "INFO"
+  verify_ip: "warn"                # pre-flight egress guard (live posts): warn | hard | off
+                                   # "warn" logs if phone SIM IP != account.ip; "hard" blocks the post.
+
+cadence:
+  window_start: "08:00"             # account-local posting window
+  window_end: "22:00"
+  ramp_days: 14                     # day 1-7 = week1 caps, day 8..ramp_days interpolate to steady
+  top_of_hour_guard_min: 3          # never post within +/-N min of :00
+  delays:
+    action_median_s: 3.0            # inter-action delay: lognormal, clamped to [min,max]
+    action_sigma: 0.45
+    action_min_s: 1.5
+    action_max_s: 6.0
+    gap_median_min: 60              # inter-post gap: lognormal, minutes-scale
+    gap_sigma: 0.5
+    gap_min_min: 20
+    gap_max_min: 240
+  platforms:
+    ig:
+      week1: [1, 1, 1, 1, 2, 2, 2]  # max posts/day on warm-up day 1..7 (non-decreasing)
+      steady: 4                     # IG steady-state ~3-5/day
+      hard_max: 5                   # absolute ceiling, never exceeded
+    tiktok:
+      week1: [1, 1, 1, 2, 2, 2, 2]
+      steady: 6                     # TikTok steady-state ~4-8/day
+      hard_max: 8
+  browse_swipes: [3, 6]             # feed-browse swipes before posting (human session shape)
+  max_retries: 2
+  retry_backoff_s: 30
+  pause_after_failures: 3           # consecutive failed jobs -> pause account 24h
+
+watcher:
+  enabled: true
+  interval_hours: 12
+  check_after_post: true
+  pause_days: 7                     # pause length on WARNING / SHADOWBANNED
+  tiktok_probe_hashtag: "fyp"       # fallback if the account has no previous hashtag
+  tiktok_scan_swipes: 4

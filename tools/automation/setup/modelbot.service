@@ -1,0 +1,24 @@
+# systemd unit for the control instance. Install:
+#   sudo cp setup/modelbot.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#   sudo systemctl enable --now modelbot
+# Edit User= and the paths. Starts in whatever mode config.yaml says (dry_run: true by default!).
+[Unit]
+Description=Model-hub social posting scheduler (python -m bot.cli schedule)
+After=network-online.target tailscaled.service adb-keepalive.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/model-hub/automation
+ExecStart=/opt/model-hub/automation/.venv/bin/python -m bot.cli schedule --poll 60
+Restart=always
+RestartSec=20
+Environment=PYTHONUNBUFFERED=1
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/opt/model-hub/automation
+
+[Install]
+WantedBy=multi-user.target

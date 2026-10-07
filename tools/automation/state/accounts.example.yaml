@@ -1,0 +1,30 @@
+# accounts.yaml — identity map: 1 account ↔ 1 device ↔ 1 dedicated mobile IP.
+# Copy to accounts.yaml (gitignored). The config loader falls back to this file so a fresh
+# checkout stays dry-run safe. `validate_accounts` enforces: unique ids, non-empty ip, and
+# (when strict_one_account_per_device is true) at most one account per device.
+#
+# ip: the *dedicated* mobile IP for this account. For a real SIM it's the phone's SIM egress
+#     (see tools/verify_ip.py to print the live IP + ASN + geo, then paste it here). Keep it
+#     stable per account; never reuse one ip across two accounts.
+# geo: tz / lang / country MUST match the SIM's carrier country (the cadence engine schedules
+#      post windows in this tz; the phone locale should match lang).
+#
+# Example — one phone, two accounts (1 IG + 1 TikTok) sharing the phone's SIM IP:
+accounts:
+  - id: ig_main
+    platform: ig                     # ig | tiktok
+    username: "your.ig.handle"
+    device_serial: "100.101.102.103:5555"   # phone tailnet IP (matches config.yaml devices[] serial)
+    ip: "73.78.11.22"                         # <- output of tools/verify_ip.py (the SIM egress)
+    geo: { tz: "America/New_York", lang: "en-US", country: "US" }
+    warmup_day: 1
+    health: unknown
+
+  - id: tt_main
+    platform: tiktok
+    username: "@your.tiktok"
+    device_serial: "100.101.102.103:5555"    # same phone (strict_one_account_per_device: false)
+    ip: "73.78.11.22"                         # same SIM IP (one per device when sharing)
+    geo: { tz: "America/New_York", lang: "en-US", country: "US" }
+    warmup_day: 1
+    health: unknown
