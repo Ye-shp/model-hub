@@ -46,15 +46,18 @@ Behind the scenes:
 
 ## Console (console.handydandy.cc)
 
+Owner only. Built on the "Not Vibecoded" design system (fonts bundled in `console/fonts`, SIL Open Font License).
+
 | Page | What it's for |
 |---|---|
-| Now | GPU load, model queues, disk space, image box; running tasks (with Stop) and recent tasks with their full step log |
+| Now | What's running: where it came from (Cowork, chat, Telegram), which GPU leads it and which helps, the current step, any question waiting for your answer, Claude Code and Jev counts, Stop. GPU load per GPU, disk, image box, Tor. Recent tasks, filterable by source, with the full step log (thinking collapsed) |
 | Chats | Every chat folder with its size: browse and download files, delete old folders to free disk |
-| Memory | What Cowork has saved about you and your projects: edit or forget |
+| Knowledge | Posts and profiles studied into the knowledge base, with their saved playbooks |
+| Memory | Notes per chat (and older shared notes): edit or forget |
 | Audience | Compare drafts, record published posts and delayed counts, review reach scores and export preference examples |
 | Phone | Bridge status, the setup command, a live screenshot, collected posts |
-| People | Who used what (tasks, tokens), Claude Code and Codex status, recent hand-offs |
-| System | Code version, disks, and progress when moving to a new box |
+| Connections | Claude Code, Codex and Jev usage against their daily limits, Jev decisions in the last 24 hours, connected accounts, MCP servers and APIs, hand-offs, drafted posts |
+| System | Running code version (linked to GitHub), startup, models, image box, Tor, disks, and progress when moving to a new box |
 
 See [Audience learning](docs/AUDIENCE-LEARNING.md) for a first TikTok or Instagram
 experiment. Delayed checks run independently of chat timeouts. The first score

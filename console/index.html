@@ -4,80 +4,110 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Model Hub Console</title>
+<link rel="preload" href="/fonts/fraunces.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/fonts/instrument-sans.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/style.css">
 <script src="/app.js" defer></script>
 </head>
 <body>
 <div id="unlock" class="unlock" hidden>
   <form id="unlock-form" class="unlock-card">
-    <h1>Model Hub console</h1>
+    <h1>Model Hub</h1>
     <p>Sign in through Cloudflare Access as the owner, or paste the console owner key.</p>
     <label for="key">Owner key</label>
     <input id="key" type="password" autocomplete="off" spellcheck="false">
-    <button type="submit">Unlock</button>
+    <button type="submit" class="primary">Unlock</button>
     <p id="unlock-error" class="error" hidden></p>
   </form>
 </div>
 
 <div id="app" class="app" hidden>
   <header class="top">
-    <div class="brand"><span class="logo">MH</span><span>Model Hub <small>control room</small></span></div>
+    <div class="brand">Model Hub</div>
     <nav class="tabs" aria-label="Sections">
       <button class="tab-btn active" data-tab="now">Now</button>
       <button class="tab-btn" data-tab="chats">Chats</button>
+      <button class="tab-btn" data-tab="knowledge">Knowledge</button>
       <button class="tab-btn" data-tab="memory">Memory</button>
       <button class="tab-btn" data-tab="audience">Audience</button>
       <button class="tab-btn" data-tab="phone">Phone</button>
-      <button class="tab-btn" data-tab="people">People</button>
+      <button class="tab-btn" data-tab="connections">Connections</button>
       <button class="tab-btn" data-tab="system">System</button>
     </nav>
-    <div class="status-pill" id="pill"><span class="dot"></span><span id="pill-text">…</span></div>
+    <div class="status" id="pill"><span class="dot"></span><span id="pill-text">Checking</span></div>
   </header>
-  <p id="notice" class="notice" hidden></p>
+  <p id="notice" class="notice" role="alert" hidden></p>
 
   <main>
     <!-- NOW -->
     <section id="tab-now" class="tab">
-      <div class="tiles" id="tiles"></div>
-      <div class="grid2">
-        <div class="panel">
-          <div class="panel-head"><h2>Running and waiting</h2></div>
-          <div id="active" class="list"></div>
+      <h1 id="now-headline" class="headline"><span class="skel-line wide"></span></h1>
+      <p id="now-sub" class="lede"></p>
+      <div class="card signature">
+        <div class="card-head"><h2>Running now</h2><span id="active-count" class="muted small"></span></div>
+        <div id="active" class="list" aria-busy="true" aria-label="Running tasks"><div class="skel-block"></div><div class="skel-block short"></div></div>
+      </div>
+      <div class="split">
+        <div class="card raised">
+          <div class="card-head"><h2>GPUs</h2><span class="muted small">Each task's lead takes one GPU, its helpers the other</span></div>
+          <div id="gpus" aria-busy="true" aria-label="GPUs"><div class="skel-block short"></div><div class="skel-block short"></div></div>
         </div>
-        <div class="panel">
-          <div class="panel-head"><h2>Recent tasks</h2><select id="who-filter" aria-label="Filter by person"><option value="">Everyone</option></select></div>
-          <div id="recent" class="list"></div>
+        <div class="card flat">
+          <h2>The box</h2>
+          <div id="box" class="kv" aria-busy="true" aria-label="Box status"><div class="skel-line"></div><div class="skel-line"></div></div>
         </div>
+      </div>
+      <div class="card flat">
+        <div class="card-head"><h2>Recent tasks</h2>
+          <select id="source-filter" aria-label="Filter by where the task came from">
+            <option value="">Everywhere</option><option value="cowork">Qwen Cowork</option><option value="chat">Qwen (chat)</option>
+            <option value="telegram">Telegram</option><option value="console">Console</option>
+          </select></div>
+        <div id="recent" class="rows" aria-busy="true" aria-label="Recent tasks"><div class="skel-line"></div><div class="skel-line"></div><div class="skel-line"></div></div>
       </div>
     </section>
 
     <!-- CHATS -->
     <section id="tab-chats" class="tab" hidden>
-      <div class="panel">
-        <div class="panel-head"><h2>Chat folders</h2><span id="chats-free" class="muted"></span></div>
-        <p class="muted small">Every Qwen Cowork chat has a folder on the box. Delete old ones to free disk space (the chat itself stays in the chat site).</p>
-        <div id="chats" class="table"></div>
+      <h1 class="headline" id="chats-headline">Chat folders</h1>
+      <p class="lede">Every Cowork and chat conversation has a folder on the box. Deleting a folder frees disk space; the conversation itself stays on the chat site.</p>
+      <div class="card raised">
+        <div id="chats" class="table" aria-busy="true" aria-label="Chat folders"><div class="skel-line"></div><div class="skel-line"></div><div class="skel-line"></div></div>
       </div>
-      <div class="panel" id="files-panel" hidden>
-        <div class="panel-head"><h2 id="files-title">Files</h2><button id="files-close" class="ghost">Close</button></div>
-        <div id="files" class="list"></div>
+      <div class="card flat" id="files-panel" hidden>
+        <div class="card-head"><h2 id="files-title">Files</h2><button id="files-close" class="secondary small">Close</button></div>
+        <div id="files" class="rows"></div>
+      </div>
+    </section>
+
+    <!-- KNOWLEDGE -->
+    <section id="tab-knowledge" class="tab" hidden>
+      <h1 class="headline" id="knowledge-headline">Knowledge base</h1>
+      <p class="lede">Posts and profiles Cowork studied (links you sent on Telegram, <code>study_link</code>, <code>study_profile</code>). Every chat searches these before advising on content, growth or ads.</p>
+      <div class="card flat">
+        <div class="card-head"><h2>Studied</h2><input id="knowledge-search" type="search" placeholder="Search titles and links" aria-label="Search the knowledge base"></div>
+        <div id="knowledge" class="rows" aria-busy="true" aria-label="Knowledge base"><div class="skel-line"></div><div class="skel-line"></div><div class="skel-line"></div></div>
       </div>
     </section>
 
     <!-- MEMORY -->
     <section id="tab-memory" class="tab" hidden>
-      <div class="panel">
-        <div class="panel-head"><h2>What Cowork remembers</h2><input id="memory-search" type="search" placeholder="Search memory" aria-label="Search memory"></div>
-        <div id="memories" class="list"></div>
+      <h1 class="headline">What Cowork remembers</h1>
+      <p class="lede">Notes are kept per chat: a chat only recalls its own. Notes from before that change stay here under "Shared" and aren't recalled by chats.</p>
+      <div class="card flat">
+        <div class="card-head"><h2>Notes</h2><input id="memory-search" type="search" placeholder="Search memory" aria-label="Search memory"></div>
+        <div id="memories" class="rows" aria-busy="true" aria-label="Notes"><div class="skel-line"></div><div class="skel-line"></div></div>
       </div>
     </section>
 
     <!-- AUDIENCE -->
     <section id="tab-audience" class="tab" hidden>
-      <div class="panel">
-        <div class="panel-head audience-heading">
-          <h2>Learn from your audience</h2>
-          <div class="row"><label for="audience-project">Project</label><input id="audience-project" type="text" value="default" maxlength="100" autocomplete="off"><button id="audience-refresh" class="ghost">Refresh</button></div>
+      <h1 class="headline">Learn from your audience</h1>
+      <p class="lede">Compare drafts against how real TikTok and Instagram posts did, and export what wins as learning examples.</p>
+      <div class="card raised">
+        <div class="card-head audience-heading">
+          <h2>Experiments</h2>
+          <div class="row"><label for="audience-project">Project</label><input id="audience-project" type="text" value="default" maxlength="100" autocomplete="off"><button id="audience-refresh" class="secondary">Refresh</button></div>
         </div>
         <p class="muted small">Compare drafts against real TikTok and Instagram results. Record publication after a post is live; this page does not publish posts or train a model. Keep the same platform, account, format and posting context within an experiment. Automatic checks need a connected analytics account and its account ID. You can also enter counts manually.</p>
         <p class="muted small">For unattended TikTok checks, connect the refresh token and app credentials as well as the access token. An access-token-only connection needs manual renewal after expiry.</p>
@@ -94,17 +124,17 @@
               <label class="form-wide">Hypothesis<textarea name="hypothesis" required maxlength="2000" placeholder="What are you changing, and what result do you expect?"></textarea></label>
             </div>
             <p class="muted small">Evaluation experiments stay out of preference exports. Choose this before collecting results to keep your test independent.</p>
-            <button type="submit">Create experiment</button>
+            <button type="submit" class="primary">Create experiment</button>
             <p class="form-message" role="status" aria-live="polite"></p>
           </form>
         </details>
       </div>
-      <div class="grid2 audience-layout">
-        <div class="panel"><div class="panel-head"><h2>Experiments</h2><span id="audience-count" class="muted small"></span></div><div id="audience-experiments" class="list"></div></div>
-        <div class="panel" id="audience-detail-panel"><div class="panel-head"><h2 id="audience-detail-title">Experiment details</h2></div><div id="audience-detail" class="list"><div class="empty">Choose an experiment to see its drafts and collection schedule.</div></div></div>
+      <div class="split audience-layout">
+        <div class="card flat"><div class="card-head"><h2>All experiments</h2><span id="audience-count" class="muted small"></span></div><div id="audience-experiments" class="list"></div></div>
+        <div class="card raised" id="audience-detail-panel"><div class="card-head"><h2 id="audience-detail-title">Experiment details</h2></div><div id="audience-detail" class="list"><div class="empty">Choose an experiment to see its drafts and collection schedule.</div></div></div>
       </div>
-      <div class="panel">
-        <div class="panel-head"><h2>Results</h2><span id="audience-score-version" class="muted small"></span></div>
+      <div class="card flat">
+        <div class="card-head"><h2>Results</h2><span id="audience-score-version" class="muted small"></span></div>
         <p class="muted small">The first score focuses on reach: views compared with similar organic posts at the same age. Shares and completed viewing are supporting signals. Sample support describes the amount of data, not proof that a draft caused the outcome. Paid exposure and changes in audience or timing can distort a comparison.</p>
         <div id="audience-results" class="list"></div>
         <details><summary>Export learning examples</summary>
@@ -114,7 +144,7 @@
               <label>Minimum views per draft<input name="min_views" type="number" value="500" min="500" max="1000000000" step="1" required></label>
               <label>Minimum score margin<input name="min_margin" type="number" value="0.15" min="0.01" max="10" step="0.01" required></label>
             </div>
-            <button type="submit">Prepare learning export</button>
+            <button type="submit" class="secondary">Prepare learning export</button>
             <p class="form-message" role="status" aria-live="polite"></p>
             <p class="muted small">Prepares download links for JSONL with the brief, preferred draft and other draft, and a separate comparison audit with post links, observations and declared origins. Only eligible learning experiments enter the export; skipped comparisons and their reasons appear below. Exporting does not start training.</p>
           </form>
@@ -125,57 +155,56 @@
 
     <!-- PHONE -->
     <section id="tab-phone" class="tab" hidden>
-      <div class="grid2">
-        <div class="panel">
-          <div class="panel-head"><h2>Phone bridge</h2><span id="phone-state" class="badge">…</span></div>
-          <div id="phone-info" class="kv"></div>
+      <h1 class="headline" id="phone-headline">Phone</h1>
+      <div class="split">
+        <div class="card raised">
+          <div class="card-head"><h2>Screen</h2><button id="phone-shot" class="primary">Take screenshot</button></div>
+          <div id="phone-screen" class="screen"><p class="muted">No screenshot yet.</p></div>
+          <h3>Bridge activity</h3>
+          <div id="phone-log" class="log"></div>
+        </div>
+        <div class="card flat">
+          <div class="card-head"><h2>Bridge</h2><span id="phone-state" class="badge">checking</span></div>
+          <div id="phone-info" class="kv" aria-busy="true"><div class="skel-line"></div><div class="skel-line"></div></div>
+          <h3>Collected posts</h3>
+          <div id="phone-posts" class="kv"></div>
           <h3>Set up on the PC the phone is plugged into</h3>
           <ol class="steps">
             <li>Install <a href="https://developer.android.com/tools/releases/platform-tools" target="_blank" rel="noopener">Android platform-tools</a> (adb) and Python 3.</li>
-            <li>On the phone: Developer options → USB debugging on. Plug it in and allow the prompt.</li>
+            <li>On the phone: Developer options, then USB debugging on. Plug it in and allow the prompt.</li>
             <li>Download <a href="/bridge.py" download>bridge.py</a> and run:</li>
           </ol>
           <pre id="phone-command" class="code"></pre>
-          <div class="row"><button id="phone-copy">Copy command</button><button id="phone-reveal" class="ghost">Show key</button><button id="phone-rotate" class="ghost danger">New key</button></div>
-          <p class="muted small">Cowork gets phone tools while the bridge is connected (owner chats only). Taps that would post, send, follow, like or buy are blocked unless your message approves them.</p>
-        </div>
-        <div class="panel">
-          <div class="panel-head"><h2>Screen</h2><button id="phone-shot">Take screenshot</button></div>
-          <div id="phone-screen" class="screen"><p class="muted">No screenshot yet.</p></div>
-          <h3>Collected posts</h3>
-          <div id="phone-posts" class="kv"></div>
-          <h3>Bridge activity</h3>
-          <div id="phone-log" class="log"></div>
+          <div class="row"><button id="phone-copy" class="secondary">Copy command</button><button id="phone-reveal" class="secondary">Show key</button><button id="phone-rotate" class="secondary danger">New key</button></div>
+          <p class="muted small">Cowork gets phone tools while the bridge is connected. Taps that would post, send, follow, like or buy are blocked unless your message approves them; with Jev connected, a negated or conditional approval ("don't post it") doesn't count.</p>
         </div>
       </div>
     </section>
 
-    <!-- PEOPLE -->
-    <section id="tab-people" class="tab" hidden>
-      <div class="panel">
-        <div class="panel-head"><h2>People</h2></div>
-        <div id="people" class="table"></div>
+    <!-- CONNECTIONS -->
+    <section id="tab-connections" class="tab" hidden>
+      <h1 class="headline" id="connections-headline">Connections</h1>
+      <p class="lede">Who Qwen hands work to, the decisions Jev makes for the hub, and the accounts Cowork can use. Connect anything from a Cowork chat; <code>/connections</code> lists every option.</p>
+      <div class="split wide-left">
+        <div class="card raised">
+          <h2>Hand-offs today</h2>
+          <div id="agents" class="agents" aria-busy="true"><div class="skel-block short"></div></div>
+          <h3>Jev decisions in the last 24 hours</h3>
+          <div id="decisions" class="rows" aria-busy="true"><div class="skel-line"></div></div>
+        </div>
+        <div class="card flat">
+          <h2>Accounts and tools</h2>
+          <div id="accounts" class="kv" aria-busy="true"><div class="skel-line"></div><div class="skel-line"></div><div class="skel-line"></div></div>
+        </div>
       </div>
-      <div class="grid2">
-        <div class="panel">
-          <div class="panel-head"><h2>Claude Code and Codex</h2></div>
-          <div id="connections" class="kv"></div>
-          <p class="muted small">Connect from any Cowork chat: <code>/connect claude &lt;token&gt;</code> or <code>/connect codex</code>.</p>
+      <div class="split">
+        <div class="card flat">
+          <h2>Recent hand-offs</h2>
+          <div id="handoffs" class="rows" aria-busy="true"><div class="skel-line"></div><div class="skel-line"></div></div>
         </div>
-        <div class="panel">
-          <div class="panel-head"><h2>Recent hand-offs</h2></div>
-          <div id="handoffs" class="list"></div>
-        </div>
-      </div>
-      <div class="grid2">
-        <div class="panel">
-          <div class="panel-head"><h2>Accounts and research tools</h2></div>
-          <div id="social" class="kv"></div>
-          <p class="muted small">Connect from a Cowork chat, e.g. <code>/connect x USERNAME auth_token=… ct0=…</code>. <code>/connections</code> lists every option.</p>
-        </div>
-        <div class="panel">
-          <div class="panel-head"><h2>Posts</h2></div>
-          <div id="posts" class="list"></div>
+        <div class="card flat">
+          <h2>Drafted posts</h2>
+          <div id="posts" class="rows" aria-busy="true"><div class="skel-line"></div></div>
           <p class="muted small">Cowork drafts posts; they're published only after you reply <code>approve post N</code> in the chat.</p>
         </div>
       </div>
@@ -183,26 +212,28 @@
 
     <!-- SYSTEM -->
     <section id="tab-system" class="tab" hidden>
-      <div class="grid2">
-        <div class="panel">
-          <div class="panel-head"><h2>Box</h2></div>
-          <div id="system" class="kv"></div>
+      <h1 class="headline" id="system-headline">System</h1>
+      <div class="split wide-left">
+        <div class="card raised">
+          <h2>Box</h2>
+          <div id="system" class="kv" aria-busy="true"><div class="skel-line"></div><div class="skel-line"></div><div class="skel-line"></div></div>
+          <p class="muted small">App code updates without losing data: send <code>/update-code &lt;commit&gt;</code> in a Cowork chat, then reboot the instance (not recycle).</p>
         </div>
-        <div class="panel">
-          <div class="panel-head"><h2>Disks</h2></div>
-          <div id="disks" class="list"></div>
+        <div class="card flat">
+          <h2>Disks</h2>
+          <div id="disks" class="rows" aria-busy="true"><div class="skel-line"></div><div class="skel-line"></div></div>
         </div>
       </div>
-      <div class="panel">
-        <div class="panel-head"><h2>Moving to a new box</h2><span id="migrate-state" class="badge">idle</span></div>
-        <p class="muted small">Used when upgrading to a bigger disk or a new server: the new box waits for the data, this box sends chats, accounts, keys and workspaces to it (encrypted). Started by the operator; the progress shows here.</p>
+      <div class="card flat">
+        <div class="card-head"><h2>Moving to a new box</h2><span id="migrate-state" class="badge">idle</span></div>
+        <p class="muted small">Used when upgrading to a bigger disk or a new server: the new box waits for the data, this box sends chats, keys and workspaces to it (encrypted). Started by the operator; the progress shows here.</p>
         <div id="migrate" class="kv"></div>
       </div>
     </section>
   </main>
 
-  <aside id="drawer" class="drawer" hidden>
-    <div class="drawer-head"><h2 id="drawer-title">Task</h2><button id="drawer-close" class="ghost">Close</button></div>
+  <aside id="drawer" class="drawer" hidden aria-labelledby="drawer-title">
+    <div class="drawer-head"><h2 id="drawer-title">Task</h2><button id="drawer-close" class="secondary small">Close</button></div>
     <div id="drawer-body"></div>
   </aside>
 </div>
