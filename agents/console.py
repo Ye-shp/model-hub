@@ -350,6 +350,13 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
     def css():
         return FileResponse(WEB / "style.css", media_type="text/css")
 
+    @app.get("/fonts/{name}")
+    def font(name: str):
+        """The console's two typefaces (SIL Open Font License), served locally so the CSP stays 'self' only."""
+        if name not in {"fraunces.woff2", "instrument-sans.woff2"}:
+            raise HTTPException(404, "Not found")
+        return FileResponse(WEB / "fonts" / name, media_type="font/woff2")
+
     @app.get("/api/state")
     def state(project: str = "default"):
         if not ws.project_exists(project):
@@ -387,7 +394,12 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
             connections = escalate.status()
         except Exception as error:  # the sandbox users only exist on the hub box
             connections = {"error": f"{type(error).__name__}: {error}"}
-        return {"projects": projects, "people": people, "connections": connections,
+        decisions = ws.query("""SELECT substr(e.detail, 6) AS purpose, COUNT(*) AS asked,
+            SUM(EXISTS(SELECT 1 FROM events d WHERE d.job_id=e.job_id AND d.kind='escalation-done' AND d.id>e.id
+                       AND d.detail = e.detail || ' failed')) AS failed
+            FROM events e WHERE e.kind='escalation' AND e.detail LIKE 'jev:%' AND datetime(e.created_at) >= datetime('now','-1 day')
+            GROUP BY purpose ORDER BY asked DESC""")
+        return {"projects": projects, "people": people, "connections": connections, "jev_decisions": decisions,
                 "escalations": ws.query("""SELECT e.detail, e.created_at, j.requested_by FROM events e JOIN jobs j ON j.id=e.job_id
                                            WHERE e.kind IN ('escalation','escalation-done') ORDER BY e.id DESC LIMIT 30""")}
 
@@ -398,9 +410,17 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         return {"jobs": ws.query(f"""SELECT j.id, j.project, p.name AS project_name, j.skill, j.profile, j.status,
             CASE WHEN instr(j.task, 'CURRENT REQUEST:') > 0 THEN substr(j.task, instr(j.task, 'CURRENT REQUEST:') + 17, 400)
                  ELSE substr(j.task, 1, 400) END AS task,
-            j.requested_by, j.thread, j.created_at, j.started_at, j.finished_at, j.error,
+            j.requested_by, j.thread, j.created_at, j.started_at, j.finished_at, j.error, j.parent,
+            substr(j.task, 1, 9) = 'AUTOMATIC' AS automatic,
             (SELECT COUNT(*) FROM events e WHERE e.job_id=j.id AND e.kind IN ('tool','delegate','escalation','image-request')) AS actions,
-            (SELECT COUNT(*) FROM artifacts a WHERE a.job_id=j.id) AS files
+            (SELECT COUNT(*) FROM artifacts a WHERE a.job_id=j.id) AS files,
+            (SELECT substr(e.detail, 9) FROM events e WHERE e.job_id=j.id AND e.kind='tool' AND e.detail LIKE 'Lead on %'
+               ORDER BY e.id DESC LIMIT 1) AS gpus,
+            (SELECT e.detail FROM events e WHERE e.job_id=j.id AND e.kind IN ('tool','delegate','escalation','phone','image-request')
+               ORDER BY e.id DESC LIMIT 1) AS step,
+            (SELECT q.question FROM questions q WHERE q.job_id=j.id AND q.status='pending' ORDER BY q.id DESC LIMIT 1) AS question,
+            (SELECT COUNT(*) FROM events e WHERE e.job_id=j.id AND e.kind='escalation' AND e.detail LIKE 'jev:%') AS jev_calls,
+            (SELECT COUNT(*) FROM events e WHERE e.job_id=j.id AND e.kind='escalation' AND e.detail LIKE 'claude:%') AS claude_calls
             FROM jobs j JOIN projects p ON p.id=j.project {where} ORDER BY j.created_at DESC, j.rowid DESC LIMIT ?""",
             (*params, max(1, min(limit, 500))))}
 
@@ -445,9 +465,31 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
     @app.get("/api/memories")
     def all_memories(project: str = "all", search: str = ""):
         where, params = ("", ()) if project == "all" else ("AND n.project=?", (project,))
-        return {"memories": ws.query(f"""SELECT n.*, p.name AS project_name FROM notes n JOIN projects p ON p.id=n.project
+        return {"memories": ws.query(f"""SELECT n.*, p.name AS project_name,
+            (SELECT CASE WHEN instr(j.task, 'CURRENT REQUEST:') > 0 THEN substr(j.task, instr(j.task, 'CURRENT REQUEST:') + 17, 160)
+                    ELSE substr(j.task, 1, 160) END FROM jobs j WHERE n.thread != '' AND j.thread = n.thread
+             ORDER BY j.created_at LIMIT 1) AS chat_request
+            FROM notes n JOIN projects p ON p.id=n.project
             WHERE (n.title LIKE ? OR n.content LIKE ?) {where} ORDER BY n.updated_at DESC, n.id DESC LIMIT 300""",
             (f"%{search}%", f"%{search}%", *params))}
+
+    @app.get("/api/knowledge")
+    def knowledge(project: str = "default", search: str = "", limit: int = 100):
+        """Posts and profiles studied into the knowledge base (study_link / study_profile), newest first."""
+        like = f"%{search}%"
+        rows = ws.query("""SELECT d.id, d.title, d.source, d.created_at
+            FROM documents d WHERE d.project=? AND d.source LIKE 'http%' AND (d.title LIKE ? OR d.source LIKE ?)
+            ORDER BY d.created_at DESC LIMIT ?""", (project, like, like, max(1, min(limit, 300))))
+        total = ws.query("SELECT COUNT(*) AS n FROM documents WHERE project=? AND source LIKE 'http%'", (project,))[0]["n"]
+        return {"documents": rows, "total": total}
+
+    @app.get("/api/knowledge/{document}")
+    def knowledge_document(document: str, project: str = "default"):
+        import study
+        rows = ws.query("SELECT id,title,source,created_at FROM documents WHERE id=? AND project=?", (document, project))
+        if not rows:
+            raise HTTPException(404, "Not in the knowledge base")
+        return {**rows[0], "text": study.saved_text(project, document, limit=60000)}
 
     @app.post("/api/memories/{note}/delete")
     def delete_memory(note: int):
@@ -859,7 +901,9 @@ def system_health(sandbox) -> dict:
     image = os.environ.get("MODEL3_URL", "")
     if image:
         try:
-            with urllib.request.urlopen(image.rsplit("/v1", 1)[0] + "/health", timeout=6) as response:
+            # Cloudflare answers 403 to Python's default user agent, which made the box look down when it wasn't.
+            probe = urllib.request.Request(image.rsplit("/v1", 1)[0] + "/health", headers={"User-Agent": "model-hub-console/1"})
+            with urllib.request.urlopen(probe, timeout=6) as response:
                 report["image_box"] = {"ok": response.status == 200}
         except Exception as error:
             report["image_box"] = {"ok": False, "error": type(error).__name__}

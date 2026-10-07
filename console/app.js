@@ -1,10 +1,12 @@
-// Model Hub control room: live tasks, health, folders, memory, audience, phone, people, system.
+// Model Hub console: what's running and on which GPU, what Cowork is waiting on, hand-offs and Jev decisions,
+// chat folders, the knowledge base, per-chat memory, audience experiments, the phone and the box.
 'use strict';
 const $ = id => document.getElementById(id);
 let token = '';
 let tab = 'now';
 let phoneKeyShown = false;
 const cache = {};
+const REPO = 'https://github.com/Ye-shp/model-hub';
 
 // ---------- helpers ----------
 function el(tag, text, cls) { const e = document.createElement(tag); if (text !== undefined && text !== null) e.textContent = text; if (cls) e.className = cls; return e; }
@@ -17,16 +19,44 @@ function ago(value) {
   if (s < 60) return Math.round(s) + 's ago'; if (s < 3600) return Math.round(s / 60) + 'm ago';
   if (s < 86400) return Math.round(s / 3600) + 'h ago'; return Math.round(s / 86400) + 'd ago';
 }
+function since(value) {
+  if (!value) return '';
+  const s = Math.max(0, (Date.now() - Date.parse(value)) / 1000);
+  if (s < 60) return Math.round(s) + 's'; if (s < 3600) return Math.round(s / 60) + ' min';
+  return Math.floor(s / 3600) + ' h ' + Math.round((s % 3600) / 60) + ' min';
+}
 function bytes(n) { if (n == null) return ''; const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0; while (n >= 1024 && i < 4) { n /= 1024; i++; } return (i ? n.toFixed(1) : n) + ' ' + u[i]; }
 function badge(text, cls) { return el('span', text, 'badge ' + (cls || text || '')); }
-function empty(target, text) { $(target).replaceChildren(el('div', text, 'empty')); }
+function empty(target, text) { const box = $(target); box.removeAttribute('aria-busy'); box.replaceChildren(el('div', text, 'empty')); }
+function fill(target, nodes) { const box = $(target); box.removeAttribute('aria-busy'); box.replaceChildren(...nodes); }
 function request(task) { return (task || '').split('CURRENT REQUEST:\n').pop().trim(); }
 function projectFor(account) { return account === 'owner' ? 'default' : account === 'guest' ? 'friends' : account; }
+function plural(n, word) { return `${n} ${word}${n === 1 ? '' : 's'}`; }
 function kv(target, pairs) {
-  const box = $(target); box.replaceChildren();
-  for (const [k, v] of pairs) { box.append(el('div', k, 'k')); const cell = el('div', undefined, 'v'); if (v instanceof Node) cell.append(v); else cell.textContent = v ?? '—'; box.append(cell); }
+  const box = $(target); box.removeAttribute('aria-busy'); box.replaceChildren();
+  for (const [k, v] of pairs) { box.append(el('div', k, 'k')); const cell = el('div', undefined, 'v'); if (v instanceof Node) cell.append(v); else cell.textContent = v ?? 'none'; box.append(cell); }
 }
-function bar(pct) { const b = el('div', undefined, 'bar' + (pct > 90 ? ' bad' : pct > 75 ? ' warn' : '')); const s = el('span'); s.style.width = Math.max(0, Math.min(100, pct)) + '%'; b.append(s); return b; }
+function bar(pct) { const b = el('div', undefined, 'bar' + (pct > 90 ? ' bad' : '')); const s = el('span'); s.style.width = Math.max(0, Math.min(100, pct)) + '%'; b.append(s); return b; }
+function link(text, href) { const a = el('a', text); a.href = href; a.target = '_blank'; a.rel = 'noopener noreferrer'; return a; }
+function safeJSON(text) { try { return JSON.parse(text); } catch { return {}; } }
+function gpuOf(model) { const m = /qwen-(\d)/.exec(model || ''); return m ? `GPU ${Number(m[1]) - 1}` : model; }
+function source(j) {
+  if (j.requested_by === 'telegram') return 'telegram';
+  if (!j.requested_by) return 'console';
+  return j.skill === 'chat' ? 'chat' : 'cowork';
+}
+const SOURCE = {telegram: 'Telegram', console: 'Console', chat: 'Qwen (chat)', cowork: 'Qwen Cowork'};
+function lead(j) {  // "qwen-1, helpers on qwen-2" -> {lead: 'qwen-1', helper: 'qwen-2'}
+  const m = /^(\S+?),? helpers on (\S+)/.exec(j.gpus || '');
+  return m ? {lead: m[1], helper: m[2]} : null;
+}
+function readable(detail) {  // event details as the console shows them
+  if (!detail) return '';
+  if (detail.startsWith('jev: ')) return 'Jev: ' + detail.slice(5);
+  if (detail.startsWith('claude: ')) return 'Claude Code: ' + detail.slice(8);
+  if (detail.startsWith('codex: ')) return 'Codex: ' + detail.slice(7);
+  return detail;
+}
 
 async function api(path, body) {
   const headers = {'Content-Type': 'application/json'};
@@ -60,139 +90,268 @@ $('unlock-form').addEventListener('submit', async ev => {
 });
 
 // ---------- tabs ----------
-document.querySelectorAll('.tab-btn').forEach(b => b.addEventListener('click', () => { tab = b.dataset.tab; document.querySelectorAll('.tab-btn').forEach(x => x.classList.toggle('active', x === b)); document.querySelectorAll('.tab').forEach(s => s.hidden = s.id !== 'tab-' + tab); refresh(); }));
+document.querySelectorAll('.tab-btn').forEach(b => b.addEventListener('click', () => {
+  tab = b.dataset.tab;
+  document.querySelectorAll('.tab-btn').forEach(x => x.classList.toggle('active', x === b));
+  document.querySelectorAll('.tab').forEach(s => s.hidden = s.id !== 'tab-' + tab);
+  refresh();
+}));
 $('drawer-close').addEventListener('click', () => { $('drawer').hidden = true; });
+document.addEventListener('keydown', ev => { if (ev.key === 'Escape') $('drawer').hidden = true; });
 $('files-close').addEventListener('click', () => { $('files-panel').hidden = true; });
-$('who-filter').addEventListener('change', () => renderRecent());
+$('source-filter').addEventListener('change', () => renderRecent());
 let memoryTimer; $('memory-search').addEventListener('input', () => { clearTimeout(memoryTimer); memoryTimer = setTimeout(loadMemory, 300); });
+let knowledgeTimer; $('knowledge-search').addEventListener('input', () => { clearTimeout(knowledgeTimer); knowledgeTimer = setTimeout(loadKnowledge, 300); });
 
 // ---------- NOW ----------
 async function loadNow() {
   const [health, activity] = await Promise.all([api('health'), api('activity?limit=80')]);
   cache.health = health; cache.activity = activity.jobs;
-  const tiles = [];
-  for (const g of health.gpus || []) {
-    const pct = g.mem_total ? Math.round(100 * g.mem_used / g.mem_total) : 0;
-    const t = el('div', undefined, 'tile'); t.append(el('div', `GPU ${g.index} · ${g.name}`, 'label'), el('div', `${g.util}%`, 'value'), el('div', `memory ${bytes(g.mem_used * 1048576)} of ${bytes(g.mem_total * 1048576)} · ${g.temp}°C`, 'sub'), bar(Number(g.util))); tiles.push(t);
-  }
-  if (Array.isArray(health.models)) {
-    const chat = health.models.filter(m => m.model.startsWith('qwen'));
-    const t = el('div', undefined, 'tile'); const run = chat.reduce((a, m) => a + m.running, 0); const wait = chat.reduce((a, m) => a + m.waiting, 0);
-    t.append(el('div', 'Model requests', 'label'), el('div', `${run} running`, 'value'), el('div', `${wait} waiting · ${chat.map(m => `${m.model} ${m.running}/${m.capacity}`).join(' · ')}`, 'sub')); tiles.push(t);
-  }
-  const d = health.disks && (health.disks.chats || health.disks.data);
-  if (d) { const t = el('div', undefined, 'tile'); t.append(el('div', 'Disk free', 'label'), el('div', `${d.free_gb} GB`, 'value'), el('div', `of ${d.total_gb} GB (${d.used_pct}% used)`, 'sub'), bar(d.used_pct)); tiles.push(t); }
-  const jobs = Object.fromEntries((health.jobs || []).map(j => [j.status, j.n]));
-  { const t = el('div', undefined, 'tile'); t.append(el('div', 'Tasks', 'label'), el('div', `${jobs.running || 0} running`, 'value'), el('div', `${jobs.queued || 0} waiting`, 'sub')); tiles.push(t); }
-  if (health.image_box) { const t = el('div', undefined, 'tile'); t.append(el('div', 'Image box', 'label'), el('div', health.image_box.ok ? 'Up' : 'Down', 'value'), el('div', health.image_box.error || 'Qwen-Image', 'sub')); tiles.push(t); }
-  $('tiles').replaceChildren(...tiles);
-
-  const low = d && d.free_gb < 8, down = Array.isArray(health.models) ? false : true;
-  $('pill').querySelector('.dot').className = 'dot ' + (down ? 'bad' : low ? 'warn' : 'ok');
-  $('pill-text').textContent = down ? 'Models unreachable' : low ? 'Disk nearly full' : 'All systems normal';
-
   const active = activity.jobs.filter(j => j.status === 'running' || j.status === 'queued');
-  if (!active.length) empty('active', 'Nothing running right now.');
-  else $('active').replaceChildren(...active.map(j => jobItem(j, true)));
-  const people = [...new Set(activity.jobs.map(j => j.requested_by || 'console'))];
-  const sel = $('who-filter'); const keep = sel.value;
-  sel.replaceChildren(el('option', 'Everyone'), ...people.map(p => { const o = el('option', p); o.value = p; return o; })); sel.options[0].value = ''; sel.value = people.includes(keep) ? keep : '';
+  const waiting = active.filter(j => j.question);
+  const disk = health.disks && (health.disks.chats || health.disks.data);
+  const modelsDown = !Array.isArray(health.models);
+  const lowDisk = disk && disk.free_gb < 8;
+
+  // One statement up top.
+  let headline;
+  if (modelsDown) headline = 'The models are unreachable.';
+  else if (waiting.length) headline = `Cowork is waiting for your answer${waiting.length > 1 ? ` in ${waiting.length} chats` : ''}.`;
+  else if (active.length) headline = `${plural(active.filter(j => j.status === 'running').length, 'task')} running${active.some(j => j.status === 'queued') ? `, ${active.filter(j => j.status === 'queued').length} waiting` : ''}.`;
+  else headline = 'Nothing is running.';
+  $('now-headline').textContent = headline;
+  const done = activity.jobs.filter(j => j.finished_at && Date.now() - Date.parse(j.finished_at) < 86400000);
+  $('now-sub').textContent = `${plural(done.length, 'task')} finished in the last 24 hours` +
+    (done.length ? `, ${done.reduce((a, j) => a + (j.claude_calls || 0), 0)} handed to Claude Code, ${done.reduce((a, j) => a + (j.jev_calls || 0), 0)} Jev decisions.` : '.');
+  $('pill').querySelector('.dot').className = 'dot ' + (modelsDown || lowDisk ? 'bad' : 'ok');
+  $('pill-text').textContent = modelsDown ? 'Models unreachable' : lowDisk ? 'Disk nearly full' : 'Healthy';
+
+  $('active-count').textContent = active.length ? plural(active.length, 'task') : '';
+  if (!active.length) empty('active', 'Nothing running. New messages to Qwen Cowork, Qwen (chat) or the Telegram bot show up here.');
+  else fill('active', active.map(taskCard));
+
+  // GPUs, and which running task leads on each.
+  const leads = {}, helps = {};
+  for (const j of active) { const g = lead(j); if (!g) continue; (leads[gpuOf(g.lead)] ||= []).push(j); (helps[gpuOf(g.helper)] ||= []).push(j); }
+  const queues = Array.isArray(health.models) ? Object.fromEntries(health.models.map(m => [gpuOf(m.model), m])) : {};
+  const gpus = (health.gpus || []).map(g => {
+    const row = el('div', undefined, 'gpu');
+    const name = `GPU ${g.index}`;
+    const q = queues[name];
+    row.append(el('div', `${name} · ${g.name}`, 'name'), el('div', `${g.util}%`, 'pct'),
+      el('div', `${bytes(g.mem_used * 1048576)} of ${bytes(g.mem_total * 1048576)} · ${g.temp}°C` + (q ? ` · ${q.running}/${q.capacity} requests, ${q.waiting} queued` : ''), 'muted small'),
+      bar(Number(g.util)));
+    const l = (leads[name] || []).length, h = (helps[name] || []).length;
+    row.append(el('div', l || h ? [l ? `leading ${plural(l, 'task')}` : '', h ? `helping ${plural(h, 'task')}` : ''].filter(Boolean).join(', ') : 'idle', 'role'));
+    return row;
+  });
+  if (gpus.length) fill('gpus', gpus); else empty('gpus', 'GPU readings are unavailable.');
+
+  const decisions = activity.jobs.reduce((a, j) => a + (j.finished_at && Date.now() - Date.parse(j.finished_at) < 86400000 ? j.jev_calls || 0 : 0), 0);
+  kv('box', [
+    ['Disk', disk ? `${disk.free_gb} GB free of ${disk.total_gb} GB` : null],
+    ['Image box', health.image_box ? (health.image_box.ok ? 'up' : 'down' + (health.image_box.error ? ` (${health.image_box.error})` : '')) : 'not configured'],
+    ['Tor', health.tor ? (health.tor.state || health.tor.status || (health.tor.ok ? 'ready' : 'not ready')) : 'not running'],
+    ['Jev today', `${plural(decisions, 'decision')}`],
+    ['App code', health.code ? health.code.slice(0, 7) : 'built into the image'],
+  ]);
   renderRecent();
 }
-function renderRecent() {
-  const who = $('who-filter').value;
-  const jobs = (cache.activity || []).filter(j => j.status !== 'running' && j.status !== 'queued' && (!who || (j.requested_by || 'console') === who)).slice(0, 30);
-  if (!jobs.length) return empty('recent', 'No finished tasks yet.');
-  $('recent').replaceChildren(...jobs.map(j => jobItem(j, false)));
-}
-function jobItem(j, live) {
-  const item = el('div', undefined, 'item click');
-  const line = el('div', undefined, 'line1'); line.append(el('div', request(j.task).slice(0, 160) || '(no text)', 'title'), badge(j.status));
+
+function taskCard(j) {
+  const card = el('div', undefined, 'task');
+  const ask = el('div', request(j.task).slice(0, 220) || '(no text)', 'ask');
+  ask.addEventListener('click', () => openJob(j.id));
   const meta = el('div', undefined, 'meta');
-  meta.append(el('span', j.requested_by || 'console'), el('span', ago(j.started_at || j.created_at)), el('span', `${j.actions} actions`), el('span', `${j.files} files`));
-  if (j.error) meta.append(el('span', j.error.slice(0, 120)));
-  item.append(line, meta);
-  if (live) { const row = el('div', undefined, 'actions'); row.append(btn('Stop', async () => { await api(`jobs/${j.id}/cancel`, {}); refresh(); }, 'small ghost danger')); item.append(row); }
-  item.addEventListener('click', () => openJob(j.id));
-  return item;
+  meta.append(el('span', SOURCE[source(j)]));
+  if (j.automatic) meta.append(el('span', 'continued automatically'));
+  const g = lead(j);
+  if (g) meta.append(el('span', `lead on ${gpuOf(g.lead)}, helpers on ${gpuOf(g.helper)}`));
+  meta.append(el('span', j.status === 'queued' ? 'waiting for a slot' : `${since(j.started_at)} in`));
+  if (j.claude_calls) meta.append(el('span', `${plural(j.claude_calls, 'Claude hand-off')}`));
+  if (j.jev_calls) meta.append(el('span', `${plural(j.jev_calls, 'Jev decision')}`));
+  card.append(ask, meta);
+  if (j.question) {
+    const w = el('div', undefined, 'waiting');
+    w.append(el('b', 'Waiting for your answer. '), document.createTextNode(j.question.slice(0, 400)));
+    card.append(w);
+  } else if (j.step) card.append(el('div', readable(j.step).slice(0, 240), 'step'));
+  const controls = el('div', undefined, 'controls');
+  controls.append(btn('Details', () => openJob(j.id), 'secondary small'),
+    btn('Stop', async () => { if (!confirm('Stop this task? Files made so far stay in the chat folder.')) return; await api(`jobs/${j.id}/cancel`, {}); refresh(); }, 'secondary small'));
+  card.append(controls);
+  return card;
 }
+
+function renderRecent() {
+  const want = $('source-filter').value;
+  const jobs = (cache.activity || []).filter(j => j.status !== 'running' && j.status !== 'queued' && (!want || source(j) === want)).slice(0, 30);
+  if (!jobs.length) return empty('recent', 'No finished tasks yet.');
+  fill('recent', jobs.map(j => {
+    const row = el('div', undefined, 'row-item click');
+    const l = el('div', undefined, 'line1');
+    l.append(el('span', request(j.task).slice(0, 160) || '(no text)', 'title'), badge(j.status === 'completed' ? 'done' : j.status, ['failed', 'interrupted'].includes(j.status) ? 'attention' : ''));
+    const meta = el('div', undefined, 'meta');
+    meta.append(el('span', SOURCE[source(j)]), el('span', ago(j.finished_at || j.created_at)));
+    if (j.automatic) meta.append(el('span', 'continued automatically'));
+    meta.append(el('span', plural(j.actions, 'action')));
+    if (j.files) meta.append(el('span', plural(j.files, 'file')));
+    if (j.claude_calls) meta.append(el('span', 'Claude Code'));
+    if (j.jev_calls) meta.append(el('span', plural(j.jev_calls, 'Jev decision')));
+    if (j.error) meta.append(el('span', j.error.slice(0, 120)));
+    row.append(l, meta);
+    row.addEventListener('click', () => openJob(j.id));
+    return row;
+  }));
+}
+
 async function openJob(id) {
   const t = await api(`jobs/${id}/timeline`);
-  $('drawer-title').textContent = request(t.task).slice(0, 80) || 'Task';
+  $('drawer-title').textContent = request(t.task).slice(0, 90) || 'Task';
   const body = $('drawer-body'); body.replaceChildren();
   const info = el('div', undefined, 'kv');
-  for (const [k, v] of [['Status', t.status], ['Who', t.requested_by || 'console'], ['Profile', t.profile], ['Started', t.started_at ? new Date(t.started_at).toLocaleString() : '—'], ['Finished', t.finished_at ? new Date(t.finished_at).toLocaleString() : '—'], ['Model calls', t.model_calls], ['Chat folder', t.thread || '—']]) { info.append(el('div', k, 'k'), el('div', String(v ?? '—'), 'v')); }
+  const from = t.requested_by === 'telegram' ? 'Telegram' : !t.requested_by ? 'Console' : t.skill === 'chat' ? 'Qwen (chat)' : 'Qwen Cowork';
+  const gpus = (t.events.find(e => e.kind === 'tool' && e.detail.startsWith('Lead on ')) || {}).detail;
+  for (const [k, v] of [['Status', t.status], ['From', from], ['Time budget', t.profile], ['GPUs', gpus ? gpus.replace(/qwen-\d/g, m => gpuOf(m)).replace('Lead on ', 'lead on ') : null],
+    ['Started', t.started_at ? new Date(t.started_at).toLocaleString() : null], ['Finished', t.finished_at ? new Date(t.finished_at).toLocaleString() : null],
+    ['Model calls', t.model_calls], ['Chat folder', t.thread]]) { info.append(el('div', k, 'k'), el('div', String(v ?? 'none'), 'v')); }
   body.append(info);
   const row = el('div', undefined, 'row');
-  if (t.status === 'running' || t.status === 'queued') row.append(btn('Stop task', async () => { await api(`jobs/${id}/cancel`, {}); openJob(id); refresh(); }, 'ghost danger'));
-  if (['failed', 'interrupted', 'cancelled'].includes(t.status)) row.append(btn('Run again from where it stopped', async () => { await api(`jobs/${id}/resume`, {}); openJob(id); refresh(); }));
-  body.append(row);
+  if (t.status === 'running' || t.status === 'queued') row.append(btn('Stop task', async () => { await api(`jobs/${id}/cancel`, {}); openJob(id); refresh(); }, 'secondary danger'));
+  if (['failed', 'interrupted', 'cancelled'].includes(t.status)) row.append(btn('Run again from where it stopped', async () => { await api(`jobs/${id}/resume`, {}); openJob(id); refresh(); }, 'primary'));
+  if (row.children.length) body.append(row);
   if (t.plan && t.plan.length) { body.append(el('h3', 'Plan')); const ul = el('ul', undefined, 'plan'); for (const s of t.plan) ul.append(el('li', s.title, s.status)); body.append(ul); }
   if (t.artifacts && t.artifacts.length) {
     body.append(el('h3', 'Files shared'));
-    const list = el('div', undefined, 'list');
-    for (const a of t.artifacts) { const it = el('div', undefined, 'item'); const l = el('div', undefined, 'line1'); l.append(el('span', a.name, 'title'), btn('Download', () => download(`artifacts/${a.id}`, a.name), 'small ghost')); it.append(l); list.append(it); }
+    const list = el('div', undefined, 'rows');
+    for (const a of t.artifacts) { const it = el('div', undefined, 'row-item'); const l = el('div', undefined, 'line1'); l.append(el('span', a.name, 'title'), btn('Download', () => download(`artifacts/${a.id}`, a.name), 'secondary small')); it.append(l); list.append(it); }
     body.append(list);
   }
   if (t.result || t.error) { body.append(el('h3', t.result ? 'Reply' : 'Error')); body.append(el('div', t.result || t.error, 'result')); }
   body.append(el('h3', 'What it did'));
   const tl = el('div', undefined, 'timeline');
-  for (const e of t.events) { if (['usage', 'model'].includes(e.kind)) continue; const r = el('div', undefined, 'ev'); r.append(el('span', new Date(e.created_at).toLocaleTimeString(), 't'), el('span', e.kind === 'artifact' ? 'Shared ' + (safeJSON(e.detail).name || 'a file') : e.detail, 'd')); tl.append(r); }
+  let thinking = null;
+  for (const e of t.events) {
+    if (['usage', 'model'].includes(e.kind)) continue;
+    if (e.kind === 'reasoning') {  // streamed thoughts: one collapsed block per stretch of thinking
+      if (!thinking) { thinking = el('details'); thinking.append(el('summary', 'Thinking'), el('div', '', 'text')); tl.append(thinking); }
+      thinking.lastChild.textContent += e.detail;
+      continue;
+    }
+    thinking = null;
+    if (e.kind === 'escalation-done' && e.detail.startsWith('jev:')) continue;
+    const r = el('div', undefined, 'ev');
+    r.append(el('span', new Date(e.created_at).toLocaleTimeString(), 't'), el('span', e.kind === 'artifact' ? 'Shared ' + (safeJSON(e.detail).name || 'a file') : readable(e.detail), 'd'));
+    tl.append(r);
+  }
   body.append(tl);
-  body.append(el('h3', 'Request (with the chat so far)'));
+  body.append(el('h3', 'Request, with the chat so far'));
   body.append(el('div', t.task, 'result'));
   $('drawer').hidden = false;
 }
-function safeJSON(text) { try { return JSON.parse(text); } catch { return {}; } }
 
 // ---------- CHATS ----------
 async function loadChats() {
   const data = await api('chats');
-  $('chats-free').textContent = `${data.free_gb} GB free on disk`;
+  const total = data.chats.reduce((a, c) => a + (c.bytes || 0), 0);
+  $('chats-headline').textContent = data.chats.length ? `${plural(data.chats.length, 'chat folder')} using ${bytes(total)}. ${data.free_gb} GB free.` : `No chat folders yet. ${data.free_gb} GB free.`;
   if (!data.chats.length) return empty('chats', 'No chat folders yet.');
   const head = el('div', undefined, 'trow head');
-  for (const h of ['Who', 'Last request', 'Tasks', 'Size', 'Changed', '']) head.append(el('div', h, 'cell'));
+  for (const h of ['Latest request', 'Tasks', 'Size', 'Changed', '']) head.append(el('div', h, 'cell'));
   const rows = data.chats.map(c => {
     const r = el('div', undefined, 'trow');
-    r.append(el('div', c.account === 'owner' ? 'You' : (c.who || c.owner), 'cell'), el('div', c.last_request || c.thread, 'cell'), el('div', String(c.tasks), 'cell'), el('div', bytes(c.bytes), 'cell'), el('div', ago(c.modified), 'cell'));
+    const label = (c.last_request || c.thread) + (c.account !== 'owner' ? ` (${c.owner})` : '');
+    r.append(el('div', label, 'cell'), el('div', String(c.tasks), 'cell'), el('div', bytes(c.bytes), 'cell'), el('div', ago(c.modified), 'cell'));
     const a = el('div', undefined, 'actions');
-    a.append(btn('Files', () => openFiles(c), 'small ghost'));
-    a.append(btn('Delete', async () => { if (!confirm(`Delete this chat's folder (${bytes(c.bytes)})? Files in it are gone for good.`)) return; await api('chats/delete', {account: c.account, thread: c.thread}); loadChats(); }, 'small ghost danger'));
+    a.append(btn('Files', () => openFiles(c), 'secondary small'));
+    a.append(btn('Delete', async () => { if (!confirm(`Delete this chat's folder (${bytes(c.bytes)})? Files in it are gone for good.`)) return; await api('chats/delete', {account: c.account, thread: c.thread}); loadChats(); }, 'secondary small danger'));
     r.append(a); return r;
   });
-  $('chats').replaceChildren(head, ...rows);
+  fill('chats', [head, ...rows]);
 }
 async function openFiles(c) {
   const project = projectFor(c.account);
   const data = await api(`workspace/files?project=${encodeURIComponent(project)}&thread=${encodeURIComponent(c.thread)}`);
-  $('files-title').textContent = `Files · ${c.last_request ? c.last_request.slice(0, 60) : c.thread}`;
+  $('files-title').textContent = `Files in ${c.last_request ? '"' + c.last_request.slice(0, 50) + '"' : c.thread}`;
   $('files-panel').hidden = false;
-  if (!data.files.length) return empty('files', 'This folder is empty.');
-  $('files').replaceChildren(...data.files.map(f => {
-    const it = el('div', undefined, 'item'); const l = el('div', undefined, 'line1');
-    l.append(el('span', f.path, 'title'), el('span', bytes(f.bytes), 'muted small'));
-    l.append(btn('Download', () => download(`workspace/file?project=${encodeURIComponent(project)}&thread=${encodeURIComponent(c.thread)}&path=${encodeURIComponent(f.path)}`, f.path.split('/').pop()), 'small ghost'));
+  if (!data.files.length) empty('files', 'This folder is empty.');
+  else fill('files', data.files.map(f => {
+    const it = el('div', undefined, 'row-item'); const l = el('div', undefined, 'line1');
+    const right = el('span', undefined, 'actions');
+    right.append(el('span', bytes(f.bytes), 'muted small'), btn('Download', () => download(`workspace/file?project=${encodeURIComponent(project)}&thread=${encodeURIComponent(c.thread)}&path=${encodeURIComponent(f.path)}`, f.path.split('/').pop()), 'secondary small'));
+    l.append(el('span', f.path, 'title'), right);
     it.append(l); return it;
   }));
-  $('files-panel').scrollIntoView({behavior: 'smooth'});
+  $('files-panel').scrollIntoView({block: 'start'});
+}
+
+// ---------- KNOWLEDGE ----------
+async function loadKnowledge() {
+  const data = await api('knowledge?search=' + encodeURIComponent($('knowledge-search').value));
+  $('knowledge-headline').textContent = !data.total ? 'Nothing studied yet.' : data.total === 1 ? 'One post studied.' : `${data.total} posts and profiles studied.`;
+  if (!data.documents.length) return empty('knowledge', data.total ? 'Nothing matches.' : 'Send a TikTok, Reel, X thread or Reddit link to the Telegram bot, or ask Cowork to study a post or profile.');
+  fill('knowledge', data.documents.map(d => {
+    // Titles look like "UGC: …" for posts and "@handle: …" for profiles.
+    const [area, ...rest] = d.title.includes(': ') ? d.title.split(': ') : ['', d.title];
+    const profile = area.startsWith('@');
+    const label = profile ? 'profile' : ({ugc: 'UGC', gtm: 'GTM'})[area.toLowerCase()] || area.toLowerCase();
+    const it = el('div', undefined, 'row-item click');
+    const l = el('div', undefined, 'line1');
+    l.append(el('span', profile ? d.title : rest.join(': ') || d.title, 'title'), area ? badge(label, 'on') : el('span'));
+    const meta = el('div', undefined, 'meta');
+    let host = ''; try { host = new URL(d.source).hostname.replace(/^www\./, ''); } catch { host = d.source; }
+    meta.append(el('span', host), el('span', ago(d.created_at)));
+    it.append(l, meta);
+    it.addEventListener('click', () => openDocument(d));
+    return it;
+  }));
+}
+async function openDocument(d) {
+  const doc = await api(`knowledge/${encodeURIComponent(d.id)}`);
+  $('drawer-title').textContent = doc.title;
+  const body = $('drawer-body');
+  const where = el('div', undefined, 'row'); where.append(link('Open the original post', doc.source), el('span', 'Studied ' + ago(doc.created_at), 'muted small'));
+  const text = (doc.text || '(no saved text)').replace(/^#\s+.*\n+/, '');  // the drawer already shows the title
+  body.replaceChildren(where, markdown(text));
+  $('drawer').hidden = false;
+}
+
+// Just enough markdown for saved playbooks: headings, bullets and numbered steps, built as DOM (never innerHTML).
+function markdown(text) {
+  const box = el('div', undefined, 'doc');
+  let list = null;
+  for (const raw of text.split('\n')) {
+    const line = raw.trimEnd();
+    const bullet = /^\s*(?:[-*]|\d+[.)])\s+(.*)$/.exec(line);
+    if (bullet) {
+      if (!list) { list = el(/^\s*\d/.test(line) ? 'ol' : 'ul'); box.append(list); }
+      list.append(el('li', bullet[1])); continue;
+    }
+    list = null;
+    const heading = /^(#{1,4})\s+(.*)$/.exec(line);
+    if (heading) box.append(el(heading[1].length <= 1 ? 'h2' : 'h3', heading[2]));
+    else if (line.trim()) box.append(el('p', line));
+  }
+  return box;
 }
 
 // ---------- MEMORY ----------
 async function loadMemory() {
   const data = await api('memories?search=' + encodeURIComponent($('memory-search').value));
   if (!data.memories.length) return empty('memories', 'Nothing saved yet. Cowork saves preferences, decisions and facts as it works.');
-  $('memories').replaceChildren(...data.memories.map(m => {
-    const it = el('div', undefined, 'item');
+  fill('memories', data.memories.map(m => {
+    const it = el('div', undefined, 'row-item');
     const l = el('div', undefined, 'line1'); l.append(el('span', m.title, 'title'), badge(m.kind));
-    const meta = el('div', undefined, 'meta'); meta.append(el('span', m.project_name), el('span', ago(m.updated_at)));
+    const meta = el('div', undefined, 'meta');
+    meta.append(el('span', m.thread ? 'Chat: ' + (m.chat_request ? m.chat_request.trim().slice(0, 80) : m.thread) : 'Shared (from before per-chat memory)'), el('span', ago(m.updated_at)));
     const text = el('div', m.content, 'text');
     const a = el('div', undefined, 'actions');
     a.append(btn('Edit', () => {
       const area = el('textarea'); area.value = m.content;
-      const save = btn('Save', async () => { await api(`memories/${m.id}`, {title: m.title, content: area.value, kind: m.kind}); loadMemory(); }, 'small');
-      text.replaceWith(area); a.replaceChildren(save, btn('Cancel', loadMemory, 'small ghost'));
-    }, 'small ghost'));
-    a.append(btn('Forget', async () => { if (!confirm('Forget this memory?')) return; await api(`memories/${m.id}/delete`, {}); loadMemory(); }, 'small ghost danger'));
+      const save = btn('Save', async () => { await api(`memories/${m.id}`, {title: m.title, content: area.value, kind: m.kind}); loadMemory(); }, 'primary small');
+      text.replaceWith(area); a.replaceChildren(save, btn('Cancel', loadMemory, 'secondary small'));
+    }, 'secondary small'));
+    a.append(btn('Forget', async () => { if (!confirm('Forget this memory?')) return; await api(`memories/${m.id}/delete`, {}); loadMemory(); }, 'secondary small danger'));
     it.append(l, meta, text, a); return it;
   }));
 }
@@ -486,10 +645,12 @@ $('audience-export-form').addEventListener('submit', ev => audienceSubmit(ev, as
   $('audience-export-form').querySelector('.form-message').textContent = records.length ? `Prepared ${records.length} preference example${records.length === 1 ? '' : 's'}. Use the download links below.` : 'No eligible comparisons yet. Review the reasons below.';
 }));
 
+
 // ---------- PHONE ----------
 async function loadPhone() {
   const p = await api('phone');
   cache.phone = p;
+  $('phone-headline').textContent = p.connected ? 'The phone is connected.' : p.last_seen ? `The phone was last seen ${ago(p.last_seen)}.` : 'No phone connected yet.';
   $('phone-state').textContent = p.connected ? 'connected' : 'offline'; $('phone-state').className = 'badge ' + (p.connected ? 'connected' : 'offline');
   const i = p.info || {};
   kv('phone-info', [['Phone', i.device ? `${i.model || ''} (${i.device})` : 'none'], ['Android', i.android], ['Screen', i.size ? i.size.join(' × ') : null], ['PC', i.host], ['Last contact', p.last_seen ? ago(p.last_seen) : 'never']]);
@@ -499,7 +660,7 @@ async function loadPhone() {
   cache.phoneCommand = `python bridge.py --url ${url} --key ${p.key}`;
   $('phone-reveal').textContent = phoneKeyShown ? 'Hide key' : 'Show key';
   if (p.screen && p.screen.jpeg && cache.phoneShot !== p.screen.at) { cache.phoneShot = p.screen.at; $('phone-screen').replaceChildren(imageFromBase64(p.screen.jpeg)); }
-  kv('phone-posts', (p.posts || []).length ? p.posts.map(r => [r.platform, `${r.n} posts · last ${ago(r.last)}`]) : [['Posts', 'none yet']]);
+  kv('phone-posts', (p.posts || []).length ? p.posts.map(r => [r.platform, `${r.n} posts, last ${ago(r.last)}`]) : [['Posts', 'none yet']]);
   $('phone-log').replaceChildren(...(p.log || []).slice().reverse().map(l => el('div', `${new Date(l.at).toLocaleTimeString()}  ${l.text}`)));
   if (!(p.log || []).length) $('phone-log').replaceChildren(el('div', 'No activity yet.', 'muted'));
   $('phone-shot').disabled = !p.connected;
@@ -509,44 +670,90 @@ $('phone-reveal').addEventListener('click', () => { phoneKeyShown = !phoneKeySho
 $('phone-rotate').addEventListener('click', async () => { if (!confirm('Make a new bridge key? The bridge on the PC stops working until you restart it with the new key.')) return; await api('phone/key', {}); phoneKeyShown = true; loadPhone(); });
 $('phone-shot').addEventListener('click', async () => { $('phone-shot').disabled = true; try { await api('phone/screen', {}); await loadPhone(); } catch (e) { notice(e.message); } finally { $('phone-shot').disabled = false; } });
 
-// ---------- PEOPLE ----------
-async function loadPeople() {
-  const o = await api('overview');
-  const head = el('div', undefined, 'trow people head');
-  for (const h of ['Person', 'Tasks', 'Running', 'Done', 'Failed', 'Tokens in / out', 'Last task']) head.append(el('div', h, 'cell'));
-  const rows = o.people.map(p => { const r = el('div', undefined, 'trow people'); for (const v of [p.who, p.tasks, p.active, p.completed, p.failed, `${(p.input_tokens / 1000).toFixed(0)}K / ${(p.output_tokens / 1000).toFixed(0)}K`, ago(p.last_task)]) r.append(el('div', String(v ?? 0), 'cell')); return r; });
-  $('people').replaceChildren(head, ...rows);
+// ---------- CONNECTIONS ----------
+const DECISIONS = {
+  'ask first?': 'Ask questions before starting?', 'route to Claude?': 'Send the request to Claude Code?',
+  'is the reply complete?': 'Is the reply complete?', 'continue?': 'Continue after a time limit?',
+  'worth studying?': 'Is a post worth a full study?', 'approval check': 'Is an approval to post real?',
+  'trend research ranking': 'Rank trend research results',
+};
+async function loadConnections() {
+  const settled = await Promise.allSettled([api('overview'), api('connections/social'), api('posts'), api('connections/tools'),
+    api('connections/higgsfield'), api('connections/telegram')]);
+  const [o, social, posts, tools, higgsfield, telegram] = settled.map(r => r.status === 'fulfilled' ? r.value : null);
+  if (!o) throw Error(settled[0].reason.message);
   const c = o.connections || {};
-  if (c.error) kv('connections', [['Status', c.error]]);
-  else kv('connections', Object.entries(c).map(([k, v]) => [({claude: 'Claude Code', codex: 'Codex', jev: 'Jev (TypeSafe)'})[k] || k, `${v.signed_in ? 'connected' : 'not connected'}${v.installed ? '' : ' (not installed)'} · ${v.used_today}/${v.daily_limit} today`]));
-  try {
-    const [social, posts] = await Promise.all([api('connections/social'), api('posts')]);
-    const names = {x: 'X', instagram: 'Instagram posting', tiktok: 'TikTok analytics', bluesky: 'Bluesky', github: 'GitHub', scrapecreators: 'ScrapeCreators'};
-    kv('social', [['Research tools', social.tools.state + (social.tools.detail ? ' — ' + social.tools.detail.slice(0, 160) : '')],
-      ...Object.entries(social.accounts).map(([k, v]) => [names[k] || k, v.connected ? 'connected' + (v.username ? ' as @' + v.username : '') : 'not connected'])]);
-    if (!posts.posts.length) empty('posts', 'No drafts yet.');
-    else $('posts').replaceChildren(...posts.posts.map(p => { const it = el('div', undefined, 'item'); const l = el('div', undefined, 'line1');
-      l.append(el('span', `#${p.id} · ${p.platform}${p.kind ? ' ' + p.kind : ''}`, 'title'), badge(p.status, {published: 'completed', draft: 'queued', on_phone: 'running'}[p.status] || p.status));
-      it.append(l, el('div', p.caption.slice(0, 280), 'text'), el('div', ago(p.updated_at), 'meta')); return it; }));
-  } catch (e) { kv('social', [['Status', e.message]]); }
-  if (!o.escalations.length) empty('handoffs', 'No hand-offs yet.');
-  else $('handoffs').replaceChildren(...o.escalations.map(e => { const it = el('div', undefined, 'item'); it.append(el('div', e.detail, 'text'), el('div', `${e.requested_by || ''} · ${ago(e.created_at)}`, 'meta')); return it; }));
+  const names = {claude: 'Claude Code', codex: 'Codex', jev: 'Jev (TypeSafe)'};
+  const unit = {claude: 'tasks', codex: 'tasks', jev: 'requests'};
+  if (c.error) empty('agents', c.error);
+  else fill('agents', Object.entries(c).map(([k, v]) => {
+    const row = el('div', undefined, 'agent');
+    const count = el('div', String(v.used_today), 'count'); count.append(el('small', ` / ${v.daily_limit}`));
+    row.append(el('div', names[k] || k, 'name'), count,
+      el('div', `${v.signed_in ? 'connected' : 'not connected'}${v.installed ? '' : ', not installed'} · ${unit[k] || 'uses'} in the last 24 hours`, 'state'));
+    return row;
+  }));
+  const claude = (c.claude || {}).used_today || 0, jev = (o.jev_decisions || []).reduce((a, d) => a + d.asked, 0);
+  $('connections-headline').textContent = `Claude Code took ${plural(claude, 'task')} today. Jev made ${plural(jev, 'decision')}.`;
+
+  if (!(o.jev_decisions || []).length) empty('decisions', (c.jev || {}).signed_in ? 'No Jev decisions in the last 24 hours.' : 'Jev isn\'t connected. Send /connect typesafe <key> in a Cowork chat.');
+  else fill('decisions', o.jev_decisions.map(d => {
+    const row = el('div', undefined, 'row-item'); const l = el('div', undefined, 'line1');
+    l.append(el('span', DECISIONS[d.purpose] || d.purpose, 'title'), el('span', `${d.asked}${d.failed ? `, ${d.failed} failed` : ''}`, 'muted'));
+    row.append(l); return row;
+  }));
+
+  const pairs = [];
+  if (social) {
+    const labels = {x: 'X', instagram: 'Instagram posting', tiktok: 'TikTok analytics', bluesky: 'Bluesky', github: 'GitHub', scrapecreators: 'ScrapeCreators'};
+    pairs.push(['Research tools', social.tools.state + (social.tools.detail ? ': ' + social.tools.detail.slice(0, 140) : '')]);
+    for (const [k, v] of Object.entries(social.accounts)) pairs.push([labels[k] || k, v.connected ? 'connected' + (v.username ? ' as @' + v.username : '') : 'not connected']);
+  }
+  if (higgsfield) pairs.push(['Higgsfield', higgsfield.connected ? `connected${(higgsfield.tools || []).length ? `, ${higgsfield.tools.length} tools` : ''}` : higgsfield.status === 'awaiting_sign_in' ? 'sign-in pending' : 'not connected']);
+  if (telegram) pairs.push(['Telegram', telegram.connected ? `@${telegram.bot}${telegram.paired ? ', paired' : ', waiting for /start'}` : 'not connected']);
+  if (tools) {
+    for (const [name, item] of Object.entries(tools.mcp || {})) if (name !== 'higgsfield') pairs.push([`MCP ${name}`, `${item.transport} (${item.target})`]);
+    for (const [name, item] of Object.entries(tools.api || {})) pairs.push([`API ${name}`, `${item.host} (${(item.methods || []).join(', ')})`]);
+  }
+  kv('accounts', pairs.length ? pairs : [['Status', 'unavailable']]);
+
+  const handoffs = (o.escalations || []).filter(e => !e.detail.startsWith('jev:') || e.detail.endsWith('failed'));
+  if (!handoffs.length) empty('handoffs', 'No hand-offs yet.');
+  else fill('handoffs', handoffs.map(e => { const it = el('div', undefined, 'row-item'); it.append(el('div', readable(e.detail).slice(0, 300), 'text'), el('div', ago(e.created_at), 'meta')); return it; }));
+
+  if (!posts || !posts.posts.length) empty('posts', 'No drafts yet.');
+  else fill('posts', posts.posts.map(p => {
+    const it = el('div', undefined, 'row-item'); const l = el('div', undefined, 'line1');
+    l.append(el('span', `#${p.id} · ${p.platform}${p.kind ? ' ' + p.kind : ''}`, 'title'), badge(p.status.replace('_', ' '), p.status === 'draft' ? 'attention' : ''));
+    it.append(l, el('div', p.caption.slice(0, 280), 'text'), el('div', ago(p.updated_at), 'meta')); return it;
+  }));
 }
 
 // ---------- SYSTEM ----------
 async function loadSystem() {
   const [h, m] = await Promise.all([api('health'), api('admin/migrate')]);
-  kv('system', [['App code', h.code ? h.code.slice(0, 12) : 'built into the image'], ['Startup', h.startup ? `${h.startup.phase}${h.startup.detail ? ' — ' + h.startup.detail : ''}` : '—'],
-    ['GPUs', (h.gpus || []).map(g => `${g.index}: ${g.name}`).join(', ') || '—'],
-    ['Models', Array.isArray(h.models) ? h.models.map(x => `${x.model} ${x.running}/${x.capacity}`).join(' · ') : 'unreachable'],
-    ['Image box', h.image_box ? (h.image_box.ok ? 'up' : 'down') : 'not configured'], ['Checked', new Date(h.at).toLocaleTimeString()]]);
-  $('disks').replaceChildren(...Object.entries(h.disks || {}).map(([k, d]) => { const it = el('div', undefined, 'item'); const l = el('div', undefined, 'line1'); l.append(el('span', `${k} (${d.path})`, 'title'), el('span', `${d.free_gb} GB free of ${d.total_gb} GB`, 'muted small')); it.append(l, bar(d.used_pct)); return it; }));
-  $('migrate-state').textContent = m.state; $('migrate-state').className = 'badge ' + m.state;
+  $('system-headline').textContent = h.code ? `Running app code ${h.code.slice(0, 7)}.` : 'Running the code built into the image.';
+  kv('system', [
+    ['App code', h.code ? link(h.code.slice(0, 12), `${REPO}/commit/${h.code}`) : 'built into the image'],
+    ['Startup', h.startup ? `${h.startup.phase}${h.startup.detail ? ': ' + h.startup.detail : ''}` : null],
+    ['GPUs', (h.gpus || []).map(g => `${g.index}: ${g.name}`).join(', ') || null],
+    ['Models', Array.isArray(h.models) ? h.models.map(x => `${x.model} on ${gpuOf(x.model)}, ${x.running}/${x.capacity} busy`).join(' · ') : 'unreachable'],
+    ['Image box', h.image_box ? (h.image_box.ok ? 'up' : 'down' + (h.image_box.error ? ` (${h.image_box.error})` : '')) : 'not configured'],
+    ['Tor', h.tor ? `${h.tor.state || 'unknown'}${h.tor.detail ? ': ' + h.tor.detail : ''}` : 'not running'],
+    ['Checked', new Date(h.at).toLocaleTimeString()],
+  ]);
+  fill('disks', Object.entries(h.disks || {}).map(([k, d]) => {
+    const it = el('div', undefined, 'row-item'); const l = el('div', undefined, 'line1');
+    l.append(el('span', k, 'title'), el('span', `${d.free_gb} GB free of ${d.total_gb} GB`, 'muted small'));
+    it.append(l, bar(d.used_pct)); return it;
+  }));
+  $('migrate-state').textContent = m.state; $('migrate-state').className = 'badge ' + (m.state === 'failed' ? 'attention' : m.state);
   kv('migrate', m.state === 'idle' ? [['Status', 'Not in progress']] : [['Target', m.target], ['Sent', bytes(m.bytes)], ['Files', m.files], ['Error', m.error], ['Receiver', m.receiver ? JSON.stringify(m.receiver) : null]]);
 }
 
 // ---------- loop ----------
-const loaders = {now: loadNow, chats: loadChats, memory: loadMemory, audience: loadAudience, phone: loadPhone, people: loadPeople, system: loadSystem};
+const loaders = {now: loadNow, chats: loadChats, knowledge: loadKnowledge, memory: loadMemory, audience: loadAudience,
+                 phone: loadPhone, connections: loadConnections, system: loadSystem};
 let busy = false;
 async function refresh() {
   if (busy) return; busy = true;
