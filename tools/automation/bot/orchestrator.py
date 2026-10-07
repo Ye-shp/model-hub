@@ -17,6 +17,8 @@ from .drivers.instagram import InstagramDriver
 from .drivers.tiktok import TikTokDriver
 from .state import AccountState, StateStore, iso, parse_iso
 from .watcher import ShadowbanWatcher, WatchResult
+from .mediaprep import MediaPrep, MediaPrepError
+from .aifinger import scan as _afscan, AIFingerReport as _ScanReport
 
 log = logging.getLogger("bot.orchestrator")
 UTC = timezone.utc
@@ -52,6 +54,9 @@ class Orchestrator:
                                         tiktok_package=cfg.instance.tiktok_package)
         self._devices: dict[str, DeviceController] = {}
         self._sched: dict[str, datetime] = {}   # job_id -> chosen slot (stable between polls)
+        # Anti-AI-detection media pipeline (see bot/mediaprep.py + bot/aifinger.py).
+        # Built lazily here so the orchestrator can run in dry-run without ffmpeg.
+        self._mediaprep: MediaPrep | None = MediaPrep(cfg.mediaprep, dry_run=dry_run)
 
     # ------------------------------------------------------------------ wiring
     def device_for(self, account: Account) -> DeviceController:
@@ -62,6 +67,55 @@ class Orchestrator:
                 account.device_serial, dc.adb_addr if dc else None, dry_run=self.dry_run, adb_bin=i.adb_bin,
                 scrcpy_bin=i.scrcpy_bin, scrcpy_args=i.scrcpy_args, screenshots_dir=self.cfg.path(i.screenshots_dir))
         return self._devices[account.device_serial]
+
+    def prepare_media(self, job: PostJob) -> Path:
+        """Scan + prep the video before it is pushed to the phone.
+
+        Returns the path the driver should use (prepared file if the pipeline ran,
+        otherwise the original).  In dry-run the pipeline is logged but not executed.
+        """
+        mp = self._mediaprep
+        if mp is None or not mp.enabled:
+            return job.asset_path
+
+        src = job.asset_path
+        if not src.exists():
+            log.debug("asset not on disk yet (%s) — skipping media prep (dry-run)", src.name)
+            return src
+
+        # 1) scan the source
+        pre_scan = _afscan(src)
+        log.info("AI-finger pre-scan  %s -> %s (%d strong, %d weak)",
+                 src.name, pre_scan.verdict, pre_scan.strong_count, pre_scan.weak_count)
+        for f in pre_scan.findings:
+            log.info("  [%s] %s", f.severity, f.detail)
+
+        # 2) prepare (re-encode + strip + humanise)
+        prep_res = mp.prepare(src, platform=job.platform.value)
+        if not prep_res.ok:
+            if self.dry_run:
+                log.warning("media prep failed (dry-run, continuing): %s", prep_res.error)
+                return src
+            raise MediaPrepError(f"media prep failed for {src}: {prep_res.error}")
+
+        # 3) scan the output
+        post_scan = _afscan(Path(prep_res.dst))
+        log.info("AI-finger post-scan %s -> %s (%d strong, %d weak)",
+                 Path(prep_res.dst).name, post_scan.verdict,
+                 post_scan.strong_count, post_scan.weak_count)
+        for f in post_scan.findings:
+            log.info("  [%s] %s", f.severity, f.detail)
+
+        # 4) warn (not block) if the post-scan is worse than pre
+        if post_scan.strong_count > pre_scan.strong_count:
+            log.warning("post-scan has MORE strong findings than pre-scan "
+                        "(%d -> %d); check mediaprep settings",
+                        pre_scan.strong_count, post_scan.strong_count)
+
+        log.info("media prep done: %s -> %s (%.1f MB, %s)",
+                 src.name, Path(prep_res.dst).name, prep_res.size_bytes / 1e6,
+                 "; ".join(prep_res.filters_applied) or "no-op")
+        return Path(prep_res.dst)
 
     def driver_for(self, account: Account) -> BaseDriver:
         kw = dict(dry_run=self.dry_run, rng=self.rng, browse_swipes=self.cfg.cadence.browse_swipes, sleep=self.sleep)
@@ -135,6 +189,15 @@ class Orchestrator:
         if not (force or self.dry_run) and (why := self.gate(acc, now)):
             raise PermissionError("; ".join(why))
         st = self.state_for(acc, now)
+        # Anti-AI-detection: prepare media (scan + prep) before push.
+        # Falls back to the original file if prep fails or is disabled.
+        try:
+            prepared = self.prepare_media(job)
+            if prepared != job.asset_path:
+                log.info("using prepped media: %s", prepared)
+                job.asset_path = prepared
+        except Exception as e:
+            log.warning("media prep failed (%s); posting original", e)
         driver = self.driver_for(acc)
         self._check_egress(acc)
         res = driver.post(job)

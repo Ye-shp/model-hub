@@ -137,6 +137,49 @@ class WatcherCfg:
 
 
 @dataclass
+class MediaPrepCfg:
+    """Anti-AI-detection media pipeline (see bot/mediaprep.py + bot/aifinger.py).
+
+    Applied to every video before it is pushed to the phone. `enabled: false` falls back
+    to the old minimal re-encode. Watermark regions are in pixels of the *source* frame
+    (x,y,w,h) and are clamped to the real frame size automatically.
+    """
+    enabled: bool = True
+    ffmpeg_bin: str = "ffmpeg"
+    ffprobe_bin: str = "ffprobe"
+    # 1. provenance + container
+    strip_c2pa: bool = True
+    strip_metadata: bool = True
+    encoder_tag: str = "Lavf60.3.100"          # replace the encoder tag (hide the real tool)
+    # 2. watermark removal (delogo). Empty regions + remove_watermark=True => default bottom-right box.
+    remove_watermark: bool = False
+    watermark_regions: list[dict] = field(default_factory=list)
+    # 3. humanisation (subtle, breaks the "perfect AI" signal)
+    humanize: bool = True
+    contrast_shift: float = 0.01
+    brightness_shift: float = 0.005
+    grain_strength: int = 2
+    sharpen: bool = True
+    vignette: bool = True
+    # 4. audio
+    normalize_loudness: bool = True
+    loudness_I: float = -14.0                  # target integrated LUFS (IG/TT default loudness)
+    loudness_TP: float = -1.5
+    loudness_LRA: float = 11.0
+    highpass_hz: int = 80
+    # 5. output encode
+    crf: int = 19
+    preset: str = "veryfast"
+    audio_bitrate: str = "192k"
+    target_fps: float = 30.0        # resample to 30 fps (phone default); breaks the 24 fps AI signature. 0 = keep source fps.
+    pix_fmt: str = "yuv420p"
+    # output location (relative to base_dir)
+    output_dir: str = "state/media_prepped"
+    workdir: str = "state/media_work"
+    scan_on_prepare: bool = True               # run the AI-finger scan before + after
+
+
+@dataclass
 class Config:
     dry_run: bool = True
     strict_one_account_per_device: bool = False
@@ -144,6 +187,7 @@ class Config:
     instance: InstanceCfg = field(default_factory=InstanceCfg)
     cadence: CadenceCfg = field(default_factory=CadenceCfg)
     watcher: WatcherCfg = field(default_factory=WatcherCfg)
+    mediaprep: MediaPrepCfg = field(default_factory=MediaPrepCfg)
     source: Path | None = None
     base_dir: Path = ROOT
 
@@ -202,7 +246,7 @@ def _build(cls: type, data: Any, where: str):
 def load_config(path: str | Path | None = None) -> Config:
     p = resolve_with_example(Path(path) if path else ROOT / "config.yaml")
     raw = _read_yaml(p)
-    known = {"dry_run", "strict_one_account_per_device", "devices", "instance", "cadence", "watcher"}
+    known = {"dry_run", "strict_one_account_per_device", "devices", "instance", "cadence", "watcher", "mediaprep"}
     if set(raw) - known:
         raise ConfigError([f"{p.name}: unknown top-level keys {sorted(set(raw) - known)}"])
     cad_raw = dict(raw.get("cadence") or {})
@@ -219,6 +263,7 @@ def load_config(path: str | Path | None = None) -> Config:
         instance=_build(InstanceCfg, raw.get("instance"), "instance"),
         cadence=cadence,
         watcher=_build(WatcherCfg, raw.get("watcher"), "watcher"),
+          mediaprep=_build(MediaPrepCfg, raw.get("mediaprep"), "mediaprep"),
         source=p,
     )
     validate_config(cfg).raise_if_errors()

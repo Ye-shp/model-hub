@@ -62,3 +62,28 @@ watcher:
   pause_days: 7                     # pause length on WARNING / SHADOWBANNED
   tiktok_probe_hashtag: "fyp"       # fallback if the account has no previous hashtag
   tiktok_scan_swipes: 4
+
+# ── Anti-AI-detection media pipeline ───────────────────────────────────────────────────────
+# Every video is prepped (strip C2PA/metadata, delogo watermarks, humanise, loudnorm, re-encode)
+# before it's pushed to the phone. `enabled: false` skips prep and pushes the original file.
+# Watermark regions are in SOURCE-frame pixels [x, y, w, h]; clamped to the real frame automatically.
+mediaprep:
+  enabled: true
+  strip_c2pa: true               # re-encode drops C2PA / Content Credentials JUMBF boxes
+  strip_metadata: true           # -map_metadata -1 (encoder, creation time, comments, tags)
+  encoder_tag: "Lavf60.3.100"    # clean ffmpeg encode tag (matches a standard re-encode)
+  remove_watermark: true         # delogo configured regions (bottom-right by default if empty)
+  # watermark_regions: [[940, 1620, 130, 60]]   # e.g. bottom-right logo on a 1080x1920 frame
+  humanize: true                 # subtle temporal grain + vignette + micro-contrast + sharpen
+  grain_strength: 2              # 1-10 (0 = off); breaks perfectly smooth AI gradients
+  normalize_loudness: true       # loudnorm to platform target (IG/TT default loudness)
+  loudness_I: -14.0              # target integrated LUFS
+  loudness_TP: -1.5              # true peak ceiling (dB)
+  loudness_LRA: 11.0             # loudness range (LU)
+  highpass_hz: 80                # remove low rumble / DC offset
+  crf: 19                        # x264 quality (lower = better; 18 for TikTok, 19 for IG)
+  preset: "veryfast"
+  audio_bitrate: "192k"
+  target_fps: 30                 # resample to 30 fps (phone default) — breaks the 24 fps AI signature; 0 = keep source
+  pix_fmt: "yuv420p"
+  output_dir: "state/media_prepped"

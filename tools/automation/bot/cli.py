@@ -12,6 +12,8 @@ from .config import (Account, Config, ConfigError, Validation, load_accounts, lo
 from .content import ContentPipeline, PostJob
 from .orchestrator import Orchestrator
 from .state import StateStore
+from .mediaprep import MediaPrep
+from .aifinger import scan as _afscan, AIFingerReport as _ScanReport
 
 UTC = timezone.utc
 
@@ -259,6 +261,48 @@ def cmd_schedule(args) -> int:
     return 0
 
 
+def cmd_scan_media(args) -> int:
+    """Scan a media file for AI fingerprints (C2PA, metadata, audio, res/fps)."""
+    from pathlib import Path
+    src = Path(args.file)
+    if not src.exists():
+        print(f"error: {src} not found", file=sys.stderr); return 2
+    rep = _afscan(src)
+    print(f"file    : {src}")
+    print(f"verdict : {rep.verdict}")
+    if rep.findings:
+        for f in rep.findings:
+            print(f"  [{f.severity:<7}] {f.label}: {f.detail}")
+    else:
+        print("  (no signals found)")
+    return 0 if rep.verdict in ("clean",) else 1
+
+
+def cmd_prep_media(args) -> int:
+    """Prepare a media file for posting (strip C2PA/metadata, delogo, humanise, loudnorm, re-encode)."""
+    from pathlib import Path
+    cfg = load_config(args.config)
+    mp = MediaPrep.from_config(cfg.mediaprep, dry_run=getattr(args, "dry_run", False))
+    src = Path(args.file)
+    if not src.exists():
+        print(f"error: {src} not found", file=sys.stderr); return 2
+    dst = Path(args.output) if args.output else None
+    plat = args.platform
+    if mp.dry_run:
+        print(f"DRY-RUN: would prepare {src} -> {mp.output_dir} (platform={plat})")
+        cmd = mp.build_command(src, Path(mp.output_dir) / (src.stem + "_prepped" + src.suffix))
+        print("  " + " ".join(cmd))
+        return 0
+    res = mp.prepare(src, dst, platform=plat)
+    if res.ok:
+        print(f"OK: {src.name} -> {res.dst} ({res.size_bytes/1e6:.1f} MB)")
+        for f in res.filters_applied:
+            print(f"  {f}")
+        return 0
+    print(f"FAILED: {res.error}", file=sys.stderr)
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="python -m bot.cli", description=__doc__)
     ap.add_argument("--config", help="config yaml (default config.yaml, else config.example.yaml)")
@@ -294,6 +338,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("schedule", cmd_schedule, "loop: post due jobs + periodic watcher")
     p.add_argument("--poll", type=float, default=60.0)
     p.add_argument("--once", action="store_true", help="single iteration then exit")
+    p = sub.add_parser("scan-media", help="scan a media file for AI fingerprints (C2PA, metadata, audio, res/fps)")
+    p.add_argument("file", help="path to media file")
+    p.set_defaults(fn=cmd_scan_media)
+    p = sub.add_parser("prep-media", help="prepare a media file for posting (strip C2PA, delogo, humanise, loudnorm, re-encode)")
+    p.add_argument("file", help="path to media file")
+    p.add_argument("-o", "--output", help="output path (default: <output_dir>/<stem>_prepped<ext>)")
+    p.add_argument("--platform", choices=["tiktok","ig"], default="tiktok")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--dry-run", action="store_true", help="print the ffmpeg command without running")
+    p.set_defaults(fn=cmd_prep_media)
     return ap
 
 
