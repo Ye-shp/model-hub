@@ -80,7 +80,7 @@ class SocialAutomationTests(unittest.TestCase):
 
     def submit(self, post, account, settings, on_submit):
         on_submit()
-        return {"ok": True, "status": "needs_confirmation", "submitted": True, "reason": "Verify the post"}
+        return {"ok": True, "status": "needs_confirmation", "submitted": True, "needs_confirmation": True, "reason": "Verify the post"}
 
     def confirm(self, post_id, remote_id="123456789", **kwargs):
         values = dict(project="default", post_id=post_id, remote_id=remote_id,
@@ -330,7 +330,9 @@ class SocialAutomationTests(unittest.TestCase):
                 automation.cancel("default", post_id, verified_not_published=True)
             release.set()
             pending.result(4)
-        self.assertEqual(automation.cancel("default", post_id, verified_not_published=True)["status"], "abandoned")
+        abandoned = automation.cancel("default", post_id, verified_not_published=True)
+        self.assertEqual(abandoned["status"], "abandoned")
+        self.assertFalse(abandoned["result"]["needs_confirmation"])
         self.assertIsNotNone(self.queue(post_id)["submitted_at"])
 
     def test_confirm_is_validated_idempotent_and_cannot_reassign_publication(self):
@@ -351,6 +353,10 @@ class SocialAutomationTests(unittest.TestCase):
         self.assertEqual(self.confirm(post_id), confirmed)
         self.assertEqual(confirmed["status"], "published")
         self.assertEqual(confirmed["result"]["confirmation"], "owner_recorded")
+        self.assertFalse(confirmed["result"]["needs_confirmation"])
+        self.assertNotIn("reason", confirmed["result"])
+        self.assertNotIn("error", confirmed["result"])
+        self.assertEqual(confirmed["result"]["submission_receipt"]["reason"], "Verify the post")
         with self.assertRaises(ValueError):
             self.confirm(post_id, remote_id="999")
         with self.assertRaises(ValueError):

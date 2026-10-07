@@ -384,7 +384,7 @@ def cancel(project: str, post_id: int, verified_not_published: bool = False) -> 
         target = "abandoned" if held or row["status"] == "abandoned" else "canceled"
         receipt = "Owner verified not published and discarded the native composer; this draft must never be replayed" if target == "abandoned" else "Canceled by the owner"
         result = json.loads(row["result"] or "{}")
-        result.update(status=target, reason=receipt, owner_verified_not_published=target == "abandoned",
+        result.update(status=target, reason=receipt, needs_confirmation=False, owner_verified_not_published=target == "abandoned",
                       verification_recorded_at=_iso(_clock()))
         db.execute("UPDATE automation_queue SET status=?,claim_token=NULL,result=?,error=?,updated_at=? WHERE post_id=? AND project=?",
                    (target, _json(result), receipt, _iso(_clock()), post_id, project))
@@ -418,7 +418,10 @@ def _identity(snapshot: dict, remote_id: str, url: str, published_at: str) -> di
 
 def _record_publication(db, row: dict, identity: dict, confirmation: str) -> None:
     result = json.loads(row["result"] or "{}")
-    result.update(identity, ok=True, status="published", confirmation=confirmation)
+    previous = {key: result.pop(key) for key in ("reason", "error") if key in result}
+    if previous:
+        result["submission_receipt"] = previous
+    result.update(identity, ok=True, status="published", needs_confirmation=False, confirmation=confirmation)
     try:
         db.execute("UPDATE automation_queue SET status='published',claim_token=NULL,remote_id=?,url=?,published_at=?,result=?,error=NULL,updated_at=? "
                    "WHERE post_id=? AND project=?", (identity["id"], identity["url"], identity["published_at"], _json(result),
