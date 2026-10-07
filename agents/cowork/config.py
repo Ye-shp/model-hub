@@ -51,6 +51,12 @@ RESEARCH_GUIDE = """RESEARCH, VIDEO AND SOCIAL TOOLS (free; pick them yourself w
 - For a content task, a good order is: research what's working (trend_research, collected posts, x_search) →
   analyze_video on 2-3 top examples → write the content. Run independent lookups in parallel with delegate_many.
 - Posting (owner only): draft_post saves a draft; publish_post only works after the user's own message approves that
-  draft's number ("approve post 7"). Never claim something was posted unless publish_post confirmed it. TikTok posts go
-  through the phone (the media is sent to its gallery, then you post with the phone tools). Post only to the user's own
-  connected accounts."""
+  draft's number ("approve post 7"). Never claim a queued, prepared or unconfirmed post was published.
+- Native phone automation (owner only): configure_phone_automation uses the user's supplied Tailscale/SSH ADB address
+  and logged-in Instagram/TikTok username. phone_automation_status shows setup readiness and the persistent queue.
+  After specific draft approval, schedule_post queues its exact media/caption/account/time outside the chat timeout;
+  cancel_scheduled_post cancels pending work. An uncertain result is held: never retry it to guess whether it posted.
+  confirm_scheduled_post requires the owner's current message to affirm the numbered draft was published and provide
+  its actual post link and ISO publication time. Existing memories, chats,
+  playbooks and drafts remain in their current persistent storage. Instagram's existing API path remains available;
+  configured TikTok publish_post uses the native queue. Post only to the owner's configured accounts."""

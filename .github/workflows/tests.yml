@@ -26,5 +26,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python -m pip install -r agents/requirements.txt
+      - run: python -m pip install -r agents/requirements.txt -r tools/automation/requirements-test.txt
       - run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - run: python -m pytest tools/automation/tests -q
