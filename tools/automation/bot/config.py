@@ -150,7 +150,7 @@ class MediaPrepCfg:
     # 1. provenance + container
     strip_c2pa: bool = True
     strip_metadata: bool = True
-    encoder_tag: str = "Lavf60.3.100"          # replace the encoder tag (hide the real tool)
+    encoder_tag: str = "H.264"                # video stream encoder; format encoder suppressed
     # 2. watermark removal (delogo). Empty regions + remove_watermark=True => default bottom-right box.
     remove_watermark: bool = False
     watermark_regions: list[dict] = field(default_factory=list)
@@ -168,11 +168,24 @@ class MediaPrepCfg:
     loudness_LRA: float = 11.0
     highpass_hz: int = 80
     # 5. output encode
-    crf: int = 19
-    preset: str = "veryfast"
+    crf: int = 20
+    preset: str = "slow"
     audio_bitrate: str = "192k"
     target_fps: float = 30.0        # resample to 30 fps (phone default); breaks the 24 fps AI signature. 0 = keep source fps.
     pix_fmt: str = "yuv420p"
+    output_ext: str = ".mov"
+    major_brand: str = "qt"
+    color_space: str = "bt709"
+    color_primaries: str = "bt709"
+    color_trc: str = "bt709"
+    color_range: str = "tv"
+    gop_size: int = 28
+    keyint_min: int = 24
+    reference_mov: str = "uploads/IMG_7540.MOV"
+    apple_make: str = "Apple"
+    apple_model: str = "iPhone 15 Pro Max"
+    apple_software: str = "26.6"
+    apple_ffrate_intent: str = "0"
     # output location (relative to base_dir)
     output_dir: str = "state/media_prepped"
     workdir: str = "state/media_work"

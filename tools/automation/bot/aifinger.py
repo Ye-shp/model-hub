@@ -247,6 +247,39 @@ def check_audio(path: Path, report: AIFingerReport) -> None:
                    f"DC offset {dc:.4f} — unusual for real audio, common in synthetic audio")
 
 
+def looks_iPhone(path: str | Path) -> bool:
+    """Validate the reference container signature; this does not establish provenance."""
+    try:
+        probe = _ffprobe_json(Path(path))
+        fmt = probe.get("format", {})
+        tags = fmt.get("tags", {})
+        if fmt.get("format_name") != "mov,mp4,m4a,3gp,3g2,mj2":
+            return False
+        if any(str(tags.get(k, "")).strip() != v for k, v in {
+            "major_brand": "qt", "minor_version": "0", "compatible_brands": "qt",
+        }.items()):
+            return False
+        if any(not tags.get("com.apple.quicktime." + key) for key in
+               ("make", "model", "software", "creationdate", "full-frame-rate-playback-intent")):
+            return False
+        video = next(s for s in probe["streams"] if s.get("codec_type") == "video")
+        audio = next(s for s in probe["streams"] if s.get("codec_type") == "audio")
+        expected = {"codec_name": "h264", "profile": "High", "codec_tag_string": "avc1",
+                    "r_frame_rate": "30/1", "color_space": "bt709", "color_primaries": "bt709",
+                    "color_transfer": "bt709", "color_range": "tv"}
+        if any(video.get(k) != v for k, v in expected.items()) or audio.get("codec_name") != "aac":
+            return False
+        for stream, handler in ((video, "Core Media Video"), (audio, "Core Media Audio")):
+            st = stream.get("tags", {})
+            if any(st.get(k) != v for k, v in {
+                "handler_name": handler, "language": "und", "vendor_id": "[0][0][0][0]",
+            }.items()):
+                return False
+        return video.get("tags", {}).get("encoder") == "H.264"
+    except (AttributeError, KeyError, TypeError, ValueError, StopIteration):
+        return False
+
+
 def check_resolution_fps(path: Path, report: AIFingerReport) -> None:
     """Flag resolution/fps combos common to AI generators."""
     probe = _ffprobe_json(path)
@@ -267,7 +300,7 @@ def check_resolution_fps(path: Path, report: AIFingerReport) -> None:
 
         # 1080x1920 @ 24 fps = Runway / Higgsfield / Sora signature
         if w == 1080 and h == 1920 and abs(fps - 24) < 1:
-            report.add("strong", "AI-typical resolution+fps",
+            report.add("info" if looks_iPhone(path) else "strong", "AI-typical resolution+fps",
                        f"1080×1920 @ {fps:.0f} fps is a common AI-generator output (Runway, Higgsfield, Sora)")
         # 1024x1792 or 1792x1024 @ any fps = some AI tools
         elif (w, h) in ((1024, 1792), (1792, 1024)):
