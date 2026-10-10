@@ -10,6 +10,7 @@ from typing import Any
 
 from .config import MediaPrepCfg
 from .mp4finalize import finalize, resolve_reference
+from .aifinger import looks_iPhone
 
 log = logging.getLogger("bot.mediaprep")
 
@@ -110,6 +111,7 @@ class MediaPrep:
         apple_model: str = 'iPhone 15 Pro Max',
         apple_software: str = '26.6',
         apple_ffrate_intent: str = '0',
+        apple_creationdate: str | None = None,
         dry_run: bool = False,
     ) -> None:
         self.output_ext = output_ext
@@ -124,6 +126,7 @@ class MediaPrep:
         self.apple_model = apple_model
         self.apple_software = apple_software
         self.apple_ffrate_intent = apple_ffrate_intent
+        self.apple_creationdate = apple_creationdate
         self.reference_mov = reference_mov if reference_mov is not None else MediaPrepCfg().reference_mov
         self.enabled = enabled
         self.ffmpeg = ffmpeg_bin
@@ -260,7 +263,7 @@ class MediaPrep:
 
     # ── main pipeline ──────────────────────────────────────────────────────────
 
-    def build_command(self, src: Path, dst: Path) -> list[str]:
+    def build_command(self, src: Path, dst: Path, *, no_reference: bool = False) -> list[str]:
         """Build the full ffmpeg command (without running it)."""
         cmd: list[str] = [self.ffmpeg, "-y", "-hide_banner", "-i", str(src)]
 
@@ -282,6 +285,18 @@ class MediaPrep:
             cmd += [f"-metadata:s:{stream}:0", f"handler_name={handler}",
                     f"-metadata:s:{stream}:0", "language=und"]
         cmd += ["-metadata:s:v:0", f"encoder={self.encoder_tag}"]
+
+        # No-reference fallback: write the four Apple keys as plain format
+        # tags (unprefixed) so the validator still passes without a reference MOV.
+        if no_reference:
+            cmd += [
+                "-metadata", f"make={self.apple_make}",
+                "-metadata", f"model={self.apple_model}",
+                "-metadata", f"software={self.apple_software}",
+                "-metadata", "full-frame-rate-playback-intent=0",
+            ]
+            cd = self.apple_creationdate or time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            cmd += ["-metadata", f"creationdate={cd}"]
 
         # Video codec
         cmd += [
@@ -328,22 +343,41 @@ class MediaPrep:
         if src_p.resolve() == dst_p.resolve():
             raise MediaPrepError("source and destination must differ")
 
-        cmd = self.build_command(src_p, dst_p)
+        # Detect whether the reference MOV is available.  If absent, fall back
+        # to plain -metadata keys and skip the /moov/meta append.
+        try:
+            reference = resolve_reference(self.reference_mov)
+            no_ref = False
+        except FileNotFoundError:
+            reference = None
+            no_ref = True
+            log.info("mediaprep: reference MOV not found — using no-reference fallback")
 
+        cmd = self.build_command(src_p, dst_p, no_reference=no_ref)
         log.info("mediaprep: %s", " ".join(cmd))
 
         try:
-            reference = resolve_reference(self.reference_mov)
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             if r.returncode != 0:
                 err = (r.stderr or "").strip()[-500:]
                 return PrepResult(ok=False, src=str(src), dst=str(dst_p), error=err)
 
+            from datetime import datetime
+            creationdate = self.apple_creationdate or datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
             finalize(dst_p, reference, {
                 "make": self.apple_make, "model": self.apple_model,
                 "software": self.apple_software,
                 "full-frame-rate-playback-intent": str(self.apple_ffrate_intent),
+                "creationdate": creationdate,
             })
+
+            # Fail-closed: output must pass the iPhone signature validator.
+            # A bad config must not silently return ok=True.
+            if not looks_iPhone(dst_p):
+                return PrepResult(ok=False, src=str(src), dst=str(dst_p),
+                    error="post-prep validation failed: looks_iPhone is False "
+                          "(check encoder_tag, major_brand, fps and apple_* fields)")
+
             size = dst_p.stat().st_size if dst_p.exists() else 0
             vf_list = self._video_filters()
             return PrepResult(
@@ -405,5 +439,6 @@ class MediaPrep:
             apple_model=getattr(cfg, "apple_model", MediaPrepCfg().apple_model),
             apple_software=getattr(cfg, "apple_software", MediaPrepCfg().apple_software),
             apple_ffrate_intent=getattr(cfg, "apple_ffrate_intent", MediaPrepCfg().apple_ffrate_intent),
+            apple_creationdate=getattr(cfg, "apple_creationdate", MediaPrepCfg().apple_creationdate),
             dry_run=dry_run,
         )

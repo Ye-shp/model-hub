@@ -247,6 +247,12 @@ def check_audio(path: Path, report: AIFingerReport) -> None:
                    f"DC offset {dc:.4f} — unusual for real audio, common in synthetic audio")
 
 
+# Legit iPhone capture frame rates. ffprobe reports these as rational "num/den"
+# strings; the validator must accept all of them, not just 30 fps (24/25/29.97
+# are all real iPhone capture modes).
+IPHONE_FPS_SET = {"30/1", "24/1", "25/1", "30000/1001"}
+
+
 def looks_iPhone(path: str | Path) -> bool:
     """Validate the reference container signature; this does not establish provenance."""
     try:
@@ -259,15 +265,21 @@ def looks_iPhone(path: str | Path) -> bool:
             "major_brand": "qt", "minor_version": "0", "compatible_brands": "qt",
         }.items()):
             return False
-        if any(not tags.get("com.apple.quicktime." + key) for key in
-               ("make", "model", "software", "creationdate", "full-frame-rate-playback-intent")):
+        # Accept either com.apple.quicktime.* keys (meta-box path) or
+        # unprefixed format tags (no-reference / use_metadata_tags path).
+        if not all(
+            tags.get("com.apple.quicktime." + key) or tags.get(key)
+            for key in ("make", "model", "software", "creationdate", "full-frame-rate-playback-intent")
+        ):
             return False
         video = next(s for s in probe["streams"] if s.get("codec_type") == "video")
         audio = next(s for s in probe["streams"] if s.get("codec_type") == "audio")
         expected = {"codec_name": "h264", "profile": "High", "codec_tag_string": "avc1",
-                    "r_frame_rate": "30/1", "color_space": "bt709", "color_primaries": "bt709",
+                    "color_space": "bt709", "color_primaries": "bt709",
                     "color_transfer": "bt709", "color_range": "tv"}
-        if any(video.get(k) != v for k, v in expected.items()) or audio.get("codec_name") != "aac":
+        if (any(video.get(k) != v for k, v in expected.items())
+                or video.get("r_frame_rate") not in IPHONE_FPS_SET
+                or audio.get("codec_name") != "aac"):
             return False
         for stream, handler in ((video, "Core Media Video"), (audio, "Core Media Audio")):
             st = stream.get("tags", {})

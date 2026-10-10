@@ -87,7 +87,10 @@ def reference_meta(reference, values):
 
 
 def finalize(target, reference, values):
-    meta = reference_meta(reference, values)
+    # When reference is None the /moov/meta append is skipped; the four
+    # com.apple.quicktime.* keys must then come from ffmpeg -metadata.
+    # The FFMP-zero, mdhd-language and ftyp-minor_version patches always run.
+    meta = reference_meta(reference, values) if reference is not None else b""
     buf = bytearray(Path(target).read_bytes())
     patched = 0
 

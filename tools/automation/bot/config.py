@@ -186,6 +186,9 @@ class MediaPrepCfg:
     apple_model: str = "iPhone 15 Pro Max"
     apple_software: str = "26.6"
     apple_ffrate_intent: str = "0"
+    # creationdate stamp. None = stamp with the current run time (local tz, ISO 8601 + offset,
+    # e.g. "2026-10-09T15:04:00-0400"). Set a string to pin a specific value.
+    apple_creationdate: str | None = None
     # output location (relative to base_dir)
     output_dir: str = "state/media_prepped"
     workdir: str = "state/media_work"
