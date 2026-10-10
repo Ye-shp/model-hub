@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from bot.config import MediaPrepCfg
 from bot.mediaprep import MediaPrep, MediaPrepError, PrepResult
 
@@ -115,3 +117,164 @@ def test_prepresult_error_message() -> None:
     r = PrepResult(ok=False, src="/x/in.mp4", dst="/x/out.mp4", error="boom")
     assert "ERR" in r.summary()
     assert "boom" in r.summary()
+
+
+def test_quicktime_recipe_and_config() -> None:
+    mp = MediaPrep.from_config(MediaPrepCfg())
+    cmd = mp.build_command(Path('source.mp4'), Path('output.mov'))
+    for flag, value in {'-profile:v': 'high', '-tag:v': 'avc1', '-g': '28',
+                        '-keyint_min': '24', '-preset': 'slow', '-fflags': '+bitexact',
+                        '-flags': '+bitexact', '-f': 'mov'}.items():
+        assert cmd[cmd.index(flag) + 1] == value
+    vf = cmd[cmd.index('-vf') + 1]
+    assert 'fps=30' in vf
+    assert 'setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv' in vf
+    assert 'encoder=H.264' in cmd
+    assert 'handler_name=Core Media Video' in cmd
+    assert 'handler_name=Core Media Audio' in cmd
+    assert 'use_metadata_tags' not in ' '.join(cmd)
+    assert 'Lavf' not in ' '.join(cmd)
+    assert mp.output_ext == '.mov'
+
+
+def test_config_overrides() -> None:
+    mp = MediaPrep.from_config(MediaPrepCfg(target_fps=60, gop_size=60, keyint_min=30,
+                                           sharpen=False, highpass_hz=90, apple_model='test model'))
+    assert mp.target_fps == 60 and mp.gop_size == 60 and mp.keyint_min == 30
+    assert mp.sharpen is False and mp.apple_model == 'test model'
+    assert 'highpass=f=90' in mp._build_af_chain()
+
+
+def test_disabled_without_dry_run() -> None:
+    result = MediaPrep(enabled=False, reference_mov='missing').prepare('missing.mp4')
+    assert result.ok and result.dst == 'missing.mp4'
+
+
+def test_resolution_rule_fail_closed(monkeypatch) -> None:
+    from bot import aifinger
+    probe = {'streams': [{'codec_type': 'video', 'width': 1080, 'height': 1920,
+                          'r_frame_rate': '24/1'}]}
+    monkeypatch.setattr(aifinger, '_ffprobe_json', lambda p: probe)
+    assert not aifinger.looks_iPhone('missing')
+    report = aifinger.AIFingerReport(path='missing')
+    aifinger.check_resolution_fps(Path('missing'), report)
+    assert report.strong_count == 1
+    probe['streams'][0]['r_frame_rate'] = '30/1'
+    report = aifinger.AIFingerReport(path='missing')
+    aifinger.check_resolution_fps(Path('missing'), report)
+    assert report.strong_count == 0
+
+
+def test_finalizer_and_signature_integration(tmp_path) -> None:
+    import shutil
+    import subprocess
+    import pytest
+    from bot import aifinger
+    from bot.mp4finalize import resolve_reference, reference_meta, boxes
+    if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
+        pytest.skip('ffmpeg/ffprobe required')
+    try:
+        reference = resolve_reference(MediaPrepCfg().reference_mov)
+    except FileNotFoundError:
+        pytest.skip('reference MOV required')
+    src = tmp_path / 'source.mp4'
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i',
+                    'testsrc=size=128x192:rate=24', '-f', 'lavfi', '-i',
+                    'sine=frequency=440:sample_rate=48000', '-t', '0.5',
+                    '-c:v', 'libx264', '-threads', '1', '-pix_fmt', 'yuv420p',
+                    '-c:a', 'aac', str(src)], check=True, capture_output=True)
+    result = MediaPrep(humanize=False, normalize_loudness=False,
+                       output_dir=tmp_path, reference_mov=reference).prepare(src)
+    assert result.ok, result.error
+    assert Path(result.dst).suffix == '.mov'
+    assert result.size_bytes == Path(result.dst).stat().st_size
+    assert aifinger.looks_iPhone(result.dst)
+    probe = aifinger._ffprobe_json(Path(result.dst))
+    assert 'encoder' not in probe['format']['tags']
+    assert probe['streams'][0]['width'] == 128
+    # Default metadata is byte-identical; custom values rebuild only metadata boxes.
+    buf = reference.read_bytes()
+    original = next(buf[o:e] for _, end, kind, body in boxes(buf) if kind == b'moov'
+                    for o, e, typ, _ in boxes(buf, body, end) if typ == b'meta')
+    values = {'make': 'Apple', 'model': 'iPhone 15 Pro Max', 'software': '26.6',
+              'full-frame-rate-playback-intent': '0'}
+    assert reference_meta(reference, values) == original
+    assert b'Custom Model' in reference_meta(reference, {**values, 'model': 'Custom Model'})
+    probe['streams'][0]['tags']['vendor_id'] = 'FFMP'
+    from unittest.mock import patch
+    with patch.object(aifinger, '_ffprobe_json', return_value=probe):
+        assert not aifinger.looks_iPhone(result.dst)
+
+
+def test_finalizer_rejects_invalid_boxes():
+    import pytest
+    from bot.mp4finalize import boxes
+    with pytest.raises(ValueError):
+        list(boxes(b'\x00\x00\x00\x20ftyp'))
+
+
+def test_no_reference_metadata_writer_and_overrides() -> None:
+    mp = _mp(apple_ffrate_intent='1', apple_creationdate='2026-10-09T12:00:00-0400')
+    cmd = mp.build_command(Path('source.mp4'), Path('output.mov'), no_reference=True)
+    assert cmd[cmd.index('-movflags') + 1] == '+faststart+use_metadata_tags'
+    assert 'full-frame-rate-playback-intent=1' in cmd
+    assert 'creationdate=2026-10-09T12:00:00-0400' in cmd
+    reference_cmd = mp.build_command(Path('source.mp4'), Path('output.mov'))
+    assert reference_cmd[reference_cmd.index('-movflags') + 1] == '+faststart'
+
+
+def _media_tools() -> tuple[str, str]:
+    import shutil
+    ffmpeg, ffprobe = shutil.which('ffmpeg'), shutil.which('ffprobe')
+    if not ffmpeg or not ffprobe:
+        pytest.skip('ffmpeg/ffprobe required')
+    return ffmpeg, ffprobe
+
+
+def _create_source(path: Path, ffmpeg: str, *, fps: int = 60, audio: bool = True) -> None:
+    import subprocess
+    cmd = [ffmpeg, '-v', 'error', '-y', '-f', 'lavfi', '-i',
+           f'testsrc=size=128x192:rate={fps}']
+    if audio:
+        cmd += ['-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000']
+    cmd += ['-t', '0.5', '-c:v', 'libx264', '-threads', '1',
+            '-pix_fmt', 'yuv420p', '-c:a', 'aac', str(path)]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+@pytest.mark.parametrize('target_fps,audio,expected_fps', [
+    (30, True, '30/1'), (60, True, '60/1'), (0, True, '60/1'), (30, False, '30/1'),
+])
+def test_prepare_without_reference_preserves_supported_inputs(
+    tmp_path, target_fps, audio, expected_fps,
+) -> None:
+    from bot import aifinger
+    ffmpeg, ffprobe = _media_tools()
+    src = tmp_path / 'source.mp4'
+    _create_source(src, ffmpeg, audio=audio)
+    mp = MediaPrep(humanize=False, normalize_loudness=False, target_fps=target_fps,
+                   ffmpeg_bin=ffmpeg, ffprobe_bin=ffprobe,
+                   reference_mov=tmp_path / 'absent.mov', apple_ffrate_intent='1',
+                   apple_creationdate='2026-10-09T12:00:00-0400')
+    result = mp.prepare(src, tmp_path / 'prepared.mov')
+    assert result.ok, result.error
+    probe = aifinger._ffprobe_json(Path(result.dst), ffprobe_bin=ffprobe)
+    assert probe['streams'][0]['r_frame_rate'] == expected_fps
+    for key, value in {'make': 'Apple', 'model': 'iPhone 15 Pro Max', 'software': '26.6',
+                       'full-frame-rate-playback-intent': '1',
+                       'creationdate': '2026-10-09T12:00:00-0400'}.items():
+        assert probe['format']['tags'][key] == value
+    assert any(s['codec_type'] == 'audio' for s in probe['streams']) is audio
+    assert aifinger.looks_iPhone(result.dst, ffprobe_bin=ffprobe) is audio
+    assert aifinger.looks_iPhone(result.dst, ffprobe_bin=ffprobe, require_audio=False)
+
+
+def test_prepare_uses_configured_tools_without_path(tmp_path, monkeypatch) -> None:
+    ffmpeg, ffprobe = _media_tools()
+    src = tmp_path / 'source.mp4'
+    _create_source(src, ffmpeg)
+    monkeypatch.setenv('PATH', '')
+    result = MediaPrep(humanize=False, normalize_loudness=False,
+                       ffmpeg_bin=ffmpeg, ffprobe_bin=ffprobe,
+                       reference_mov=tmp_path / 'absent.mov').prepare(src, tmp_path / 'prepared.mov')
+    assert result.ok, result.error

@@ -71,7 +71,7 @@ mediaprep:
   enabled: true
   strip_c2pa: true               # re-encode drops C2PA / Content Credentials JUMBF boxes
   strip_metadata: true           # -map_metadata -1 (encoder, creation time, comments, tags)
-  encoder_tag: "Lavf60.3.100"    # clean ffmpeg encode tag (matches a standard re-encode)
+  encoder_tag: "H.264"            # video encoder tag (must be "H.264" to pass looks_iPhone)
   remove_watermark: true         # delogo configured regions (bottom-right by default if empty)
   # watermark_regions: [[940, 1620, 130, 60]]   # e.g. bottom-right logo on a 1080x1920 frame
   humanize: true                 # subtle temporal grain + vignette + micro-contrast + sharpen

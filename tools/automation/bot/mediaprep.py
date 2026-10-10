@@ -1,24 +1,4 @@
-"""Media preparation pipeline: strip AI fingerprints, remove watermarks, humanise, normalise audio.
-
-This is the FIX half of the AI-detection bypass (the SCAN half is `aifinger.py`).
-It produces a single ffmpeg command that:
-
-  1. Strips C2PA / Content Credentials provenance (re-encode drops all JUMBF boxes)
-  2. Strips all container metadata (`-map_metadata -1`)
-  3. Replaces the encoder tag with a clean `Lavf60.3.100` (matches a standard ffmpeg encode)
-  4. Removes watermarks (delogo filter on configurable regions)
-  5. Adds subtle humanisation: temporal noise, vignette, micro contrast shift, light sharpening
-  6. Normalises audio loudness to platform targets (-14 LUFS / -1.5 TP / 11 LRA)
-  7. Re-encodes to H.264 / AAC with platform-appropriate quality
-
-All steps are configurable via `MediaCfg`. The pipeline is a single ffmpeg invocation
-(no intermediate files), which means the output is always a clean H.264/AAC MP4.
-
-Usage:
-    from bot.mediaprep import MediaPrep
-    prep = MediaPrep(cfg=mediaprep_cfg, ffmpeg_bin="ffmpeg")
-    result = prep.prepare(src="raw.mp4", dst="clean.mp4", platform="tiktok")
-"""
+"""H.264/AAC QuickTime preparation with configurable filters and metadata finalization."""
 from __future__ import annotations
 
 import logging
@@ -27,6 +7,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from .config import MediaPrepCfg
+from .mp4finalize import finalize, resolve_reference
+from .aifinger import looks_iPhone
 
 log = logging.getLogger("bot.mediaprep")
 
@@ -88,7 +72,7 @@ class MediaPrep:
         # C2PA / metadata
         strip_c2pa: bool = True,
         strip_metadata: bool = True,
-        encoder_tag: str = "Lavf60.3.100",
+        encoder_tag: str = "H.264",
         # Watermark removal
         remove_watermark: bool = False,
         watermark_regions: list[dict[str, int]] | None = None,
@@ -104,17 +88,46 @@ class MediaPrep:
         target_loudness: float = -14.0,
         true_peak: float = -1.5,
         lra: float = 11.0,
+        highpass_hz: int = 80,
         # Output codec
         video_codec: str = "libx264",
-        crf: int = 19,
-        preset: str = "medium",
+        crf: int = 20,
+        preset: str = "slow",
         audio_bitrate: str = "192k",
-        target_fps: float = 0.0,
+        target_fps: float = 30.0,
         pix_fmt: str = "yuv420p",
         output_dir: str | Path = "state/media_prepped",
         workdir: str | Path = "tmp",
+        output_ext: str = '.mov',
+        major_brand: str = 'qt',
+        color_space: str = 'bt709',
+        color_primaries: str = 'bt709',
+        color_trc: str = 'bt709',
+        color_range: str = 'tv',
+        gop_size: int = 28,
+        keyint_min: int = 24,
+        reference_mov: str | Path | None = None,
+        apple_make: str = 'Apple',
+        apple_model: str = 'iPhone 15 Pro Max',
+        apple_software: str = '26.6',
+        apple_ffrate_intent: str = '0',
+        apple_creationdate: str | None = None,
         dry_run: bool = False,
     ) -> None:
+        self.output_ext = output_ext
+        self.major_brand = major_brand
+        self.color_space = color_space
+        self.color_primaries = color_primaries
+        self.color_trc = color_trc
+        self.color_range = color_range
+        self.gop_size = gop_size
+        self.keyint_min = keyint_min
+        self.apple_make = apple_make
+        self.apple_model = apple_model
+        self.apple_software = apple_software
+        self.apple_ffrate_intent = apple_ffrate_intent
+        self.apple_creationdate = apple_creationdate
+        self.reference_mov = reference_mov if reference_mov is not None else MediaPrepCfg().reference_mov
         self.enabled = enabled
         self.ffmpeg = ffmpeg_bin
         self.ffprobe = ffprobe_bin
@@ -138,6 +151,7 @@ class MediaPrep:
         self.target_loudness = target_loudness
         self.true_peak = true_peak
         self.lra = lra
+        self.highpass_hz = highpass_hz
         self.video_codec = video_codec
         self.crf = crf
         self.preset = preset
@@ -231,6 +245,9 @@ class MediaPrep:
         if self.humanize and self.vignette:
             parts.append("vignette=angle=PI/7")
 
+        if self.target_fps:
+            parts.append(f"fps={self.target_fps:g}")
+        parts.append(f"setparams=colorspace={self.color_space}:color_primaries={self.color_primaries}:color_trc={self.color_trc}:range={self.color_range}")
         return ",".join(parts)
 
     def _build_af_chain(self) -> str:
@@ -241,12 +258,12 @@ class MediaPrep:
                 f"loudnorm=I={self.target_loudness:.1f}:TP={self.true_peak:.1f}:LRA={self.lra:.1f}"
             )
             # Remove DC offset and low rumble
-            parts.append("highpass=f=80")
+            parts.append(f"highpass=f={self.highpass_hz}")
         return ",".join(parts)
 
     # ── main pipeline ──────────────────────────────────────────────────────────
 
-    def build_command(self, src: Path, dst: Path) -> list[str]:
+    def build_command(self, src: Path, dst: Path, *, no_reference: bool = False) -> list[str]:
         """Build the full ffmpeg command (without running it)."""
         cmd: list[str] = [self.ffmpeg, "-y", "-hide_banner", "-i", str(src)]
 
@@ -260,19 +277,26 @@ class MediaPrep:
         if af:
             cmd += ["-af", af]
 
-        # Metadata stripping (C2PA is dropped by re-encode; this strips container tags)
-        if self.strip_metadata:
-            cmd += ["-map_metadata", "-1"]
-            if self.encoder_tag:
-                cmd += ["-metadata", f"encoder={self.encoder_tag}"]
-        else:
-            # Even without strip_metadata, drop the encoder tag if it's an AI tool
-            cmd += ["-map_metadata", "-1", "-metadata", f"encoder={self.encoder_tag}"]
+        cmd += ["-map_metadata", "-1", "-fflags", "+bitexact", "-flags", "+bitexact"]
+        cmd += ["-profile:v", "high", "-tag:v", "avc1",
+                "-g", str(self.gop_size), "-keyint_min", str(self.keyint_min),
+                "-x264-params", "log-level=error"]
+        for stream, handler in (("v", "Core Media Video"), ("a", "Core Media Audio")):
+            cmd += [f"-metadata:s:{stream}:0", f"handler_name={handler}",
+                    f"-metadata:s:{stream}:0", "language=und"]
+        cmd += ["-metadata:s:v:0", f"encoder={self.encoder_tag}"]
 
-        # Frame rate: if a target fps is set, resample to it. This breaks the
-        # "1080×1920 @ 24 fps" Runway/Higgsfield signature — phone videos use 30 fps.
-        if self.target_fps:
-            cmd += ["-r", str(int(self.target_fps))]
+        # The MOV metadata-tag writer preserves these custom format keys when
+        # no reference metadata atom is available.
+        if no_reference:
+            cmd += [
+                "-metadata", f"make={self.apple_make}",
+                "-metadata", f"model={self.apple_model}",
+                "-metadata", f"software={self.apple_software}",
+                "-metadata", f"full-frame-rate-playback-intent={self.apple_ffrate_intent}",
+            ]
+            cd = self.apple_creationdate or time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            cmd += ["-metadata", f"creationdate={cd}"]
 
         # Video codec
         cmd += [
@@ -286,7 +310,8 @@ class MediaPrep:
         cmd += ["-c:a", "aac", "-b:a", self.audio_bitrate]
 
         # Faststart for web
-        cmd += ["-movflags", "+faststart"]
+        movflags = "+faststart+use_metadata_tags" if no_reference else "+faststart"
+        cmd += ["-movflags", movflags, "-brand", self.major_brand.ljust(4), "-f", "mov"]
 
         cmd.append(str(dst))
         return cmd
@@ -311,40 +336,55 @@ class MediaPrep:
         if dst is None:
             base = Path(self.output_dir or "state/media_prepped")
             stamp = time.strftime("%Y%m%d-%H%M%S")
-            dst_p = base / f"{src_p.stem}-prepped-{stamp}{src_p.suffix.lower() or '.mp4'}"
+            dst_p = base / f"{src_p.stem}-prepped-{stamp}{self.output_ext}"
         else:
-            dst_p = Path(dst)
+            dst_p = Path(dst).with_suffix(self.output_ext)
         dst_p.parent.mkdir(parents=True, exist_ok=True)
 
-        # Per-platform quality adjustments
-        crf = self.crf
-        audio_br = self.audio_bitrate
-        if platform == "tiktok":
-            crf = min(crf, 18)  # slightly higher quality for TikTok
-        elif platform == "ig":
-            crf = min(crf, 19)
+        if src_p.resolve() == dst_p.resolve():
+            raise MediaPrepError("source and destination must differ")
 
-        # Build command with platform-specific settings
-        cmd = self.build_command(src_p, dst_p)
-        # Override CRF for platform
-        if "-crf" in cmd:
-            idx = cmd.index("-crf")
-            cmd[idx + 1] = str(crf)
+        # Detect whether the reference MOV is available.  If absent, fall back
+        # to plain -metadata keys and skip the /moov/meta append.
+        try:
+            reference = resolve_reference(self.reference_mov)
+            no_ref = False
+        except FileNotFoundError:
+            reference = None
+            no_ref = True
+            log.info("mediaprep: reference MOV not found — using no-reference fallback")
 
+        cmd = self.build_command(src_p, dst_p, no_reference=no_ref)
         log.info("mediaprep: %s", " ".join(cmd))
 
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             if r.returncode != 0:
                 err = (r.stderr or "").strip()[-500:]
-                return PrepResult(ok=False, src=str(src), dst=str(dst), error=err)
+                return PrepResult(ok=False, src=str(src), dst=str(dst_p), error=err)
+
+            from datetime import datetime
+            creationdate = self.apple_creationdate or datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+            finalize(dst_p, reference, {
+                "make": self.apple_make, "model": self.apple_model,
+                "software": self.apple_software,
+                "full-frame-rate-playback-intent": str(self.apple_ffrate_intent),
+                "creationdate": creationdate,
+            })
+
+            # Fail-closed: output must pass the iPhone signature validator.
+            # A bad config must not silently return ok=True.
+            if not looks_iPhone(dst_p, ffprobe_bin=self.ffprobe, require_audio=False):
+                return PrepResult(ok=False, src=str(src), dst=str(dst_p),
+                    error="post-prep validation failed: looks_iPhone is False "
+                          "(check encoder_tag, major_brand, fps and apple_* fields)")
 
             size = dst_p.stat().st_size if dst_p.exists() else 0
             vf_list = self._video_filters()
             return PrepResult(
                 ok=True,
                 src=str(src),
-                dst=str(dst),
+                dst=str(dst_p),
                 size_bytes=size,
                 filters_applied=vf_list,
                 audio_normalised=self.normalize_loudness,
@@ -352,9 +392,9 @@ class MediaPrep:
             )
 
         except subprocess.TimeoutExpired:
-            return PrepResult(ok=False, src=str(src), dst=str(dst), error="ffmpeg timed out (300s)")
+            return PrepResult(ok=False, src=str(src), dst=str(dst_p), error="ffmpeg timed out (300s)")
         except Exception as e:
-            return PrepResult(ok=False, src=str(src), dst=str(dst), error=str(e))
+            return PrepResult(ok=False, src=str(src), dst=str(dst_p), error=str(e))
 
 
     @classmethod
@@ -373,17 +413,33 @@ class MediaPrep:
             vignette=cfg.vignette,
             contrast_shift=cfg.contrast_shift,
             brightness_shift=cfg.brightness_shift,
-            target_fps=getattr(cfg, "target_fps", 0.0),
+            target_fps=getattr(cfg, "target_fps", 30.0),
             enabled=cfg.enabled,
             normalize_loudness=cfg.normalize_loudness,
             target_loudness=cfg.loudness_I,
             true_peak=cfg.loudness_TP,
             lra=cfg.loudness_LRA,
+            highpass_hz=cfg.highpass_hz,
             crf=cfg.crf,
             preset=cfg.preset,
             audio_bitrate=cfg.audio_bitrate,
             pix_fmt=getattr(cfg, "pix_fmt", "yuv420p"),
             output_dir=cfg.output_dir,
             workdir=cfg.workdir,
+            sharpen=cfg.sharpen,
+            output_ext=getattr(cfg, "output_ext", MediaPrepCfg().output_ext),
+            major_brand=getattr(cfg, "major_brand", MediaPrepCfg().major_brand),
+            color_space=getattr(cfg, "color_space", MediaPrepCfg().color_space),
+            color_primaries=getattr(cfg, "color_primaries", MediaPrepCfg().color_primaries),
+            color_trc=getattr(cfg, "color_trc", MediaPrepCfg().color_trc),
+            color_range=getattr(cfg, "color_range", MediaPrepCfg().color_range),
+            gop_size=getattr(cfg, "gop_size", MediaPrepCfg().gop_size),
+            keyint_min=getattr(cfg, "keyint_min", MediaPrepCfg().keyint_min),
+            reference_mov=getattr(cfg, "reference_mov", MediaPrepCfg().reference_mov),
+            apple_make=getattr(cfg, "apple_make", MediaPrepCfg().apple_make),
+            apple_model=getattr(cfg, "apple_model", MediaPrepCfg().apple_model),
+            apple_software=getattr(cfg, "apple_software", MediaPrepCfg().apple_software),
+            apple_ffrate_intent=getattr(cfg, "apple_ffrate_intent", MediaPrepCfg().apple_ffrate_intent),
+            apple_creationdate=getattr(cfg, "apple_creationdate", MediaPrepCfg().apple_creationdate),
             dry_run=dry_run,
         )
