@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from bot.config import MediaPrepCfg
 from bot.mediaprep import MediaPrep, MediaPrepError, PrepResult
 
@@ -209,3 +211,70 @@ def test_finalizer_rejects_invalid_boxes():
     from bot.mp4finalize import boxes
     with pytest.raises(ValueError):
         list(boxes(b'\x00\x00\x00\x20ftyp'))
+
+
+def test_no_reference_metadata_writer_and_overrides() -> None:
+    mp = _mp(apple_ffrate_intent='1', apple_creationdate='2026-10-09T12:00:00-0400')
+    cmd = mp.build_command(Path('source.mp4'), Path('output.mov'), no_reference=True)
+    assert cmd[cmd.index('-movflags') + 1] == '+faststart+use_metadata_tags'
+    assert 'full-frame-rate-playback-intent=1' in cmd
+    assert 'creationdate=2026-10-09T12:00:00-0400' in cmd
+    reference_cmd = mp.build_command(Path('source.mp4'), Path('output.mov'))
+    assert reference_cmd[reference_cmd.index('-movflags') + 1] == '+faststart'
+
+
+def _media_tools() -> tuple[str, str]:
+    import shutil
+    ffmpeg, ffprobe = shutil.which('ffmpeg'), shutil.which('ffprobe')
+    if not ffmpeg or not ffprobe:
+        pytest.skip('ffmpeg/ffprobe required')
+    return ffmpeg, ffprobe
+
+
+def _create_source(path: Path, ffmpeg: str, *, fps: int = 60, audio: bool = True) -> None:
+    import subprocess
+    cmd = [ffmpeg, '-v', 'error', '-y', '-f', 'lavfi', '-i',
+           f'testsrc=size=128x192:rate={fps}']
+    if audio:
+        cmd += ['-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000']
+    cmd += ['-t', '0.5', '-c:v', 'libx264', '-threads', '1',
+            '-pix_fmt', 'yuv420p', '-c:a', 'aac', str(path)]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+@pytest.mark.parametrize('target_fps,audio,expected_fps', [
+    (30, True, '30/1'), (60, True, '60/1'), (0, True, '60/1'), (30, False, '30/1'),
+])
+def test_prepare_without_reference_preserves_supported_inputs(
+    tmp_path, target_fps, audio, expected_fps,
+) -> None:
+    from bot import aifinger
+    ffmpeg, ffprobe = _media_tools()
+    src = tmp_path / 'source.mp4'
+    _create_source(src, ffmpeg, audio=audio)
+    mp = MediaPrep(humanize=False, normalize_loudness=False, target_fps=target_fps,
+                   ffmpeg_bin=ffmpeg, ffprobe_bin=ffprobe,
+                   reference_mov=tmp_path / 'absent.mov', apple_ffrate_intent='1',
+                   apple_creationdate='2026-10-09T12:00:00-0400')
+    result = mp.prepare(src, tmp_path / 'prepared.mov')
+    assert result.ok, result.error
+    probe = aifinger._ffprobe_json(Path(result.dst), ffprobe_bin=ffprobe)
+    assert probe['streams'][0]['r_frame_rate'] == expected_fps
+    for key, value in {'make': 'Apple', 'model': 'iPhone 15 Pro Max', 'software': '26.6',
+                       'full-frame-rate-playback-intent': '1',
+                       'creationdate': '2026-10-09T12:00:00-0400'}.items():
+        assert probe['format']['tags'][key] == value
+    assert any(s['codec_type'] == 'audio' for s in probe['streams']) is audio
+    assert aifinger.looks_iPhone(result.dst, ffprobe_bin=ffprobe) is audio
+    assert aifinger.looks_iPhone(result.dst, ffprobe_bin=ffprobe, require_audio=False)
+
+
+def test_prepare_uses_configured_tools_without_path(tmp_path, monkeypatch) -> None:
+    ffmpeg, ffprobe = _media_tools()
+    src = tmp_path / 'source.mp4'
+    _create_source(src, ffmpeg)
+    monkeypatch.setenv('PATH', '')
+    result = MediaPrep(humanize=False, normalize_loudness=False,
+                       ffmpeg_bin=ffmpeg, ffprobe_bin=ffprobe,
+                       reference_mov=tmp_path / 'absent.mov').prepare(src, tmp_path / 'prepared.mov')
+    assert result.ok, result.error

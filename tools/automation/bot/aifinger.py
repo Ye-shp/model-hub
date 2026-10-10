@@ -124,11 +124,11 @@ def _read_bytes(path: Path) -> bytes:
         return f.read()
 
 
-def _ffprobe_json(path: Path) -> dict[str, Any]:
+def _ffprobe_json(path: Path, *, ffprobe_bin: str = "ffprobe") -> dict[str, Any]:
     """Run ffprobe and return the JSON output."""
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+            [ffprobe_bin, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
             capture_output=True, text=True, timeout=30,
         )
         if r.returncode == 0:
@@ -250,13 +250,14 @@ def check_audio(path: Path, report: AIFingerReport) -> None:
 # Legit iPhone capture frame rates. ffprobe reports these as rational "num/den"
 # strings; the validator must accept all of them, not just 30 fps (24/25/29.97
 # are all real iPhone capture modes).
-IPHONE_FPS_SET = {"30/1", "24/1", "25/1", "30000/1001"}
+IPHONE_FPS_SET = {"30/1", "24/1", "25/1", "30000/1001", "60/1", "60000/1001", "24000/1001"}
 
 
-def looks_iPhone(path: str | Path) -> bool:
+def looks_iPhone(path: str | Path, *, ffprobe_bin: str = "ffprobe", require_audio: bool = True) -> bool:
     """Validate the reference container signature; this does not establish provenance."""
     try:
-        probe = _ffprobe_json(Path(path))
+        probe = (_ffprobe_json(Path(path)) if ffprobe_bin == "ffprobe"
+                 else _ffprobe_json(Path(path), ffprobe_bin=ffprobe_bin))
         fmt = probe.get("format", {})
         tags = fmt.get("tags", {})
         if fmt.get("format_name") != "mov,mp4,m4a,3gp,3g2,mj2":
@@ -273,15 +274,19 @@ def looks_iPhone(path: str | Path) -> bool:
         ):
             return False
         video = next(s for s in probe["streams"] if s.get("codec_type") == "video")
-        audio = next(s for s in probe["streams"] if s.get("codec_type") == "audio")
+        audio = next((s for s in probe["streams"] if s.get("codec_type") == "audio"), None)
+        if audio is None and require_audio:
+            return False
         expected = {"codec_name": "h264", "profile": "High", "codec_tag_string": "avc1",
                     "color_space": "bt709", "color_primaries": "bt709",
                     "color_transfer": "bt709", "color_range": "tv"}
         if (any(video.get(k) != v for k, v in expected.items())
                 or video.get("r_frame_rate") not in IPHONE_FPS_SET
-                or audio.get("codec_name") != "aac"):
+                or (audio is not None and audio.get("codec_name") != "aac")):
             return False
         for stream, handler in ((video, "Core Media Video"), (audio, "Core Media Audio")):
+            if stream is None:
+                continue
             st = stream.get("tags", {})
             if any(st.get(k) != v for k, v in {
                 "handler_name": handler, "language": "und", "vendor_id": "[0][0][0][0]",

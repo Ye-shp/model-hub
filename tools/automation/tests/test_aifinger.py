@@ -5,11 +5,13 @@ detection, and the overall verdict logic.
 """
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
 import pytest
 
+from bot import aifinger
 from bot.aifinger import AIFingerReport, Finding, check_c2pa, check_metadata, check_audio, check_resolution_fps, scan
 
 
@@ -126,3 +128,101 @@ def test_ai_tool_signature_detected(tmp_path: Path) -> None:
     check_metadata(path, report)
     assert report.strong_count >= 1
     assert any("AI tool signature" in f.label and "runway" in f.detail.lower() for f in report.findings)
+
+
+@pytest.fixture
+def iphone_probe() -> dict:
+    return {
+        "format": {
+            "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+            "tags": {
+                "major_brand": "qt  ", "minor_version": "0", "compatible_brands": "qt  ",
+                "com.apple.quicktime.make": "Apple",
+                "com.apple.quicktime.model": "iPhone 15 Pro Max",
+                "com.apple.quicktime.software": "26.6",
+                "com.apple.quicktime.creationdate": "2026-10-09T12:00:00-0400",
+                "com.apple.quicktime.full-frame-rate-playback-intent": "0",
+            },
+        },
+        "streams": [
+            {
+                "codec_type": "video", "codec_name": "h264", "profile": "High",
+                "codec_tag_string": "avc1", "r_frame_rate": "30/1",
+                "color_space": "bt709", "color_primaries": "bt709",
+                "color_transfer": "bt709", "color_range": "tv",
+                "tags": {"handler_name": "Core Media Video", "language": "und",
+                         "vendor_id": "[0][0][0][0]", "encoder": "H.264"},
+            },
+            {
+                "codec_type": "audio", "codec_name": "aac",
+                "tags": {"handler_name": "Core Media Audio", "language": "und",
+                         "vendor_id": "[0][0][0][0]"},
+            },
+        ],
+    }
+
+
+def test_iphone_signature_audio_optional_only_when_requested(monkeypatch, iphone_probe) -> None:
+    monkeypatch.setattr(aifinger, "_ffprobe_json", lambda path: iphone_probe)
+    assert aifinger.looks_iPhone("output.mov")
+    iphone_probe["streams"].pop()
+    assert not aifinger.looks_iPhone("output.mov")
+    assert aifinger.looks_iPhone("output.mov", require_audio=False)
+
+
+@pytest.mark.parametrize("key,value", [
+    ("codec_name", "mp3"),
+    ("handler_name", "SoundHandler"),
+    ("language", "eng"),
+    ("vendor_id", "FFMP"),
+])
+def test_iphone_optional_audio_still_validates_present_audio(monkeypatch, iphone_probe, key, value) -> None:
+    audio = iphone_probe["streams"][1]
+    (audio if key == "codec_name" else audio["tags"])[key] = value
+    monkeypatch.setattr(aifinger, "_ffprobe_json", lambda path: iphone_probe)
+    assert not aifinger.looks_iPhone("output.mov", require_audio=False)
+
+
+@pytest.mark.parametrize("fps", ["24/1", "25/1", "30/1", "30000/1001", "60/1", "60000/1001", "24000/1001"])
+def test_iphone_signature_supported_frame_rates(monkeypatch, iphone_probe, fps) -> None:
+    iphone_probe["streams"][0]["r_frame_rate"] = fps
+    monkeypatch.setattr(aifinger, "_ffprobe_json", lambda path: iphone_probe)
+    assert aifinger.looks_iPhone("output.mov")
+
+
+@pytest.mark.parametrize("field,value", [
+    ("codec_name", "hevc"), ("profile", "Main"),
+    ("color_space", "bt2020nc"), ("r_frame_rate", "15/1"),
+])
+def test_iphone_signature_preserves_video_requirements(monkeypatch, iphone_probe, field, value) -> None:
+    iphone_probe["streams"][0][field] = value
+    monkeypatch.setattr(aifinger, "_ffprobe_json", lambda path: iphone_probe)
+    assert not aifinger.looks_iPhone("output.mov", require_audio=False)
+
+
+def test_iphone_signature_requires_metadata(monkeypatch, iphone_probe) -> None:
+    iphone_probe["format"]["tags"].pop("com.apple.quicktime.model")
+    monkeypatch.setattr(aifinger, "_ffprobe_json", lambda path: iphone_probe)
+    assert not aifinger.looks_iPhone("output.mov", require_audio=False)
+
+
+def test_iphone_signature_uses_configured_ffprobe(monkeypatch, iphone_probe, tmp_path) -> None:
+    commands = []
+    executable = str(tmp_path / "custom tools" / "ffprobe")
+
+    def run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(iphone_probe), stderr="")
+
+    monkeypatch.setattr(aifinger.subprocess, "run", run)
+    assert aifinger.looks_iPhone("output.mov", ffprobe_bin=executable)
+    assert commands[0][0] == executable
+    assert commands[0][-1] == "output.mov"
+
+
+def test_iphone_signature_missing_configured_ffprobe_fails_closed(monkeypatch) -> None:
+    def missing(command, **kwargs):
+        raise FileNotFoundError(command[0])
+
+    monkeypatch.setattr(aifinger.subprocess, "run", missing)
+    assert not aifinger.looks_iPhone("output.mov", ffprobe_bin="missing-ffprobe", require_audio=False)

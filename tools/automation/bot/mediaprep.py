@@ -286,14 +286,14 @@ class MediaPrep:
                     f"-metadata:s:{stream}:0", "language=und"]
         cmd += ["-metadata:s:v:0", f"encoder={self.encoder_tag}"]
 
-        # No-reference fallback: write the four Apple keys as plain format
-        # tags (unprefixed) so the validator still passes without a reference MOV.
+        # The MOV metadata-tag writer preserves these custom format keys when
+        # no reference metadata atom is available.
         if no_reference:
             cmd += [
                 "-metadata", f"make={self.apple_make}",
                 "-metadata", f"model={self.apple_model}",
                 "-metadata", f"software={self.apple_software}",
-                "-metadata", "full-frame-rate-playback-intent=0",
+                "-metadata", f"full-frame-rate-playback-intent={self.apple_ffrate_intent}",
             ]
             cd = self.apple_creationdate or time.strftime("%Y-%m-%dT%H:%M:%S%z")
             cmd += ["-metadata", f"creationdate={cd}"]
@@ -310,7 +310,8 @@ class MediaPrep:
         cmd += ["-c:a", "aac", "-b:a", self.audio_bitrate]
 
         # Faststart for web
-        cmd += ["-movflags", "+faststart", "-brand", self.major_brand.ljust(4), "-f", "mov"]
+        movflags = "+faststart+use_metadata_tags" if no_reference else "+faststart"
+        cmd += ["-movflags", movflags, "-brand", self.major_brand.ljust(4), "-f", "mov"]
 
         cmd.append(str(dst))
         return cmd
@@ -373,7 +374,7 @@ class MediaPrep:
 
             # Fail-closed: output must pass the iPhone signature validator.
             # A bad config must not silently return ok=True.
-            if not looks_iPhone(dst_p):
+            if not looks_iPhone(dst_p, ffprobe_bin=self.ffprobe, require_audio=False):
                 return PrepResult(ok=False, src=str(src), dst=str(dst_p),
                     error="post-prep validation failed: looks_iPhone is False "
                           "(check encoder_tag, major_brand, fps and apple_* fields)")
