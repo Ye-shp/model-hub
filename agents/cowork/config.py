@@ -4,9 +4,13 @@ from __future__ import annotations
 import os
 
 PROFILES = {
-    "fast": {"seconds": 1200, "turns": 30, "helper_turns": 12, "tokens": 8192, "effort": "low"},
-    "balanced": {"seconds": 3600, "turns": 60, "helper_turns": 20, "tokens": 12288, "effort": "medium"},
-    "deep": {"seconds": 7200, "turns": 100, "helper_turns": 30, "tokens": 16384, "effort": "medium"},
+    # orchestrator_turns: steps for a GLM lead (glm.py). It only plans, assigns and reviews, so it needs far fewer
+    # steps than a Qwen lead that does the work itself, and every step it takes is paid.
+    "fast": {"seconds": 1200, "turns": 30, "helper_turns": 12, "tokens": 8192, "effort": "low", "orchestrator_turns": 15},
+    "balanced": {"seconds": 3600, "turns": 60, "helper_turns": 20, "tokens": 12288, "effort": "medium",
+                 "orchestrator_turns": 30},
+    "deep": {"seconds": 7200, "turns": 100, "helper_turns": 30, "tokens": 16384, "effort": "medium",
+             "orchestrator_turns": 45},
 }
 MAX_IMAGES = 8
 SHARE_LIMIT = 100 * 1024**2
@@ -15,6 +19,15 @@ RESIDENTS = ("qwen-1", "qwen-2")  # one per GPU
 LEAD_MODEL = os.environ.get("COWORK_LEAD_MODEL", "auto")
 HELPER_MODEL = os.environ.get("COWORK_HELPER_MODEL", "auto")
 MAX_PARALLEL_HELPERS = int(os.environ.get("COWORK_MAX_PARALLEL_HELPERS", "4"))
+# With GLM leading (glm.py) both GPUs are free for helpers: up to this many at once, spread over qwen-1 and qwen-2.
+ORCHESTRATOR_HELPERS = int(os.environ.get("COWORK_ORCHESTRATOR_HELPERS", "6"))
+# Which Cowork modes GLM leads ("chat", the quick-chat mode, stays on Qwen unless added here).
+ORCHESTRATOR_SKILLS = {s.strip() for s in os.environ.get("COWORK_ORCHESTRATOR_SKILLS", "cowork").split(",") if s.strip()}
+# A GLM lead's context is trimmed sooner than a Qwen lead's: every character it re-reads is paid for.
+ORCHESTRATOR_SOFT_CHARS = int(os.environ.get("COWORK_ORCHESTRATOR_SOFT_CHARS", "60000"))
+ORCHESTRATOR_HARD_CHARS = int(os.environ.get("COWORK_ORCHESTRATOR_HARD_CHARS", "120000"))
+# Helper reports the GLM lead reads are cut to this many characters (details stay in the files helpers write).
+ORCHESTRATOR_REPORT_CHARS = int(os.environ.get("COWORK_ORCHESTRATOR_REPORT_CHARS", "5000"))
 MAX_CHAIN = {"owner": int(os.environ.get("COWORK_MAX_PHASES", "6")), "friend": int(os.environ.get("COWORK_FRIEND_MAX_PHASES", "2"))}
 # When a task hits its time or step limit, the next part starts by itself in the same chat (no "continue" needed),
 # up to this many times in a row.

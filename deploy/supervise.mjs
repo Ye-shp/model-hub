@@ -84,7 +84,7 @@ const setStatus = (phase, detail = '') => writeFile(STATUS, JSON.stringify({phas
 // your frontier API keys or the tunnel token.
 const BASE = Object.fromEntries(Object.entries(env).filter(([k]) =>
   ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TZ', 'LD_LIBRARY_PATH'].includes(k) || k.startsWith('NVIDIA_') || k.startsWith('CUDA_')));
-const GATEWAY_ENV = Object.fromEntries(Object.entries(env).filter(([k]) => !['TUNNEL_TOKEN', 'WEBUI_SECRET_KEY', 'HF_TOKEN', 'CONSOLE_KEY', 'RESTORE_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'].includes(k)));
+const GATEWAY_ENV = Object.fromEntries(Object.entries(env).filter(([k]) => !['TUNNEL_TOKEN', 'WEBUI_SECRET_KEY', 'HF_TOKEN', 'CONSOLE_KEY', 'RESTORE_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'GLM_API_KEY'].includes(k)));
 
 const children = new Set();
 let stopping = false;
@@ -184,7 +184,8 @@ if (env.ENABLE_AGENT_CONSOLE === 'true') {
     ...Object.fromEntries(['CLAUDE_CODE_OAUTH_TOKEN', 'CODEX_API_KEY', 'BRAVE_API_KEY', 'CLAUDE_MODEL', 'CODEX_MODEL',
       'CLAUDE_DAILY_TASKS', 'CODEX_DAILY_TASKS', 'ESCALATION_TIMEOUT', 'AGENT_SLOTS', 'AGENT_MODEL_CALLS',
       'COWORK_MIN_FREE_GB', 'COWORK_FRIEND_QUOTA_GB', 'COWORK_MAX_PHASES', 'COWORK_FRIEND_MAX_PHASES', 'COWORK_HELPER_MODEL',
-      'COWORK_LEAD_MODEL', 'COWORK_MAX_PARALLEL_HELPERS',
+      'COWORK_LEAD_MODEL', 'COWORK_MAX_PARALLEL_HELPERS', 'COWORK_ORCHESTRATOR', 'COWORK_ORCHESTRATOR_HELPERS',
+      'COWORK_ORCHESTRATOR_SKILLS', 'GLM_API_KEY', 'GLM_BASE_URL', 'GLM_MODEL', 'GLM_MONTHLY_BUDGET_USD', 'GLM_MAX_TOKENS',
       'COWORK_CONTEXT_SOFT_CHARS', 'COWORK_CONTEXT_HARD_CHARS']
       .filter(k => env[k]).map(k => [k, env[k]])),
     // Claude Code bills an API key instead of your Claude plan when one is present, so only pass it on request.

@@ -17,10 +17,12 @@ import web
 import workspace as ws
 from crew import IMAGE_SIZES, POST_COLUMNS, CallBudget
 
-from .config import MAX_CHAIN, MAX_IMAGES, MAX_PARALLEL_HELPERS, PLAN_FILE, PROFILES, RESIDENTS, SHARE_LIMIT
+from .config import (MAX_CHAIN, MAX_IMAGES, MAX_PARALLEL_HELPERS, ORCHESTRATOR_HELPERS, ORCHESTRATOR_REPORT_CHARS, PLAN_FILE,
+                     PROFILES, RESIDENTS, SHARE_LIMIT)
 from .context import RUN_CONFIG, describe
 from .continuity import chain_depth, current_request
 from .effort import AdaptiveModel
+from . import gpu
 from .prompt import instructions
 
 
@@ -45,6 +47,23 @@ class ToolContext:
     escalation: list = field(default_factory=list)
     phone: bool = False
     research_status: str = ""
+    # GLM leads (orchestrator.py): the lead only plans and reviews, and helpers run on both GPUs.
+    orchestrated: bool = False
+    helper_escalation: list = field(default_factory=list)  # Claude Code / Codex for the helpers themselves
+    owner_tools: bool = False  # the lead has the posting tools (orchestrated prompt)
+
+    @property
+    def max_helpers(self) -> int:
+        return ORCHESTRATOR_HELPERS if self.orchestrated else MAX_PARALLEL_HELPERS
+
+    def workers(self, count: int) -> list[str]:
+        """Which resident each of `count` new helpers runs on."""
+        if self.orchestrated:
+            return gpu.least_busy(count)
+        return [self.helper_model] * count
+
+    def report_limit(self, default: int) -> int:
+        return min(default, ORCHESTRATOR_REPORT_CHARS) if self.orchestrated else default
 
     @property
     def project(self) -> str:
@@ -238,9 +257,13 @@ def _update_plan(ctx: ToolContext):
         pending = [s["title"] for s in steps_now if s["status"] != "completed"]
         reply = json.dumps(steps_now)
         if len(pending) >= 2 and ctx.state["delegations"] == 0:
-            reply += (f"\nReminder: the second GPU ({ctx.helper_model}) is idle. Hand the pending steps that don't need "
-                      "this conversation or each other's results to start_helpers now (they run in the background "
-                      "while you do the rest), or to delegate_many.")
+            if ctx.orchestrated:
+                reply += ("\nNext: hand the pending steps that don't depend on each other to start_helpers in one call "
+                          "(both GPUs are free), then collect_helpers.")
+            else:
+                reply += (f"\nReminder: the second GPU ({ctx.helper_model}) is idle. Hand the pending steps that don't need "
+                          "this conversation or each other's results to start_helpers now (they run in the background "
+                          "while you do the rest), or to delegate_many.")
         return reply
     return update_plan
 
@@ -301,21 +324,31 @@ def _generate_image(ctx: ToolContext):
 
 # ---- pausing the task clock ----
 class paused_clock:
-    """The task's time limit doesn't run while it waits on someone else (the user's answer, Claude Code, Codex)."""
+    """The task's time limit doesn't run while it waits on someone else (the user's answer, Claude Code, Codex).
+    Several helpers can wait at once: the clock stops at the first wait and restarts when the last one ends."""
     def __init__(self, ctx: ToolContext):
         self.timer = ctx.state.get("timer")
+        self.state = ctx.state
 
     async def __aenter__(self):
-        loop = asyncio.get_running_loop()
-        self.started = loop.time()
-        self.deadline = self.timer.when() if self.timer is not None else None
-        if self.deadline is not None:
-            self.timer.reschedule(None)
+        if self.timer is None:
+            return self
+        pause = self.state.setdefault("pause", {"depth": 0, "deadline": None, "started": 0.0})
+        if pause["depth"] == 0:
+            pause["started"] = asyncio.get_running_loop().time()
+            pause["deadline"] = self.timer.when()
+            if pause["deadline"] is not None:
+                self.timer.reschedule(None)
+        pause["depth"] += 1
         return self
 
     async def __aexit__(self, *exc):
-        if self.deadline is not None:
-            self.timer.reschedule(self.deadline + (asyncio.get_running_loop().time() - self.started))
+        if self.timer is None:
+            return False
+        pause = self.state["pause"]
+        pause["depth"] -= 1
+        if pause["depth"] == 0 and pause["deadline"] is not None:
+            self.timer.reschedule(pause["deadline"] + (asyncio.get_running_loop().time() - pause["started"]))
         return False
 
 
@@ -362,7 +395,10 @@ def make_helper(ctx: ToolContext, model: str, helper_tools: list) -> Agent:
     return Agent(name="helper", model=AdaptiveModel(model, ctx.client, ctx.gate, ctx.before),
                  tools=helper_tools,
                  model_settings=settings(ctx, profile["tokens"], "low" if profile["effort"] == "low" else "medium", False),
-                 instructions=instructions(ctx.job, ctx.space, helper=True, jev=ctx.state.get("jev", False)))
+                 instructions=instructions(ctx.job, ctx.space, helper=True, jev=ctx.state.get("jev", False),
+                                           escalation=ctx.helper_escalation,
+                                           connected=ctx.state.get("connector_notes", "") if ctx.orchestrated else "",
+                                           orchestrated=ctx.orchestrated))
 
 
 def _run_helper(ctx: ToolContext, helper_tools: list):
@@ -375,6 +411,7 @@ def _run_helper(ctx: ToolContext, helper_tools: list):
             helpers[model] = make_helper(ctx, model, helper_tools)
         ctx.state["delegations"] += 1
         ctx.log("delegate", f"Helper started on {model}: {brief[:140]}")
+        gpu.helper_started(model)
         try:
             result = await Runner.run(helpers[model], brief, max_turns=profile["helper_turns"], run_config=RUN_CONFIG,
                                       error_handlers=out_of_turns(ctx.client, ctx.gate, profile["tokens"], ctx.job_id))
@@ -383,7 +420,9 @@ def _run_helper(ctx: ToolContext, helper_tools: list):
             raise
         except Exception as error:  # one failed helper shouldn't sink the others
             output = f"Helper failed: {type(error).__name__}: {str(error)[:300]}"
-        ctx.log("delegate-done", f"Helper finished: {brief[:80]}")
+        finally:
+            gpu.helper_finished(model)
+        ctx.log("delegate-done", f"Helper finished on {model}: {brief[:80]}")
         return output
     return run_helper
 
@@ -394,7 +433,7 @@ def _delegate(ctx: ToolContext, run_helper):
         """Run one helper agent (on the other GPU) on a self-contained sub-task. It has the shell, files and web tools
         and shares this workspace. Returns the helper's report. For several independent pieces use delegate_many."""
         ctx.budget.active()
-        return sandbox.trim(await run_helper(brief, ctx.helper_model), 12000)
+        return sandbox.trim(await run_helper(brief, ctx.workers(1)[0]), ctx.report_limit(12000))
     return delegate
 
 
@@ -408,13 +447,17 @@ def _delegate_many(ctx: ToolContext, run_helper):
         briefs = [b.strip() for b in briefs if b and b.strip()]
         if not briefs:
             raise ValueError("Give at least one brief")
-        if len(briefs) > MAX_PARALLEL_HELPERS:
-            raise ValueError(f"At most {MAX_PARALLEL_HELPERS} helpers at once; group the work or call again for the rest")
-        # The lead waits during this call, so its GPU is free too: alternate helpers between the two GPUs.
-        order = ([ctx.helper_model, ctx.lead_model] if ctx.lead_model in RESIDENTS and ctx.helper_model in RESIDENTS
-                 else [ctx.helper_model])
-        results = await asyncio.gather(*(run_helper(b, order[i % len(order)]) for i, b in enumerate(briefs)))
-        limit = max(3000, 24000 // len(briefs))
+        if len(briefs) > ctx.max_helpers:
+            raise ValueError(f"At most {ctx.max_helpers} helpers at once; group the work or call again for the rest")
+        if ctx.orchestrated:
+            models = ctx.workers(len(briefs))
+        else:
+            # The lead waits during this call, so its GPU is free too: alternate helpers between the two GPUs.
+            order = ([ctx.helper_model, ctx.lead_model] if ctx.lead_model in RESIDENTS and ctx.helper_model in RESIDENTS
+                     else [ctx.helper_model])
+            models = [order[i % len(order)] for i in range(len(briefs))]
+        results = await asyncio.gather(*(run_helper(b, m) for b, m in zip(briefs, models)))
+        limit = ctx.report_limit(max(3000, 24000 // len(briefs)))
         return "\n\n".join(f"### Helper {i + 1}: {b[:80]}\n{sandbox.trim(r, limit)}" for i, (b, r) in enumerate(zip(briefs, results)))
     return delegate_many
 
@@ -422,8 +465,8 @@ def _delegate_many(ctx: ToolContext, run_helper):
 def _start_helpers(ctx: ToolContext, run_helper):
     @function_tool
     async def start_helpers(briefs: list[str]) -> str:
-        """Start 1-4 helper agents in the BACKGROUND on the other GPU and return at once, so you keep working while
-        they do. Each brief must be self-contained: goal, input files, the output file to write, what done looks
+        """Start helper agents (up to 4, or 6 when you are the orchestrator) in the BACKGROUND and return at once, so
+        you keep working while they do. Each brief must be self-contained: goal, input files, the output file to write, what done looks
         like. Get their reports with collect_helpers (always before your final reply)."""
         ctx.budget.active()
         briefs = [b.strip() for b in briefs if b and b.strip()]
@@ -431,16 +474,19 @@ def _start_helpers(ctx: ToolContext, run_helper):
             raise ValueError("Give at least one brief")
         running = ctx.state.setdefault("background", {})
         busy = sum(1 for item in running.values() if not item["task"].done())
-        if busy + len(briefs) > MAX_PARALLEL_HELPERS:
-            raise ValueError(f"At most {MAX_PARALLEL_HELPERS} background helpers at once ({busy} running); "
+        if busy + len(briefs) > ctx.max_helpers:
+            raise ValueError(f"At most {ctx.max_helpers} background helpers at once ({busy} running); "
                              "collect_helpers first")
         started = []
-        for brief in briefs:
+        for brief, model in zip(briefs, ctx.workers(len(briefs))):
             ident = f"h{len(running) + 1}"
-            running[ident] = {"brief": brief, "task": asyncio.ensure_future(run_helper(brief, ctx.helper_model)),
+            running[ident] = {"brief": brief, "model": model, "task": asyncio.ensure_future(run_helper(brief, model)),
                               "collected": False}
-            started.append(ident)
-        return (f"Started {', '.join(started)} on {ctx.helper_model}. Keep working on other steps; call collect_helpers "
+            started.append(f"{ident} on {model}")
+        if ctx.orchestrated:
+            return (f"Started {', '.join(started)}. Call collect_helpers with a long wait_seconds to get their reports "
+                    "(start any other independent pieces first).")
+        return (f"Started {', '.join(started)}. Keep working on other steps; call collect_helpers "
                 "to get their reports.")
     return start_helpers
 
@@ -467,7 +513,7 @@ def _collect_helpers(ctx: ToolContext):
                 report = item["task"].result()
             except BaseException as error:  # noqa: BLE001  (a stopped or failed helper)
                 report = f"Helper failed: {type(error).__name__}"
-            parts.append(f"### {ident}: {item['brief'][:80]}\n{sandbox.trim(report, 8000)}")
+            parts.append(f"### {ident}: {item['brief'][:80]}\n{sandbox.trim(report, ctx.report_limit(8000))}")
         if not parts and not still:
             return "No background helpers to collect."
         if still:
@@ -484,7 +530,8 @@ def cancel_background(state: dict) -> None:
 
 
 # ---- hand-off to frontier agents ----
-def _hand_off(ctx: ToolContext):
+def _hand_off(ctx: ToolContext, stop_on_failure: bool = True):
+    """stop_on_failure: the lead's hand-off ends the task when it fails; a helper's just reports the failure back."""
     async def hand_off(kind: str, task: str) -> str:
         ctx.budget.active()
         label = "Claude Code" if kind == "claude" else "Codex"
@@ -495,6 +542,10 @@ def _hand_off(ctx: ToolContext):
             why = result.get("error") or ("it timed out" if result.get("timed_out") else
                                           f"it exited with code {result.get('exit_code')}")
             summary = (result.get("summary") or "").strip()
+            if not stop_on_failure:
+                ctx.log("tool", f"{label} hand-off failed ({why}); the helper carries on")
+                return (json.dumps(result, ensure_ascii=False) + f"\n\nThis {label} hand-off failed ({why}). Do the part "
+                        "yourself if you can, otherwise say in your report exactly what is missing.")
             ctx.state["stop"] = f"the {label} hand-off failed ({why})" + (f": {summary[:300]}" if summary and not result.get("error") else "")
             ctx.log("tool", f"{label} hand-off failed; stopping the task")
             return json.dumps(result, ensure_ascii=False) + "\n\nThis hand-off failed, so the task stops now and reports it."
@@ -550,7 +601,9 @@ def _ask_codex(ctx: ToolContext, hand_off):
 
 
 def build_tools(ctx: ToolContext) -> list:
-    """The lead agent's tools. Also fills in ctx.escalation, ctx.phone and ctx.research_status for the prompt."""
+    """The lead agent's tools. Also fills in ctx.escalation, ctx.phone and ctx.research_status for the prompt.
+    With GLM orchestrating (ctx.orchestrated) the lead keeps only planning, reviewing and sharing tools; the shell, web,
+    research, connected tools, images, Jev, Claude Code and Codex go to the Qwen helpers, which do the work."""
     job, space = ctx.job, ctx.space
     run_shell, list_files, read_file = _run_shell(ctx), _list_files(ctx), _read_file(ctx)
     write_file, edit_file, share_file = _write_file(ctx), _edit_file(ctx), _share_file(ctx)
@@ -571,42 +624,59 @@ def build_tools(ctx: ToolContext) -> list:
     # Helpers get the lookups and video analysis too (so several videos/topics can be researched in parallel),
     # never posting.
     helper_research = [t for t in research_list if t.name not in research_module.OWNER_ONLY_TOOLS]
+    owner_research = [t for t in research_list if t.name in research_module.OWNER_ONLY_TOOLS]
 
     # Jev (TypeSafe), for the owner's tasks that may use paid frontier models; helpers get it too for bulk judgments.
     import jev
     ctx.state["jev"] = bool(space.is_owner and job["allow_frontier"] and jev.available() is None)
     jev_tools = [_ask_jev(ctx)] if ctx.state["jev"] else []
 
-    run_helper = _run_helper(ctx, workspace_tools + research_tools + helper_research + jev_tools)
-    delegate, delegate_many = _delegate(ctx, run_helper), _delegate_many(ctx, run_helper)
-
-    tools = workspace_tools + [share_file] + research_tools + [recall, remember, recent_posts, topic_stats, update_plan,
-                                                               queue_next_phase, delegate, delegate_many,
-                                                               _start_helpers(ctx, run_helper), _collect_helpers(ctx),
-                                                               _ask_user(ctx)]
-    tools += jev_tools
-    tools += ctx.state.get("connector_tools", [])  # the owner's MCP servers and APIs (connectors.py), opened by run_job
-    if job["allow_images"]:
-        tools.append(_generate_image(ctx))
-
-    ctx.phone = False
-    if space.is_owner:
-        import phone_link
-        if phone_link.connected():
-            ctx.phone = True
-            tools += phone_link.agent_tools(job, ctx.log, ctx.budget, current_request(job.get("task") or ""), ctx.client, ctx.gate)
-
-    tools += research_list
-
     ctx.escalation = []
     if space.is_owner and job["allow_frontier"]:
         for kind in ("claude", "codex"):
             if escalate.available(kind) is None:
                 ctx.escalation.append(kind)
-
     hand_off = _hand_off(ctx)
-    if "claude" in ctx.escalation:
-        tools.append(_ask_claude(ctx, hand_off))
-    if "codex" in ctx.escalation:
-        tools.append(_ask_codex(ctx, hand_off))
+    escalation_tools = ([_ask_claude(ctx, hand_off)] if "claude" in ctx.escalation else []) + \
+                       ([_ask_codex(ctx, hand_off)] if "codex" in ctx.escalation else [])
+    connector_tools = ctx.state.get("connector_tools", [])  # the owner's MCP servers and APIs, opened by run_job
+
+    phone_tools = []
+    ctx.phone = False
+    if space.is_owner:
+        import phone_link
+        if phone_link.connected():
+            ctx.phone = True
+            phone_tools = phone_link.agent_tools(job, ctx.log, ctx.budget, current_request(job.get("task") or ""),
+                                                 ctx.client, ctx.gate)
+
+    helper_tools = workspace_tools + research_tools + helper_research + jev_tools
+    if ctx.orchestrated:
+        # The Qwens keep Claude Code, Codex and Jev; a failed hand-off is reported to the helper, not fatal to the task.
+        ctx.helper_escalation = list(ctx.escalation)
+        helper_hand_off = _hand_off(ctx, stop_on_failure=False)
+        helper_tools = helper_tools + connector_tools
+        helper_tools += ([_ask_claude(ctx, helper_hand_off)] if "claude" in ctx.escalation else [])
+        helper_tools += ([_ask_codex(ctx, helper_hand_off)] if "codex" in ctx.escalation else [])
+        if job["allow_images"]:
+            helper_tools.append(_generate_image(ctx))
+
+    run_helper = _run_helper(ctx, helper_tools)
+    delegate, delegate_many = _delegate(ctx, run_helper), _delegate_many(ctx, run_helper)
+    coordination_tools = [update_plan, queue_next_phase, delegate, delegate_many, _start_helpers(ctx, run_helper),
+                          _collect_helpers(ctx), _ask_user(ctx)]
+
+    if ctx.orchestrated:
+        ctx.owner_tools = bool(owner_research)
+        return ([list_files, read_file, write_file, edit_file, share_file, recall, remember] + coordination_tools
+                + jev_tools + escalation_tools + phone_tools + owner_research)
+
+    tools = workspace_tools + [share_file] + research_tools + [recall, remember, recent_posts, topic_stats] + coordination_tools
+    tools += jev_tools
+    tools += connector_tools
+    if job["allow_images"]:
+        tools.append(_generate_image(ctx))
+    tools += phone_tools
+    tools += research_list
+    tools += escalation_tools
     return tools

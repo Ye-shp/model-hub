@@ -701,6 +701,27 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         jev.save_key(body.token)
         return jev.status()
 
+    @app.get("/api/connections/glm")
+    def glm_status():
+        import glm
+        return glm.status()
+
+    @app.post("/api/connections/glm")
+    def connect_glm(body: KeyIn):
+        """/connect glm <API key> | off | budget <USD> from an owner chat: GLM as the orchestrator of Cowork tasks."""
+        import glm
+        text = body.token.strip()
+        if text.lower().startswith("budget"):
+            amount = text[len("budget"):].strip().lstrip("$")
+            try:
+                value = float(amount)
+            except ValueError:
+                raise ValueError("Give the monthly budget in USD, for example: /connect glm budget 40") from None
+            glm.save_budget(value)
+        else:
+            glm.save_key(text)
+        return glm.status()
+
     @app.post("/api/admin/code")
     async def stage_code(body: CodeIn):
         """Stage a GitHub commit of the hub's app code; the next instance restart runs it (see supervise.mjs)."""

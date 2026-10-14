@@ -31,6 +31,7 @@ Owner commands: `/connections` (status of everything) · `/connect claude TOKEN`
 `/connect bluesky HANDLE APP_PASSWORD` · `/connect github TOKEN` · `/connect telegram BOT_TOKEN` (use Cowork from
 Telegram) · `/connect higgsfield` (sign in with your existing account; `off` disconnects) ·
 `/connect typesafe API_KEY` (Jev, TypeSafe's judgment model; `off` disconnects) ·
+`/connect glm API_KEY` (GLM leads tasks and assigns the work to Qwen; `budget USD` sets its monthly cap, `off` disconnects) ·
 `/connect mcp NAME URL [bearer=KEY]` or `/connect mcp NAME stdio COMMAND… [env:KEY=value]` (MCP servers) ·
 `/connect api NAME BASE_URL [bearer=KEY] [header="Name: value"] [about="…"]` (HTTP APIs). Approve a drafted post with `approve post N`."""
 
@@ -425,6 +426,14 @@ class Pipe:
                     except (httpx.HTTPError, ValueError, KeyError):
                         pass
                     try:
+                        orchestrator = await self._call(client, "GET", "/api/connections/glm")
+                        rows.append("- **GLM orchestrator**: " + (
+                            f"connected ({orchestrator['model']}); ${orchestrator['spent_usd']:.2f} of "
+                            f"${orchestrator['budget_usd']:.2f} this month" if orchestrator["connected"]
+                            else "not connected (`/connect glm <API key>`)"))
+                    except (httpx.HTTPError, ValueError, KeyError):
+                        pass
+                    try:
                         telegram = await self._call(client, "GET", "/api/connections/telegram")
                         rows.append("- **Telegram**: " + (("@" + str(telegram["bot"]) + (" (paired)" if telegram["paired"] else
                                                                                         " (waiting for /start <code>)"))
@@ -548,6 +557,30 @@ class Pipe:
                         return
                     staged = await self._call(client, "POST", "/api/admin/code", json={"ref": parts[1]})
                     yield f"Staged `{staged['staged'][:12]}` ({staged['files']} files). Restart the instance (not recycle) to run it."
+                    return
+                if command.split()[:2] == ["/connect", "glm"]:
+                    if tier != "owner":
+                        yield "Only the owner can manage connections."
+                        return
+                    value = request_text.split(None, 2)[2].strip() if len(request_text.split(None, 2)) == 3 else ""
+                    if not value:
+                        yield ("Send `/connect glm <your abliteration.ai API key>` to let GLM lead Cowork tasks, "
+                               "`/connect glm budget <USD>` to set its monthly spending cap, or `/connect glm off`.")
+                        return
+                    try:
+                        info = await self._call(client, "POST", "/api/connections/glm", json={"token": value})
+                    except ValueError as error:
+                        yield f"Not saved: {connection_error(error, request_text)}"
+                        return
+                    spend = f"${info['spent_usd']:.2f} of ${info['budget_usd']:.2f} used this month"
+                    if value.lower().startswith("budget"):
+                        yield f"GLM's monthly budget is now ${info['budget_usd']:.2f} ({spend})."
+                    elif info.get("connected"):
+                        yield (f"GLM ({info['model']}) is connected and now leads Cowork tasks: it plans and assigns the work, "
+                               f"and Qwen on both GPUs does it ({spend}). When the budget runs out, Qwen leads again. "
+                               "You can delete this message from the chat (the key is stored only on the box).")
+                    else:
+                        yield "GLM is disconnected. Qwen leads Cowork tasks again."
                     return
                 if command.split()[:2] == ["/connect", "typesafe"]:
                     if tier != "owner":
