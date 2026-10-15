@@ -362,7 +362,7 @@ def bounded_json(items: list[dict], limit: int = 12000) -> str:
 
 
 # Skills run by the Cowork agent (agents/cowork): "chat" is Qwen (chat), the same agent in a conversational mode.
-AGENT_SKILLS = frozenset({"cowork", "tor-fetcher", "social-automation", "chat"})
+AGENT_SKILLS = frozenset({"cowork", "tor-fetcher", "social-automation", "chat", "frame-extraction"})
 
 
 def create_job(project: str, task: str, skill: str, profile: str = "balanced", allow_frontier: bool = False, allow_images: bool = False,

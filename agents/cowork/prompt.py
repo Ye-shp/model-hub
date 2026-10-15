@@ -219,7 +219,8 @@ def orchestrator_instructions(job: dict, space: sandbox.Workspace, workers: int,
     now = datetime.now(timezone.utc)
     minutes = PROFILES[job["profile"]]["seconds"] // 60
     helper_kit = ["a Linux shell (Python, Node, ffmpeg, pandoc and more; they can install packages)", "the files in this "
-                  "chat's folder", "web search and page reading", "the research, video-analysis and social lookup tools"]
+                  "chat's folder", "web search and page reading", "the research, video-analysis and social lookup tools",
+                  "frame_sheet (a video, frame by frame, into a reusable character sheet saved to the knowledge base)"]
     if jev:
         helper_kit.append("Jev (ask_jev: typed judgments for classifying, ranking, scoring and checking many items)")
     if connected:

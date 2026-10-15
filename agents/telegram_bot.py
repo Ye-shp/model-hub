@@ -38,8 +38,10 @@ HELP = ("Send me a TikTok, Reel, X post or thread, Reddit thread or YouTube link
         "creator's profile link to analyse their whole account. I'll tell "
         "you which platform it is, study what it says and the top comments, and save anything useful about UGC, "
         "go-to-market and growth to the knowledge base for every future chat. Anything else you write is a normal "
-        "Cowork request. If a task needs something from you, it asks here and waits for your reply.\n\n/new starts a fresh "
-        "conversation, /status shows what's running.")
+        "Cowork request. If a task needs something from you, it asks here and waits for your reply.\n\n/frame <video link> "
+        "[name] (or a video with /frame as its caption) builds a character sheet from the video frame by frame: look, "
+        "outfits, setting, light, camera, palette and a prompt kit, saved for later. /new starts a fresh conversation, "
+        "/status shows what's running.")
 
 _watchers: dict[str, asyncio.Task] = {}
 
@@ -213,6 +215,49 @@ def attachment(message: dict) -> tuple[str, str, int] | None:
     return None
 
 
+async def save_attachment(token: str, message: dict, thread: str) -> tuple[str | None, str | None]:
+    """(workspace path, problem): the message's video/file saved in the chat's uploads/ folder."""
+    item = attachment(message)
+    if not item:
+        return None, None
+    file_id, name, size = item
+    if size > MAX_DOWNLOAD:
+        return None, f"{name} is over Telegram's 20 MB limit for bots: send its link instead."
+    try:
+        import sandbox
+        content = await download(token, file_id)
+        space = sandbox.Workspace("owner", thread).prepare()
+        return space.relative(space.write_bytes(f"uploads/{Path(name).name[:120]}", content)), None
+    except Exception as error:
+        return None, f"Couldn't download {name}: {_redact(str(error))[:200]}"
+
+
+async def frame_command(token: str, chat: int, message: dict, text: str, thread: str) -> None:
+    """/frame <link> [name], or a video with "/frame [name]" as its caption: a character sheet (frames.py)."""
+    import frames
+    found = message_links(message)
+    rest = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
+    for url in found:
+        rest = rest.replace(url, " ")
+    name = " ".join(rest.split())[:80]
+    saved, problem = await save_attachment(token, message, thread)
+    source = saved or (found[0] if found else "")
+    if not source:
+        await send(token, chat, problem or "Send /frame with a video link (TikTok, Reel, Short, X, YouTube…), optionally "
+                                           "followed by a name for the character, or attach a video with /frame as its caption.")
+        return
+    job = ws.create_job(PROJECT, frames.task_text(source, name), frames.SKILL, "fast", allow_frontier=True,
+                        allow_images=False, thread=thread, requested_by="telegram")
+    import glm
+    reader = "GLM's vision model" if glm.available() is None else "Qwen (GLM isn't connected)"
+    await send(token, chat, f"🎞 Extracting frames{' for ' + name if name else ''} — {reader} reads them one by one and "
+                            "writes the character sheet. About 2-6 minutes.")
+    pending = load().get("pending", {})
+    pending[job] = chat
+    update(pending=pending)
+    _watch(job, chat)
+
+
 def history(project: str, thread: str, limit: int = 4, characters: int = 6000) -> str:
     rows = ws.query("SELECT task,result,status FROM jobs WHERE project=? AND thread=? ORDER BY created_at DESC, rowid DESC LIMIT ?",
                     (project, thread, limit))
@@ -269,6 +314,10 @@ async def handle(message: dict) -> None:
             f"- {r['status']}: {r['task'].split('CURRENT REQUEST:' + chr(10), 1)[-1][:120]}" for r in rows))
         return
 
+    if command == "/frame":
+        await frame_command(token, chat, message, text, thread)
+        return
+
     import asking
     waiting = asking.pending_in_thread(PROJECT, thread)
     if waiting and text and not command:
@@ -279,19 +328,9 @@ async def handle(message: dict) -> None:
 
     found = message_links(message)
     attached, problems = [], []
-    item = attachment(message)
-    if item:
-        file_id, name, size = item
-        if size > MAX_DOWNLOAD:
-            problems.append(f"{name} is over Telegram's 20 MB limit for bots: send its link instead.")
-        else:
-            try:
-                import sandbox
-                content = await download(token, file_id)
-                space = sandbox.Workspace("owner", thread).prepare()
-                attached.append(space.relative(space.write_bytes(f"uploads/{Path(name).name[:120]}", content)))
-            except Exception as error:
-                problems.append(f"Couldn't download {name}: {_redact(str(error))[:200]}")
+    saved, problem = await save_attachment(token, message, thread)
+    attached += [saved] if saved else []
+    problems += [problem] if problem else []
     if not text and not attached:
         if problems:
             await send(token, chat, "\n".join(problems))

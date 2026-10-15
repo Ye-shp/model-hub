@@ -51,6 +51,8 @@ ACTION_KINDS = ("tool", "delegate", "delegate-done", "escalation", "escalation-d
 RESEARCH_GUIDE = """RESEARCH, VIDEO AND SOCIAL TOOLS (free; pick them yourself whenever they fit)
 - analyze_video: whenever the user shares or mentions a specific TikTok/Reel/Short/X video (link or upload) or wants
   to know why a video works. Returns hook, beats, CTA, pacing, sound and AI-tool fingerprint, from real measurements.
+- frame_sheet (owner): when the user wants a video's character, look, outfits or shots captured to reuse later
+  (a character sheet, a lookbook, "copy this person's style"). Frame by frame; saved to the knowledge base.
 - trend_research: "what's trending / what are people saying about X lately" — ranked posts across Reddit, X,
   YouTube, Hacker News, Polymarket, GitHub, Bluesky. Synthesise it; cite the posts and name the window. Set days to
   the window the user asks for: 2 (past 2 days / last 48 hours), 7 (past week), 14 (past 2 weeks) or 30 (past month);

@@ -179,5 +179,25 @@ generation, Jev, Claude Code and Codex; a helper's failed Claude/Codex hand-off 
 - Scope: the owner's Cowork tasks only. Quick chat mode, friends' tasks and the agent teams keep Qwen as the lead.
 - Off: `/connect glm off`, or `COWORK_ORCHESTRATOR=off` on the instance.
 
+- Chat with GLM directly: pick **GLM** in the chat site's model list (owner only). It uses the same key and budget;
+  a picture in your latest message goes to the vision model (`GLM_VISION_MODEL`, default `abliterated-model`, $1 / $0.10
+  / $3 per million), because the large model rejects images.
+
+### /frame: character sheets from videos
+
+In Telegram, send `/frame <video link> [name]`, or a video with `/frame [name]` as its caption. The owner's Cowork
+helpers have the same thing as the `frame_sheet` tool. It runs as a fixed pipeline (`agents/frames.py`), not an agent:
+
+1. `video_probe.py --dense` grabs up to `FRAME_MAX_FRAMES` (40) frames: the start of every shot plus frames spread
+   evenly over the video, and transcribes the voice and reads on-screen text.
+2. Each frame's colour palette is measured from its pixels.
+3. GLM's vision model reads the frames 4 at a time, 3 calls in parallel (Qwen-VL when GLM isn't connected).
+4. The large GLM model writes the character sheet: look, every outfit with timestamps, expressions, voice, setting,
+   light and camera, measured palette, continuity, extrapolated details marked "(inferred)" and a prompt kit.
+5. `character-sheets/<name>-<time>/` in the chat's folder gets `sheet.md`, `contact-sheet.jpg`, `frames.json` and
+   `frames.zip`; the three files are sent back, and the sheet goes into the knowledge base (`search_knowledge`).
+
+A 30-60 second video costs roughly $0.10-0.30 of the GLM budget.
+
 Everything here ships with `/update-code` and a reboot; the env settings above need a new image to reach the controller.
 
