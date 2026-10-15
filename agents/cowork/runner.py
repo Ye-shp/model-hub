@@ -20,8 +20,9 @@ from .context import RUN_CONFIG, describe, replayable, trim_items
 from .continuity import current_request, read_plan, recap
 from .effort import AdaptiveModel
 from .gpu import assign_gpus, release_gpus
+from . import orchestrator
 from .intent import is_automatic, wants_claude
-from .prompt import STOP_WRAP_UP, WRAP_UP, instructions
+from .prompt import STOP_WRAP_UP, WRAP_UP, instructions, orchestrator_instructions
 from .tier import tier_for
 from .tools import StopTask, ToolContext, build_tools, cancel_background, settings
 
@@ -75,6 +76,15 @@ def out_of_turns(client, gate, tokens: int, job_id: str, state: dict | None = No
 # ---------------------------------------------------------------------------------------------
 def make_agent(ctx: ToolContext, tools: list) -> Agent:
     profile = ctx.profile
+    if ctx.orchestrated:
+        ws.event(ctx.job_id, "tool", "GLM leads (plans and assigns); helpers on qwen-1 and qwen-2")
+        return Agent(name="cowork", model=orchestrator.OrchestratorModel(ctx.client, ctx.gate, ctx.before, ctx.job_id, ctx.state),
+                     tools=tools, model_settings=settings(ctx, profile["tokens"], profile["effort"], True),
+                     instructions=orchestrator_instructions(
+                         ctx.job, ctx.space, ctx.max_helpers, escalation=ctx.escalation, plan_text=read_plan(ctx.space),
+                         history=recap(ctx.job), phone=ctx.phone, owner_tools=ctx.owner_tools,
+                         connected=ctx.state.get("connector_notes", ""), jev=ctx.state.get("jev", False),
+                         claude_requested=wants_claude(ctx.job.get("task") or "") and not ctx.state.get("claude_done")))
     ws.event(ctx.job_id, "tool", f"Lead on {ctx.lead_model}, helpers on {ctx.helper_model}")
     return Agent(name="cowork", model=AdaptiveModel(ctx.lead_model, ctx.client, ctx.gate, ctx.before), tools=tools,
                  model_settings=settings(ctx, profile["tokens"], profile["effort"], True),
@@ -87,10 +97,13 @@ def make_agent(ctx: ToolContext, tools: list) -> Agent:
 
 def build(job: dict, client, gate: asyncio.Semaphore, space: sandbox.Workspace, state: dict | None = None) -> Agent:
     job_id = job["id"]
-    budget = CallBudget(job, limit=PROFILES[job["profile"]]["turns"] * 4)
     state = state if state is not None else {}
+    if "orchestrated" not in state:
+        state["orchestrated"] = orchestrator.enabled(job, space.is_owner)
+    # With GLM leading, helpers make most of the model calls (on both GPUs), so the task gets more of them.
+    budget = CallBudget(job, limit=PROFILES[job["profile"]]["turns"] * (8 if state["orchestrated"] else 4))
     if "lead" not in state:
-        state["lead"], state["helper"] = assign_gpus(job_id)
+        state["lead"], state["helper"] = assign_gpus(job_id, state["orchestrated"])
     state.setdefault("delegations", 0)
 
     def before(name: str):
@@ -104,7 +117,8 @@ def build(job: dict, client, gate: asyncio.Semaphore, space: sandbox.Workspace, 
         ws.event(job_id, kind, detail.replace("cd " + folder + " && ", "").replace(folder + "/", "").replace(folder, "."))
 
     ctx = ToolContext(job=job, space=space, client=client, gate=gate, budget=budget, state=state, images={"count": 0},
-                      log=log, before=before, lead_model=state["lead"], helper_model=state["helper"])
+                      log=log, before=before, lead_model=state["lead"], helper_model=state["helper"],
+                      orchestrated=state["orchestrated"])
     return make_agent(ctx, build_tools(ctx))
 
 
@@ -249,7 +263,10 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
     try:
         if space.is_owner:
             await open_connectors(job, space, state, connections)
-        state["lead"], state["helper"] = assign_gpus(job["id"])
+        state["orchestrated"] = orchestrator.enabled(job, space.is_owner)
+        state["lead"], state["helper"] = assign_gpus(job["id"], state["orchestrated"])
+        run_config = orchestrator.RUN_CONFIG if state["orchestrated"] else RUN_CONFIG
+        turns = profile["orchestrator_turns"] if state["orchestrated"] else profile["turns"]
 
         def still_running():
             rows = ws.query("SELECT status FROM jobs WHERE id=?", (job["id"],))
@@ -281,8 +298,8 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
                 state["timer"] = timer  # ask_user and hand-offs move the deadline by the time spent waiting
                 agent = build(job, client, gate, space, state)
                 handlers = out_of_turns(client, gate, profile["tokens"], job["id"], state)
-                result = await Runner.run(agent, task_input, max_turns=profile["turns"], session=session,
-                                          run_config=RUN_CONFIG, error_handlers=handlers)
+                result = await Runner.run(agent, task_input, max_turns=turns, session=session,
+                                          run_config=run_config, error_handlers=handlers)
                 log_usage(job["id"], result)
                 answer = str(result.final_output)
                 # Jev checks the reply against the request; one fix round when it falls short (Cowork only).
@@ -291,8 +308,8 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
                     gap = await judge.reply_gap(job, answer, shared_files(job["id"]))
                     if gap:
                         ws.event(job["id"], "tool", "Quality check: the reply falls short; finishing the missing parts")
-                        result = await Runner.run(agent, gap, max_turns=max(10, profile["turns"] // 3), session=session,
-                                                  run_config=RUN_CONFIG, error_handlers=handlers)
+                        result = await Runner.run(agent, gap, max_turns=max(10, turns // 3), session=session,
+                                                  run_config=run_config, error_handlers=handlers)
                         log_usage(job["id"], result)
                         answer = str(result.final_output)
         except Exception as error:
@@ -316,7 +333,7 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
             ws.event(job["id"], "tool", "Writing up what was done")
             return header + "\n\n" + await wrap_up(client, gate, profile, job, session, reason)
         if state.get("out_of_steps") and not state.get("next"):
-            reason = f"it used all {profile['turns']} steps"
+            reason = f"it used all {turns} steps"
             ws.event(job["id"], "partial", reason)
             if await continue_after(job, reason, answer):
                 answer = "🔁 **Used all steps for one task; the next part has started automatically.**\n\n" + answer
@@ -329,6 +346,9 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
             ws.event(job["id"], "next-phase", nxt)
         return answer
     finally:
+        note = orchestrator.cost_note(state)
+        if note:
+            ws.event(job["id"], "tool", note)
         reasoning.end(reasoning_token)
         cancel_background(state)
         release_gpus(job["id"])

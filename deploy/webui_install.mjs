@@ -39,6 +39,10 @@ export async function installAgents({env, socket, dataDir, integrations = '/opt/
       description: 'Chat with Qwen; it uses the web, a shell, files, images, helpers and Claude Code when they help',
       valves: key => ({CONTROLLER_URL: 'http://127.0.0.1:8787', OWNER_KEY: key, MODE: 'chat',
         OWNER_PROFILE: env.CHAT_PROFILE || 'fast', ALLOW_IMAGES: imagesOn, OWNER_ESCALATION: env.COWORK_ESCALATION !== 'false'})},
+    // Plain chat with the hosted GLM model through the controller, which holds its key and monthly budget (agents/glm.py).
+    {id: 'glm', name: 'GLM', file: 'openwebui_glm.py',
+      description: 'Chat with GLM (abliteration.ai) using the key and budget stored on the box; pictures go to its vision model',
+      valves: key => ({CONTROLLER_URL: 'http://127.0.0.1:8787', OWNER_KEY: key})},
   ];
   for (let attempt = 1; attempt <= attempts && !stopping(); attempt++) {
     try {
@@ -71,7 +75,7 @@ export async function installAgents({env, socket, dataDir, integrations = '/opt/
       // The model list shows Qwen Cowork and Qwen (chat), both with tools. The bare models (qwen, qwen-1, qwen-2) stay
       // usable (chat titles use qwen-2) but are hidden from the picker. The Pipes refuse anyone but the owner.
       const everyone = [{principal_type: 'user', principal_id: '*', permission: 'read'}];
-      for (const [id, name, hidden] of [['cowork', 'Qwen Cowork', false], ['qwen_chat', 'Qwen (chat)', false],
+      for (const [id, name, hidden] of [['cowork', 'Qwen Cowork', false], ['qwen_chat', 'Qwen (chat)', false], ['glm', 'GLM', false],
                                         ['qwen', 'qwen (no tools)', true], ['qwen-1', 'qwen-1', true], ['qwen-2', 'qwen-2', true]]) {
         const r = await call('/models/model/access/update', {method: 'POST', headers, body: JSON.stringify({id, name, access_grants: everyone})});
         if (!r.ok) { log.error(`[supervisor] could not share model ${id}: HTTP ${r.status} ${r.text.slice(0, 200)}`); continue; }

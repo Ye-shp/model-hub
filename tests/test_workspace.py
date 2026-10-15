@@ -156,7 +156,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("--serial", fleet.plan({"devices":[{"serial":"A"}]})[0])
 
     def test_all_skills_are_loadable_and_traversal_is_rejected(self):
-        self.assertEqual(len(skills.catalog()), 12)
+        self.assertEqual(len(skills.catalog()), 13)
         with self.assertRaises(ValueError):
             skills.load_skill("../../outside")
 

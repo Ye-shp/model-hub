@@ -74,6 +74,10 @@ class StreamingModel(OpenAIChatCompletionsModel):
             raw = response.usage
             usage = Usage(requests=1, input_tokens=raw.input_tokens, output_tokens=raw.output_tokens,
                           total_tokens=raw.total_tokens) if raw else Usage(requests=1)
+            # Cached prompt tokens bill at a lower rate on hosted models (see glm.py).
+            cached = getattr(getattr(raw, "input_tokens_details", None), "cached_tokens", None) if raw else None
+            if cached:
+                usage.input_tokens_details.cached_tokens = cached
             return ModelResponse(output=response.output, usage=usage, response_id=None)
         if self.gate:
             async with self.gate:

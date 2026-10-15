@@ -243,6 +243,9 @@ def build_team(job: dict, client, gate: asyncio.Semaphore) -> Agent:
 
 
 async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
+    if job["skill"] == "frame-extraction":  # /frame: a fixed pipeline, no agent (frames.py)
+        import frames
+        return await frames.run_job(job, gate)
     if job["skill"] in ws.AGENT_SKILLS:
         import cowork
         return await cowork.run_job(job, gate)

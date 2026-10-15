@@ -90,9 +90,27 @@ def frame_times(duration: float, scenes: list[tuple[float, float]], limit: int) 
     return sorted(set(hook + middles))[:limit + 1]
 
 
-def grab(path: Path, at: float, target: Path) -> bool:
+def dense_times(duration: float, scenes: list[tuple[float, float]], limit: int) -> list[float]:
+    """Frame by frame (for /frame): the start of every shot (so every look, angle and outfit change is caught), the
+    rest of the budget spread evenly over the whole video. With more shots than the limit, the shots are thinned evenly."""
+    if duration <= 0:
+        return [0.0]
+    starts = sorted({round(min(a + 0.15, max(b - 0.05, a)), 2) for a, b in scenes if 0 <= a < duration})
+    if len(starts) >= limit:
+        step = len(starts) / limit
+        return [starts[int(i * step)] for i in range(limit)]
+    room = limit - len(starts)
+    even = [round(duration * (i + 0.5) / room, 2) for i in range(room)]
+    times = list(starts)
+    for t in even:  # skip near-duplicates of a shot start
+        if all(abs(t - kept) >= 0.3 for kept in times):
+            times.append(t)
+    return sorted(times)
+
+
+def grab(path: Path, at: float, target: Path, width: int = 720) -> bool:
     out = subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{at:.2f}", "-i", str(path), "-frames:v", "1",
-                          "-vf", "scale='min(720,iw)':-2", "-q:v", "3", str(target)], capture_output=True, timeout=60)
+                          "-vf", f"scale='min({width},iw)':-2", "-q:v", "3", str(target)], capture_output=True, timeout=60)
     return out.returncode == 0 and target.exists()
 
 
@@ -148,6 +166,7 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--frames", type=int, default=12)
     ap.add_argument("--whisper", default="")
+    ap.add_argument("--dense", action="store_true", help="evenly spaced frames plus every shot start (for /frame)")
     args = ap.parse_args()
     out = Path(args.out)
     (out / "frames").mkdir(parents=True, exist_ok=True)
@@ -182,9 +201,10 @@ def main():
                        "first_cut_at": scenes[1][0] if len(scenes) > 1 else None, "list": scenes[:80]}
 
     frames = []
-    for i, at in enumerate(frame_times(duration, scenes, args.frames)):
+    times = dense_times(duration, scenes, args.frames) if args.dense else frame_times(duration, scenes, args.frames)
+    for i, at in enumerate(times):
         target = out / "frames" / f"{i:02d}_{at:06.2f}s.jpg"
-        if grab(path, at, target):
+        if grab(path, at, target, 1080 if args.dense else 720):
             frames.append({"at": at, "path": str(target)})
     report["frames"] = frames
 

@@ -404,6 +404,22 @@ def build_tools(job: dict, space, client, gate, log, budget, request_text: str, 
 
     tools = [analyze_video, trend_research, study_link, study_profile, list_knowledge]
 
+    # ---- frame extraction (frames.py): the owner's, since it may use GLM's paid vision model ----
+    if owner and job.get("allow_frontier"):
+        @function_tool
+        async def frame_sheet(source: str, name: str = "") -> str:
+            """Frame-by-frame visual analysis of a video (link or workspace file) into a reusable CHARACTER SHEET: face,
+            hair, body, every outfit with timestamps, accessories, expressions, voice, setting, lighting, camera,
+            measured colour palette, continuity, extrapolated details (marked) and a prompt kit for image/video models.
+            Saves sheet.md, a contact sheet and all frames under character-sheets/, shares them, and adds the sheet to
+            the knowledge base. name: what to call the character. Takes 2-6 minutes."""
+            import frames
+            budget.active()
+            result = await frames.extract(source, space, project, job_id, client, gate, log, name)
+            return frames.summary(result, name or "Character") + (
+                f"\n\nSheet: {result['sheet']}" if result.get("ok") else "")
+        tools.append(frame_sheet)
+
     # ---- lookups ----
     @function_tool
     async def google_trends(keywords: list[str], timeframe: str = "today 1-m", geo: str = "") -> str:

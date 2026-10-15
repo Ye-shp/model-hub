@@ -62,6 +62,11 @@ The old box streams everything to the new one: databases are copied consistently
 | `COWORK_CONTEXT_SOFT_CHARS` / `_HARD_CHARS` | `120000` / `260000` | when old tool output starts being shortened |
 | `COWORK_LEAD_MODEL` / `COWORK_HELPER_MODEL` | `auto` | pin the lead or helpers to `qwen-1`/`qwen-2` instead of balancing |
 | `COWORK_MAX_PARALLEL_HELPERS` | `4` | helpers one `delegate_many` call may start |
+| `COWORK_ORCHESTRATOR` | `on` | `off` keeps Qwen as the lead even when GLM is connected (section 6) |
+| `COWORK_ORCHESTRATOR_HELPERS` | `6` | helpers at once when GLM leads (spread over both GPUs) |
+| `COWORK_ORCHESTRATOR_SKILLS` | `cowork` | Cowork modes GLM leads; add `chat` to let it lead quick chats too |
+| `GLM_MONTHLY_BUDGET_USD` | `40` | GLM's monthly spending cap until `/connect glm budget <USD>` sets one |
+| `GLM_BASE_URL` / `GLM_MODEL` | `https://api.abliteration.ai/v1` / `abliterated-model-large-v2` | the hosted orchestrator |
 | `TOOLS_DIR` | next to `COWORK_ROOT` (`/workspace/tools`) | research/video tools environment, installed on first start (about 1–2 GB) |
 | `BRIDGE_PUBLIC_URL` | derived from `WEBUI_URL` (`hub.` → `api.`) | the address shown in the phone setup command |
 
@@ -157,3 +162,42 @@ in the task's instructions.
 Cowork calls them with `call_api(api, method, path, query_json, body_json)`. Stored headers and query values are added
 on the box and hidden from responses; calls stay under the base URL, redirects aren't followed, and only the listed
 methods (default GET, POST) are allowed. `/connections` lists everything connected (names and hosts, no keys).
+
+## 6. GLM as the orchestrator
+
+A hosted GLM model (abliteration.ai) can lead the owner's Cowork tasks while the two Qwens do the work. GLM plans,
+splits the request into self-contained briefs, starts helpers on both GPUs at once (up to `COWORK_ORCHESTRATOR_HELPERS`),
+checks their files and writes the reply. It has no shell or web access itself, so it only pays for planning and
+reviewing. The Qwen helpers keep the shell, files, web and research tools, the owner's connected tools, image
+generation, Jev, Claude Code and Codex; a helper's failed Claude/Codex hand-off is reported back instead of stopping the task.
+
+- Connect: send `/connect glm <API key>` in an owner Cowork chat (stored root-only as `DATA/glm-key`), then delete the message.
+- Budget: `/connect glm budget <USD>` (default 40 per calendar month). Every call is metered from its token usage at
+  $3 / $0.30 (cached) / $5 per million input / output tokens; `/connections` shows the month's spend and each task's
+  status ends with its GLM cost.
+- Fallback: with no key, the budget used up or GLM failing, Qwen leads as before (the switch is logged in the task).
+- Scope: the owner's Cowork tasks only. Quick chat mode, friends' tasks and the agent teams keep Qwen as the lead.
+- Off: `/connect glm off`, or `COWORK_ORCHESTRATOR=off` on the instance.
+
+- Chat with GLM directly: pick **GLM** in the chat site's model list (owner only). It uses the same key and budget;
+  a picture in your latest message goes to the vision model (`GLM_VISION_MODEL`, default `abliterated-model`, $1 / $0.10
+  / $3 per million), because the large model rejects images.
+
+### /frame: character sheets from videos
+
+In Telegram, send `/frame <video link> [name]`, or a video with `/frame [name]` as its caption. The owner's Cowork
+helpers have the same thing as the `frame_sheet` tool. It runs as a fixed pipeline (`agents/frames.py`), not an agent:
+
+1. `video_probe.py --dense` grabs up to `FRAME_MAX_FRAMES` (40) frames: the start of every shot plus frames spread
+   evenly over the video, and transcribes the voice and reads on-screen text.
+2. Each frame's colour palette is measured from its pixels.
+3. GLM's vision model reads the frames 4 at a time, 3 calls in parallel (Qwen-VL when GLM isn't connected).
+4. The large GLM model writes the character sheet: look, every outfit with timestamps, expressions, voice, setting,
+   light and camera, measured palette, continuity, extrapolated details marked "(inferred)" and a prompt kit.
+5. `character-sheets/<name>-<time>/` in the chat's folder gets `sheet.md`, `contact-sheet.jpg`, `frames.json` and
+   `frames.zip`; the three files are sent back, and the sheet goes into the knowledge base (`search_knowledge`).
+
+A 30-60 second video costs roughly $0.10-0.30 of the GLM budget.
+
+Everything here ships with `/update-code` and a reboot; the env settings above need a new image to reach the controller.
+

@@ -14,7 +14,7 @@ from typing import Literal
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, StrictFloat, StrictInt
 
 import hub  # Reads agents/.env before the data directory is selected.
@@ -47,6 +47,11 @@ class JobIn(BaseModel):
 
 class TokenIn(BaseModel):
     token: str = Field(min_length=20, max_length=400)
+
+
+class GlmChatIn(BaseModel):
+    """A conversation for the chat site's GLM model (OpenAI-style messages; images as data URLs)."""
+    messages: list[dict] = Field(min_length=1, max_length=400)
 
 
 class KeyIn(BaseModel):
@@ -700,6 +705,43 @@ def create_app(key: str | None = None, run_worker: bool = True, runner=None) -> 
         import jev
         jev.save_key(body.token)
         return jev.status()
+
+    @app.get("/api/connections/glm")
+    def glm_status():
+        import glm
+        return glm.status()
+
+    @app.post("/api/connections/glm")
+    def connect_glm(body: KeyIn):
+        """/connect glm <API key> | off | budget <USD> from an owner chat: GLM as the orchestrator of Cowork tasks."""
+        import glm
+        text = body.token.strip()
+        if text.lower().startswith("budget"):
+            amount = text[len("budget"):].strip().lstrip("$")
+            try:
+                value = float(amount)
+            except ValueError:
+                raise ValueError("Give the monthly budget in USD, for example: /connect glm budget 40") from None
+            glm.save_budget(value)
+        else:
+            glm.save_key(text)
+        return glm.status()
+
+    @app.post("/api/glm/chat")
+    async def glm_chat(body: GlmChatIn):
+        """The chat site's GLM model (openwebui_glm.py): streams newline-delimited JSON events from glm.stream_chat."""
+        import glm
+        messages = []
+        for message in body.messages:
+            role, content = message.get("role"), message.get("content")
+            if role not in {"system", "user", "assistant"} or not isinstance(content, (str, list)):
+                raise ValueError("Each message needs a role (system, user or assistant) and content")
+            messages.append({"role": role, "content": content})
+
+        async def events():
+            async for event in glm.stream_chat(messages):
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+        return StreamingResponse(events(), media_type="application/x-ndjson")
 
     @app.post("/api/admin/code")
     async def stage_code(body: CodeIn):
