@@ -35,7 +35,7 @@ PRICES = {MODEL: (PRICE_INPUT, PRICE_CACHED, PRICE_OUTPUT),
                          float(os.environ.get("GLM_VISION_PRICE_CACHED_INPUT", "0.10")),
                          float(os.environ.get("GLM_VISION_PRICE_OUTPUT", "3.00")))}
 DEFAULT_BUDGET = float(os.environ.get("GLM_MONTHLY_BUDGET_USD", "40"))
-MAX_TOKENS = int(os.environ.get("GLM_MAX_TOKENS", "6000"))
+MAX_TOKENS = int(os.environ.get("GLM_MAX_TOKENS", "16000"))  # a ceiling, not a cost: thinking is capped by effort
 KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{19,299}")
 _lock = threading.Lock()
 

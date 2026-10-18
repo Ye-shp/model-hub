@@ -231,7 +231,8 @@ class EndToEndTests(Base):
         self.assertEqual(output, "Both notes are written.")
         self.assertEqual(sorted(helper_models), ["qwen-1", "qwen-2"])
         self.assertEqual({r["model"] for r in lead_requests}, {glm.MODEL})
-        self.assertTrue(all("reasoning_effort" not in r for r in lead_requests))
+        # Planning steps think at "high"; right after a read-only look (collect is not one) still "high".
+        self.assertEqual({r["reasoning_effort"] for r in lead_requests}, {"high"})
         self.assertTrue(all(r["max_tokens"] <= glm.MAX_TOKENS for r in lead_requests))
         lead_tools = {t["function"]["name"] for t in lead_requests[0]["tools"]}
         self.assertNotIn("run_shell", lead_tools)
@@ -242,6 +243,62 @@ class EndToEndTests(Base):
         notes = [e["detail"] for e in ws.query("SELECT detail FROM events WHERE job_id=? AND kind='tool'", (identity,))]
         self.assertTrue(any(n.startswith("GLM: 3 calls") for n in notes))
         self.assertEqual(gpu._helpers, {"qwen-1": 0, "qwen-2": 0})
+
+    def test_glm_out_of_tokens_retries_with_less_thinking_then_hands_one_step_to_qwen(self):
+        glm.save_key(KEY)
+        efforts, qwen_calls = [], []
+
+        def length_only(request, model):
+            # Thinking used every token: no text, no tool call, finish_reason "length".
+            chunk = lambda d, f=None: {"id": "c", "object": "chat.completion.chunk", "created": 1, "model": model,
+                                       "choices": [{"index": 0, "delta": d, "finish_reason": f}]}
+            pieces = [chunk({"role": "assistant", "reasoning_content": "hmm " * 50}), chunk({}, "length"),
+                      {"id": "c", "object": "chat.completion.chunk", "created": 1, "model": model, "choices": [],
+                       "usage": {"prompt_tokens": 100, "completion_tokens": 16000, "total_tokens": 16100}}]
+            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                  content="".join("data: " + json.dumps(p) + "\n\n" for p in pieces) + "data: [DONE]\n\n")
+
+        def glm_handler(request):
+            body = json.loads(request.content)
+            efforts.append(body.get("reasoning_effort"))
+            if len(efforts) == 1:  # the first try runs out; the low-effort retry answers
+                return length_only(request, body["model"])
+            if len(efforts) == 2:
+                return sse({"role": "assistant", "content": "Answered after the retry."}, "stop", model=glm.MODEL)
+            return length_only(request, body["model"])
+
+        def hub_handler(request):
+            qwen_calls.append(json.loads(request.content)["model"])
+            return sse({"role": "assistant", "content": "Qwen took the step."}, "stop")
+
+        identity, output = self.run_task(glm_handler, hub_handler)
+        self.assertEqual(output, "Answered after the retry.")
+        self.assertEqual(efforts, ["high", "low"])
+        self.assertEqual(qwen_calls, [])
+        notes = [e["detail"] for e in ws.query("SELECT detail FROM events WHERE job_id=? AND kind='tool'", (identity,))]
+        self.assertIn("GLM ran out of room while thinking; asking again with less thinking", notes)
+
+    def test_when_glm_runs_out_twice_qwen_takes_that_step_and_glm_stays_the_lead(self):
+        glm.save_key(KEY)
+        efforts = []
+
+        def length_only(request):
+            efforts.append(json.loads(request.content).get("reasoning_effort"))
+            chunk = lambda d, f=None: {"id": "c", "object": "chat.completion.chunk", "created": 1, "model": glm.MODEL,
+                                       "choices": [{"index": 0, "delta": d, "finish_reason": f}]}
+            pieces = [chunk({"role": "assistant", "reasoning_content": "hmm"}), chunk({}, "length")]
+            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                  content="".join("data: " + json.dumps(p) + "\n\n" for p in pieces) + "data: [DONE]\n\n")
+
+        def hub_handler(request):
+            return sse({"role": "assistant", "content": "Qwen took the step."}, "stop")
+
+        identity, output = self.run_task(length_only, hub_handler)
+        self.assertEqual(output, "Qwen took the step.")
+        self.assertEqual(efforts, ["high", "low"])
+        notes = [e["detail"] for e in ws.query("SELECT detail FROM events WHERE job_id=? AND kind='tool'", (identity,))]
+        self.assertIn("GLM couldn't fit this step; Qwen takes this one step", notes)
+        self.assertFalse(any(n.startswith("GLM is unavailable") for n in notes))
 
     def test_qwen_takes_over_when_glm_fails(self):
         glm.save_key(KEY)

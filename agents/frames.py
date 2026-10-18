@@ -158,7 +158,7 @@ async def _ask(messages: list, vision: bool, hub_client, gate, max_tokens: int) 
     if glm.available() is None:
         try:
             text, spent = await glm.complete(messages, glm.VISION_MODEL if vision else glm.MODEL, max_tokens=max_tokens,
-                                             temperature=0.2)
+                                             temperature=0.2, reasoning_effort="high")  # unbounded thinking can eat the reply
             return text, spent, glm.VISION_MODEL if vision else glm.MODEL
         except Exception as error:  # fall back to Qwen rather than lose the work
             print(f"[frames] GLM call failed, using Qwen: {type(error).__name__}", flush=True)
