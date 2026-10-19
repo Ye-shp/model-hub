@@ -135,6 +135,16 @@ class NativePublisherTests(unittest.TestCase):
         self.device = patch.object(publisher, "_device", return_value=self.phone)
         self.device.start()
         self.markers = 0
+        # UI tests use synthetic bytes; exercise prep separately with real media.
+        self.prep = patch.object(publisher, "_prepare_for_push", side_effect=self.prepare)
+        self.prep_mock = self.prep.start()
+        self.addCleanup(self.prep.stop)
+
+    def prepare(self, source, tempdir):
+        self.assertEqual(source.read_bytes(), self.source.read_bytes())
+        processed = tempdir / (source.stem + "-prepped.mov")
+        processed.write_bytes(b"processed video bytes")
+        return processed
 
     def tearDown(self):
         self.device.stop()
@@ -150,16 +160,31 @@ class NativePublisherTests(unittest.TestCase):
     def test_exact_approved_video_uri_and_caption_precede_one_submit(self):
         result = self.publish()
         self.assertEqual(result["status"], "needs_confirmation")
-        self.assertEqual(self.phone.transferred, self.source.read_bytes())
+        self.assertEqual(self.phone.transferred, b"processed video bytes")
+        self.assertEqual(result["source_hash"], self.post["media_hashes"][0])
+        self.assertEqual(result["processed_hash"], hashlib.sha256(self.phone.transferred).hexdigest())
+        self.assertEqual(self.source.read_bytes(), b"retained approved original video")
         self.assertEqual(self.phone.caption, self.post["caption"])
         intent = [args for args in self.phone.adb if args[1] == "am"][0]
         self.assertEqual(intent[intent.index("--eu") + 2], "content://media/external/video/media/17")
         self.assertEqual(intent[intent.index("-p") + 1], "com.instagram.android")
+        self.assertEqual(intent[intent.index("-t") + 1], "video/quicktime")
+        self.assertTrue(self.phone.filename.endswith(".mov"))
         self.assertEqual(self.phone.events[-2:], ["durable_hold", "submit"])
         self.assertEqual(self.phone.submits, 1)
         self.assertEqual(self.markers, 1)
         self.assertNotIn("id", result)
         self.assertNotIn("url", result)
+
+    def test_prep_failure_prevents_transfer_and_submit(self):
+        self.prep_mock.side_effect = RuntimeError("Media preparation failed")
+        result = self.publish()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["source_hash"], self.post["media_hashes"][0])
+        self.assertIsNone(result["processed_hash"])
+        self.assertNotIn("push", self.phone.events)
+        self.assertEqual(self.markers, 0)
+        self.assertEqual(self.phone.submits, 0)
 
     def test_tiktok_uses_exact_account_and_target_package(self):
         self.post.update(platform="tiktok", kind="video")

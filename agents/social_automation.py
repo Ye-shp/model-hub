@@ -556,7 +556,7 @@ def _submit(row: dict) -> None:
 
 
 def _safe_result(row: dict, result: dict) -> dict:
-    allowed = {"ok", "status", "submitted", "needs_confirmation", "reason", "error", "caption", "remote_media", "id", "url", "published_at", "retryable"}
+    allowed = {"ok", "status", "submitted", "needs_confirmation", "reason", "error", "caption", "remote_media", "id", "url", "published_at", "retryable", "source_hash", "processed_hash"}
     clean = {key: value for key, value in result.items() if key in allowed}
     for key, value in clean.items():
         if isinstance(value, str):

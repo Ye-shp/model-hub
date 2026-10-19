@@ -56,7 +56,7 @@ class Orchestrator:
         self._sched: dict[str, datetime] = {}   # job_id -> chosen slot (stable between polls)
         # Anti-AI-detection media pipeline (see bot/mediaprep.py + bot/aifinger.py).
         # Built lazily here so the orchestrator can run in dry-run without ffmpeg.
-        self._mediaprep: MediaPrep | None = MediaPrep(cfg.mediaprep, dry_run=dry_run)
+        self._mediaprep: MediaPrep | None = MediaPrep.from_config(cfg.mediaprep, dry_run=dry_run)
 
     # ------------------------------------------------------------------ wiring
     def device_for(self, account: Account) -> DeviceController:

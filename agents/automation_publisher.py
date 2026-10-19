@@ -27,7 +27,7 @@ _PACKAGES = {"instagram": "com.instagram.android", "tiktok": "com.zhiliaoapp.mus
 _VIDEO = {".mp4", ".mov", ".m4v"}
 
 
-def _scaffold_device():
+def _scaffold_module(name: str):
     """Import the local scaffold without claiming the generic `bot` package."""
     path = Path(__file__).resolve().parents[1] / "tools" / "automation" / "bot"
     with _IMPORT_LOCK:
@@ -44,7 +44,21 @@ def _scaffold_device():
             except BaseException:
                 sys.modules.pop(_NAMESPACE, None)
                 raise
-        return importlib.import_module(f"{_NAMESPACE}.device").DeviceController
+        return importlib.import_module(f"{_NAMESPACE}.{name}")
+
+
+def _scaffold_device():
+    return _scaffold_module("device").DeviceController
+
+
+def _prepare_for_push(source: Path, tempdir: Path) -> Path:
+    """Prepare a staged copy with repo defaults; never fall back to raw media."""
+    cfg = _scaffold_module("config").Config()
+    prep = _scaffold_module("mediaprep").MediaPrep.from_config(cfg.mediaprep, dry_run=False)
+    result = prep.prepare(source, dst=tempdir / f"{source.stem}-prepped")
+    if not result.ok:
+        raise RuntimeError(f"Media preparation failed: {result.error}")
+    return Path(result.dst)  # Preserve the pipeline's output extension (usually .mov).
 
 
 def _device(settings: dict):
@@ -209,6 +223,7 @@ def publish(post: dict, account: dict, settings: dict, on_submit: Callable[[], N
     platform, username, source, expected = _snapshot(post, account, settings)
     device = _device(settings)
     remote = None
+    hashes = {"source_hash": expected, "processed_hash": None}
     try:
         if not device.connect() or not device.is_connected():
             raise RuntimeError("The configured phone is not connected through ADB")
@@ -216,8 +231,8 @@ def publish(post: dict, account: dict, settings: dict, on_submit: Callable[[], N
         session.app_start(package, use_monkey=True)
         sleep(1)
         _own_profile(session, package, platform, username, sleep)
-        # Copy and rehash the bytes actually transferred, closing the race between
-        # approved-file validation and an Android upload.
+        # Validate a staged copy against the immutable approval anchor before prep.
+        # Record the processed bytes separately; every attempt starts from source.
         with tempfile.TemporaryDirectory(prefix="hub-phone-video-") as temporary:
             job_key = hashlib.sha256(str(post["id"]).encode()).hexdigest()[:16]
             filename = f"hub-{job_key}-{expected[:16]}{source.suffix.lower()}"
@@ -225,7 +240,10 @@ def publish(post: dict, account: dict, settings: dict, on_submit: Callable[[], N
             shutil.copyfile(source, staged)
             if _hash(staged) != expected:
                 raise ValueError("The approved video changed while preparing it")
-            remote = device.push_file(staged)
+            processed = _prepare_for_push(staged, Path(temporary))
+            hashes["processed_hash"] = _hash(processed)
+            filename = processed.name
+            remote = device.push_file(processed)
         sleep(1)
         uri = None
         for _ in range(4):
@@ -237,7 +255,7 @@ def publish(post: dict, account: dict, settings: dict, on_submit: Callable[[], N
         nodes = []
         if uri is not None:
             result = device._adb("shell", "am", "start", "-W", "-a", "android.intent.action.SEND",
-                                 "-t", "video/quicktime" if source.suffix.lower() == ".mov" else "video/mp4",
+                                 "-t", "video/quicktime" if processed.suffix.lower() == ".mov" else "video/mp4",
                                  "-p", package, "--eu", "android.intent.extra.STREAM", uri,
                                  "-f", "1")
             if result.returncode != 0 or re.search(r"\b(?:Error|Exception):", (result.stdout or "") + (result.stderr or "")):
@@ -253,7 +271,7 @@ def publish(post: dict, account: dict, settings: dict, on_submit: Callable[[], N
                   n.get("text", "") == str(post.get("caption") or "")]
         buttons = [n for n in nodes if _label(n) == ("Share" if platform == "instagram" else "Post")]
         if uri is None or len(fields) != 1 or len({n.get("bounds") for n in buttons}) != 1:
-            return {"ok": True, "status": "awaiting_manual_publish", "submitted": False,
+            return {**hashes, "ok": True, "status": "awaiting_manual_publish", "submitted": False,
                     "reason": reason, "remote_media": remote, "caption": str(post.get("caption") or ""),
                     "screenshot": _screenshot(device, post["id"], "prepared")}
         # Resolve and validate the final target before committing the submission
@@ -271,11 +289,11 @@ def publish(post: dict, account: dict, settings: dict, on_submit: Callable[[], N
         if remote is not None:
             # A prepared native draft must not be overwritten by the next job
             # just because its layout/input could not be verified automatically.
-            return {"ok": True, "status": "awaiting_manual_publish", "submitted": False,
+            return {**hashes, "ok": True, "status": "awaiting_manual_publish", "submitted": False,
                     "reason": str(error)[:400], "remote_media": remote,
                     "caption": str(post.get("caption") or ""),
                     "screenshot": _screenshot(device, post["id"], "prepared")}
-        return {"ok": False, "status": "failed", "submitted": False,
+        return {**hashes, "ok": False, "status": "failed", "submitted": False,
                 "error": str(error)[:400], "screenshot": _screenshot(device, post.get("id"), "blocked")}
 
     on_submit()
@@ -291,5 +309,5 @@ def publish(post: dict, account: dict, settings: dict, on_submit: Callable[[], N
         # A disconnected phone may already have accepted the click. Keep the
         # durable hold even when we cannot observe the result.
         reason = "The phone disconnected during Submit. Check the profile and confirm the resulting link before any new post."
-    return {"ok": True, "status": "needs_confirmation", "submitted": True, "needs_confirmation": True,
+    return {**hashes, "ok": True, "status": "needs_confirmation", "submitted": True, "needs_confirmation": True,
             "reason": reason, "screenshot": _screenshot(device, post["id"], "submitted")}
