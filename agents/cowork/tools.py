@@ -276,6 +276,8 @@ def _queue_next_phase(ctx: ToolContext):
         files to read first. Call at most once, near the end of your work."""
         ctx.budget.active()
         account = "owner" if ctx.space.is_owner else "friend"
+        if ctx.state.get("phone_lease"):
+            return "Phone sessions finish here. Report the observed results; do not queue another phase."
         if ctx.state.get("next"):
             return "The next phase is already queued."
         if not (ctx.space.dir / PLAN_FILE).is_file():
@@ -648,7 +650,29 @@ def build_tools(ctx: ToolContext) -> list:
         if phone_link.connected():
             ctx.phone = True
             phone_tools = phone_link.agent_tools(job, ctx.log, ctx.budget, current_request(job.get("task") or ""),
-                                                 ctx.client, ctx.gate)
+                                                 ctx.client, ctx.gate,
+                                                 stop=lambda reason: ctx.state.update(stop=reason))
+            # Claim the same phone lease as the scheduled publisher on first use,
+            # then retain it through all model turns until runner cleanup.
+            phone_mutex = asyncio.Lock()
+            def leased(tool):
+                original = tool.on_invoke_tool
+                async def invoke(context, arguments):
+                    async with phone_mutex:
+                        if "phone_lease" not in ctx.state:
+                            import social_automation
+                            lease = social_automation._phone_lock()
+                            if not lease.__enter__():
+                                lease.__exit__(None, None, None)
+                                reason = "The phone is busy with another task or scheduled publication. Try after it finishes."
+                                ctx.state["stop"] = reason
+                                return reason
+                            ctx.state["phone_lease"] = lease
+                            ctx.state.pop("next", None)
+                        return await original(context, arguments)
+                tool.on_invoke_tool = invoke
+                return tool
+            phone_tools = [leased(tool) for tool in phone_tools]
 
     helper_tools = workspace_tools + research_tools + helper_research + jev_tools
     if ctx.orchestrated:

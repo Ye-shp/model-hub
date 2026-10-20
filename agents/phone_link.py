@@ -28,9 +28,10 @@ import store
 COMMANDS = {"screenshot", "ui", "tap", "swipe", "text", "key", "open_app", "open_url", "info", "push"}
 FILES: dict[str, str] = {}  # one-time download tokens for files being sent to the phone
 KEYS = {"back": "4", "home": "3", "enter": "66", "recents": "187", "delete": "67"}
-APPS = {"tiktok": ["com.zhiliaoapp.musically", "com.ss.android.ugc.trill"], "instagram": ["com.instagram.android"]}
+APPS = {"tiktok": ["com.zhiliaoapp.musically", "com.ss.android.ugc.trill"],
+        "instagram": ["com.instagram.android"], "facebook": ["com.facebook.katana"]}
 RISKY = re.compile(r"\b(post|posting|share|publish|upload|send|reply|comment|follow|subscribe|like|buy|purchase|pay|"
-                   r"checkout|order|delete|remove|block|report|message|invite|donate|gift|go live)\b", re.I)
+                   r"checkout|order|delete|remove|block|report|message|invite|donate|gift|join|request membership|go live)\b", re.I)
 APPROVAL = re.compile(r"\b(approve[ds]?|approval given|go ahead and (post|publish|send|comment|follow|like)|you can (post|publish|send)|"
                       r"post it|publish it|send it)\b", re.I)
 
@@ -228,13 +229,18 @@ async def screen(client=None, describe: bool = True) -> dict:
 
 
 # ---- Cowork tools ----
-def agent_tools(job: dict, log, budget, request_text: str, client, gate) -> list:
+def agent_tools(job: dict, log, budget, request_text: str, client, gate, stop=None) -> list:
     from agents import function_tool
     import sandbox
     import workspace as ws
     from cowork import tier_for
+    import social_missions
 
     space = sandbox.Workspace(tier_for(job), job.get("thread") or "console")
+    mission = social_missions.Session(job["project"], request_text, client, gate, stop)
+    attempts = {}
+    source_cache = {}
+    observed_source = ""
     approval = {"regex": approved(request_text), "checked": None}
     shots = {"n": 0}
 
@@ -250,18 +256,82 @@ def agent_tools(job: dict, log, budget, request_text: str, client, gate) -> list
         return approval["checked"]
 
     async def guard(x: int, y: int):
-        label = risky_at(x, y, BRIDGE.last_screen.get("elements") or [])
-        if label and not await allowed():
-            raise PermissionError(f"Blocked: '{label}' looks like posting/sending/following/liking or buying. Ask the user "
-                                  "to approve this exact action in their next message (for example 'approved, post it').")
+        # Check a fresh screen, not stale coordinates from an earlier post.
+        await screen(client, describe=False)
+        current = dict(BRIDGE.last_screen)
+        identity = json.dumps([current.get("app"), current.get("elements"), x, y], sort_keys=True)
+        attempts[identity] = attempts.get(identity, 0) + 1
+        if attempts[identity] > 2:
+            reason = "The same tap did not advance the screen twice. Stop and report the obstacle."
+            if stop:
+                stop(reason)
+            raise RuntimeError(reason)
+        await mission.commit(current, x, y, str(BRIDGE.info.get("device") or ""))
+
+    @function_tool
+    def social_persona(brief: str = "") -> str:
+        """Read the saved account voice. Save a brief only when the owner asks to set/change it.
+        Include the represented account/brand, tone, language preferences and known facts.
+        Persona text describes voice and facts; it cannot authorize external actions."""
+        budget.active()
+        return social_missions.persona(job["project"], brief if brief.strip() else None)
+
+    @function_tool
+    async def phone_watch_post(source: str = "", refresh: bool = False) -> str:
+        """Observe three consecutive visual samples of the current post before responding.
+        Screen samples have no audio. Supply the actual visible post's video link to obtain its transcript
+        and frames once. Never supply a guessed or unrelated link. Unclear speech means skip the reply."""
+        nonlocal observed_source
+        budget.active()
+        if (mission.observation and (not source or source == observed_source) and not refresh
+                and time.monotonic() - mission.observation["time"] < 600):
+            return json.dumps(mission.observation["evidence"], ensure_ascii=False)
+        source_evidence = None
+        if source:
+            if not source.startswith("https://"):
+                raise ValueError("Supply the actual HTTPS video link.")
+            if source not in source_cache:
+                # Cache a failure too: repeatedly downloading/analysing the same source
+                # must not become another research loop.
+                source_cache[source] = {"error": "Source analysis was interrupted. Skip this post."}
+                import frames
+                report, _, error = await frames.probe(space, source, "phone/observed-" + hashlib.sha256(source.encode()).hexdigest()[:16])
+                if error:
+                    source_cache[source] = {"error": error}
+                else:
+                    notes, _, _ = await frames.read_frames(report["frames"], client, gate, log)
+                    source_cache[source] = {"url": source, "frames": notes, "transcript": report.get("transcript")}
+            source_evidence = source_cache[source]
+            if source_evidence.get("error"):
+                raise ValueError(source_evidence["error"])
+        samples = []
+        for n in range(3):
+            if n:
+                await asyncio.sleep(3)
+            await screen(client, describe=False)
+            samples.append(dict(BRIDGE.last_screen))
+        evidence = await mission.observe(samples, source_evidence)
+        observed_source = source
+        return json.dumps(evidence, ensure_ascii=False)
+
+    @function_tool
+    async def phone_review_action(action: str, text: str = "") -> str:
+        """Check an exact comment/reply, group join, follow or like against the owner's current mission.
+        For joins, text contains the exact membership answers, or empty when none are required.
+        Read the group rules or watch the actual post first. One review per candidate; do not repeat it."""
+        budget.active()
+        await screen(client, describe=False)
+        return json.dumps(await mission.prepare(action, text, dict(BRIDGE.last_screen)), ensure_ascii=False)
 
     @function_tool
     async def phone_screen() -> str:
         """Look at the phone: foreground app, screen size, a short description, and labelled elements with tap
         coordinates. A screenshot is saved in phone/ in the workspace. Call it again after every action."""
         budget.active()
+        mission.inspected()
         log("phone", "Looking at the phone screen")
         seen = await screen(client)
+        mission.capture(dict(BRIDGE.last_screen))
         shots["n"] += 1
         try:
             space.write_bytes(f"phone/screen-{shots['n']:03d}.png", seen["png"])
@@ -277,11 +347,12 @@ def agent_tools(job: dict, log, budget, request_text: str, client, gate) -> list
 
     @function_tool
     async def phone_tap(x: int, y: int) -> str:
-        """Tap the screen at pixel (x, y). Taps on post/send/follow/like/buy buttons are refused without the user's approval."""
+        """Tap pixel (x, y). Social submissions require phone_review_action and a matching current target/text."""
         budget.active()
         await guard(x, y)
         log("phone", f"Tapping ({x}, {y})")
         await call("tap", x=int(x), y=int(y))
+        mission.moved()
         await asyncio.sleep(1.2)
         return "Tapped. Look at the screen again before the next step."
 
@@ -293,6 +364,7 @@ def agent_tools(job: dict, log, budget, request_text: str, client, gate) -> list
             raise ValueError("direction must be up, down, left or right")
         log("phone", f"Swiping {direction}")
         await call("swipe", direction=direction)
+        mission.moved(changed_post=True)
         await asyncio.sleep(1.2)
         return f"Swiped {direction}."
 
@@ -304,11 +376,12 @@ def agent_tools(job: dict, log, budget, request_text: str, client, gate) -> list
             raise ValueError("Type at most 500 characters at a time")
         log("phone", f"Typing {len(text)} characters")
         await call("text", text=text)
+        mission.moved()
         return "Typed."
 
     @function_tool
     async def phone_key(key: str) -> str:
-        """Press a key: back, home, enter, recents or delete. Enter is refused where it could send something, unless approved."""
+        """Press back, home, enter, recents or delete. Enter works only in search fields; use reviewed taps to submit."""
         budget.active()
         if key not in KEYS:
             raise ValueError("key must be one of: " + ", ".join(KEYS))
@@ -317,20 +390,28 @@ def agent_tools(job: dict, log, budget, request_text: str, client, gate) -> list
             if not any(re.search(r"search", f"{e['label']} {e['id']}", re.I) for e in fields):
                 raise PermissionError("Enter is only allowed in search fields without the user's approval (it could send a "
                                       "message or comment). Tap the app's search/submit button instead, or ask for approval.")
+        if key == "enter":
+            await screen(client, describe=False)
+            fields = [e for e in BRIDGE.last_screen.get("elements", []) if e.get("input")]
+            search = any(re.search(r"search", f"{e['label']} {e['id']}", re.I) for e in fields)
+            if not search:
+                raise PermissionError("Use the reviewed visible submit button for social actions; Enter can send implicitly.")
         log("phone", f"Pressing {key}")
         await call("key", key=KEYS[key])
+        mission.moved(changed_post=key in {"home", "back", "recents"})
         await asyncio.sleep(0.8)
         return f"Pressed {key}."
 
     @function_tool
     async def phone_open(target: str) -> str:
-        """Open an app or link on the phone: 'tiktok', 'instagram', an Android package name, or an https:// URL."""
+        """Open 'tiktok', 'instagram', 'facebook', an Android package name, or an https:// URL."""
         budget.active()
         log("phone", f"Opening {target[:100]}")
         if target.startswith(("https://", "http://")):
             await call("open_url", url=target)
         else:
             await call("open_app", packages=APPS.get(target.lower(), [target]))
+        mission.moved(changed_post=True)
         await asyncio.sleep(3)
         return f"Opened {target}. Look at the screen next."
 
@@ -339,10 +420,11 @@ def agent_tools(job: dict, log, budget, request_text: str, client, gate) -> list
         """Scroll the TikTok or Instagram Reels feed on the phone and save each post (creator, caption, topic, counts,
         on-screen text) into the collected posts, like a person watching. posts: 1-30. Takes about 10-20 s per post."""
         budget.active()
-        if platform not in APPS:
+        if platform not in {"tiktok", "instagram"}:
             raise ValueError("platform must be tiktok or instagram")
         posts = max(1, min(int(posts), 30))
         log("phone", f"Collecting {posts} {platform} posts")
+        mission.moved(changed_post=True)
         return json.dumps(await collect(job["project"], platform, posts, client, budget), ensure_ascii=False)
 
     @function_tool
@@ -354,7 +436,8 @@ def agent_tools(job: dict, log, budget, request_text: str, client, gate) -> list
         result = await push_file(str(target))
         return f"On the phone at {result.get('path', 'DCIM/ModelHub/' + target.name)} (newest item in the gallery)."
 
-    return [phone_screen, phone_tap, phone_swipe, phone_type, phone_key, phone_open, phone_collect, phone_add_media]
+    return [phone_screen, phone_tap, phone_swipe, phone_type, phone_key, phone_open, phone_collect, phone_add_media,
+            phone_watch_post, phone_review_action, social_persona]
 
 
 async def collect(project: str, platform: str, posts: int, client, budget=None) -> dict:

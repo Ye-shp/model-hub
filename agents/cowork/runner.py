@@ -303,7 +303,8 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
                 log_usage(job["id"], result)
                 answer = str(result.final_output)
                 # Jev checks the reply against the request; one fix round when it falls short (Cowork only).
-                if job.get("skill") == "cowork" and not state.get("next") and not state.get("out_of_steps"):
+                if (job.get("skill") == "cowork" and not state.get("next") and not state.get("out_of_steps")
+                        and not state.get("phone_lease") and not state.get("stop")):
                     from . import judge
                     gap = await judge.reply_gap(job, answer, shared_files(job["id"]))
                     if gap:
@@ -322,7 +323,7 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
                 ws.event(job["id"], "partial", reason)
                 ws.event(job["id"], "tool", "Writing up what was done")
                 report = await wrap_up(client, gate, profile, job, session, reason)
-                if await continue_after(job, reason, report):
+                if not state.get("phone_lease") and await continue_after(job, reason, report):
                     header = f"⏱ **Reached the {minutes}-minute limit for one task; the next part has started automatically.**"
                 else:
                     header = (f"⏱ **Stopped at the {minutes}-minute time limit.** Reply **continue** to keep going: the "
@@ -335,9 +336,15 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
         if state.get("out_of_steps") and not state.get("next"):
             reason = f"it used all {turns} steps"
             ws.event(job["id"], "partial", reason)
-            if await continue_after(job, reason, answer):
+            if not state.get("phone_lease") and not state.get("stop") and await continue_after(job, reason, answer):
                 answer = "🔁 **Used all steps for one task; the next part has started automatically.**\n\n" + answer
             return answer
+        if state.get("phone_lease"):
+            # A fresh job would lose the current phone evidence and reset action limits.
+            # End this session rather than starting another review or automated phase.
+            state.pop("next", None)
+        if state.get("stop"):
+            answer += "\n\nStopped: " + state["stop"]
         if state.get("next"):
             nxt = ws.create_job(job["project"], "AUTOMATIC NEXT PHASE (queued by the previous task in this chat; the "
                                 f"project plan is in {PLAN_FILE}).\n\nCURRENT REQUEST:\n" + state["next"], "cowork",
@@ -346,6 +353,8 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
             ws.event(job["id"], "next-phase", nxt)
         return answer
     finally:
+        if state.get("phone_lease"):
+            state["phone_lease"].__exit__(None, None, None)
         note = orchestrator.cost_note(state)
         if note:
             ws.event(job["id"], "tool", note)

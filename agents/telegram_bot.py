@@ -41,7 +41,8 @@ HELP = ("Send me a TikTok, Reel, X post or thread, Reddit thread or YouTube link
         "Cowork request. If a task needs something from you, it asks here and waits for your reply.\n\n/frame <video link> "
         "[name] (or a video with /frame as its caption) builds a character sheet from the video frame by frame: look, "
         "outfits, setting, light, camera, palette and a prompt kit, saved for later. /new starts a fresh conversation, "
-        "/status shows what's running.")
+        "/status shows what's running. /copy adapts a reference video with your saved characters and backgrounds; "
+        "/copy help explains setup. /persona <brief> saves your social account's voice.")
 
 _watchers: dict[str, asyncio.Task] = {}
 
@@ -303,10 +304,25 @@ async def handle(message: dict) -> None:
     if command == "/new":
         threads = state.get("threads", {})
         threads[str(chat)] = threads.get(str(chat), 1) + 1
-        update(threads=threads)
+        waiting = state.get("copy_waiting", {})
+        waiting.pop(str(chat), None)
+        update(threads=threads, copy_waiting=waiting)
         await send(token, chat, "Started a fresh conversation. The knowledge base carries over.")
         return
     thread = thread_for(state, chat)
+    if command == "/persona":
+        import social_missions
+        brief = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else None
+        try:
+            saved = social_missions.persona(PROJECT, brief)
+        except ValueError as error:
+            saved = str(error)
+        await send(token, chat, saved)
+        return
+    if command == "/copy":
+        import video_copy
+        await video_copy.command(token, chat, message, text, thread)
+        return
     if command == "/status":
         rows = ws.query("SELECT id,status,task FROM jobs WHERE project=? AND thread=? AND status IN ('queued','running') "
                         "ORDER BY created_at", (PROJECT, thread))
@@ -324,6 +340,12 @@ async def handle(message: dict) -> None:
         # The running task asked a question (ask_user): this message is the answer, not a new task.
         asking.answer(waiting[0]["id"], text)
         await send(token, chat, "Got it, the task continues.", {"remove_keyboard": True})
+        return
+
+    awaiting_copy = state.get("copy_waiting", {}).get(str(chat))
+    if not command and awaiting_copy and awaiting_copy.get("thread") == thread:
+        import video_copy
+        await video_copy.command(token, chat, message, "/copy", thread)
         return
 
     found = message_links(message)
