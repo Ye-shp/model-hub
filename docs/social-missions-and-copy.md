@@ -1,8 +1,19 @@
-# Social missions and Telegram /copy
+# Direct phone control and Telegram /copy
 
 These features require the updated controller. Interactive phone work still requires the Phone
 bridge to show connected; a Tailscale/ADB connection alone does not register the interactive tools.
 Use a saved owner Cowork chat. The agent has Facebook, Instagram and TikTok app shortcuts.
+It can also open other installed apps by Android package name. It observes the screen,
+taps, long-presses, swipes, types, reads copied text, switches apps and transfers local
+media to the gallery. It can publish through the app's own composer when your task
+authorizes that post. These direct controls do not require scheduling or a numbered draft.
+
+After updating the controller, download the new bridge.py from the console's Phone page
+and restart that bridge process. On the computer running it, install Unicode/clipboard
+support once with `python -m pip install uiautomator2==3.7.0`. Bridge 1.2 supports Turkish
+characters/emoji through a verified clipboard paste, plus reading a copied post link.
+It needs an authorized ADB connection, over USB or your existing private-network connection;
+use `--serial <the exact serial shown by adb devices>` to select your phone.
 
 ## Set the account voice
 
@@ -17,7 +28,7 @@ Do not invent personal experiences or affiliations.
 In Cowork, ask it to save those details with `social_persona`. The brief persists per project,
 across chats and controller restarts. A persona defines voice and facts, not authorization.
 
-## Give a bounded mission
+## Give it a phone task
 
 For example:
 
@@ -29,12 +40,14 @@ For example:
 
 The agent can choose targets within an explicitly delegated mission. It samples the actual
 post before replying; if understanding depends on speech, it needs the actual video link
-to extract frames/transcript, otherwise it skips the reply. It reviews the exact response
+to extract frames/transcript, otherwise it skips the reply. It can obtain the actual link
+itself using the app's Share/Copy link control and phone_clipboard. It reviews the exact response
 against the mission, persona, observed post and current screen. Group joins require visible
 group identity/rules and truthful membership answers. Missing owner facts need an answer.
 
-The current session permits at most five externally visible reviewed actions. Reading and
-navigation are separate. The same action is recorded before submission and cannot be
+The agent works through the task within its existing time/model-step budget; there is no
+fixed five-action cutoff. Reviews are internal checks, not owner prompts for every tap.
+The same action is recorded before submission and cannot be
 blindly retried. An uncertain result must be checked on the phone. Three screen reads without
 an intervening action are allowed; a fourth stops the task. A third identical tap on an
 unchanged screen also stops it. Phone actions run serially under the same phone lease as the
@@ -43,7 +56,9 @@ Once a task takes the phone, Cowork does not start a second quality-review run o
 automatic continuation task; it returns its observed results. A new owner request starts
 a new session.
 
-This is interactive group/reply support. Facebook scheduled video publishing remains unsupported.
+Facebook uses the same direct screen controls, including its post composer. This change
+does not add a Facebook driver to the separate scheduled-publishing system. Real app screens
+and the signed-in account still need live acceptance testing.
 The system does not guarantee regional reach, a particular recommendation feed, or human
 indistinguishability. Relevant browsing can influence recommendations; no fake biography or
 fabricated expertise is part of the persona.

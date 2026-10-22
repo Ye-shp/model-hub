@@ -94,14 +94,41 @@ class SocialMissionsTests(unittest.TestCase):
         result = asyncio.run(self.session.prepare("join", "", self.screen))
         self.assertFalse(result["allowed"])
 
-    def test_five_external_actions_end_session(self):
+    def test_task_can_continue_past_five_actions_without_losing_duplicate_fence(self):
         self.session.actions = 5
         self.session.review = {"action": "join", "text": "", "target": "Group",
                                "screen": self.screen, "time": time.monotonic()}
         self.session.decide = AsyncMock(return_value={"navigation_only": False, "matches_review": True})
-        with self.assertRaisesRegex(PermissionError, "five-action"):
-            asyncio.run(self.session.commit(self.screen, 20, 30, "phone"))
-        self.assertTrue(self.stopped)
+        self.assertTrue(asyncio.run(self.session.commit(self.screen, 20, 30, "phone")))
+        self.assertEqual(self.session.actions, 6)
+        self.assertFalse(self.stopped)
+        with self.assertRaisesRegex(PermissionError, "already attempted"):
+            sm.reserve_action("default", "phone", "Group", "join", "")
+
+    def test_direct_post_requires_details_and_reviews_the_requested_media(self):
+        self.session.request = "Publish my pottery clip to my Facebook page with caption New bowl."
+        with self.assertRaisesRegex(ValueError, "exact operation"):
+            asyncio.run(self.session.prepare("post", "New bowl", self.screen))
+        self.session.decide = AsyncMock(return_value={"allowed": True, "target": "my page / pottery clip / New bowl"})
+        result = asyncio.run(self.session.prepare("post", "New bowl", self.screen,
+                                                "Selected pottery clip, my page, public audience"))
+        self.assertTrue(result["allowed"])
+        self.assertIn("pottery clip", self.session.review["details"])
+        prompt = self.session.decide.call_args.args[0]
+        self.assertIn("selected media", prompt)
+        self.assertIn("Publish my pottery clip", prompt)
+
+    def test_message_and_device_operation_require_a_scoped_review(self):
+        for action in ("message", "device"):
+            self.session.decide = AsyncMock(return_value={"allowed": False, "reason": "Outside the requested task"})
+            result = asyncio.run(self.session.prepare(action, "", self.screen, "Unrelated operation"))
+            self.assertFalse(result["allowed"])
+            self.assertIsNone(self.session.review)
+
+    def test_long_press_is_reviewed_as_a_distinct_gesture(self):
+        self.session.decide = AsyncMock(return_value={"navigation_only": True})
+        self.assertFalse(asyncio.run(self.session.commit(self.screen, 20, 30, "phone", "long_press")))
+        self.assertIn('"gesture": "long_press"', self.session.decide.call_args.args[0])
 
 
 if __name__ == "__main__":

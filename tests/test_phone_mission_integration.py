@@ -62,6 +62,24 @@ class PhoneMissionIntegrationTests(unittest.TestCase):
             asyncio.run(scenario())
         probe.assert_awaited_once()
 
+    def test_old_bridge_gets_upgrade_message_without_sending_an_unknown_command(self):
+        with patch.object(phone_link.BRIDGE, "info", {"version": "1.1"}), \
+             patch.object(phone_link, "call", new_callable=AsyncMock) as call:
+            tools = self.tools()
+            clipboard = asyncio.run(self.invoke(tools["phone_clipboard"]))
+            long_press = asyncio.run(self.invoke(tools["phone_long_press"], x=10, y=20))
+        self.assertIn("updated bridge.py", str(clipboard))
+        self.assertIn("updated bridge.py", str(long_press))
+        call.assert_not_awaited()
+
+    def test_copied_link_flows_back_from_the_bridge(self):
+        link = "https://www.tiktok.com/@potter/video/123"
+        with patch.object(phone_link.BRIDGE, "info", {"capabilities": ["clipboard"]}), \
+             patch.object(phone_link, "call", new_callable=AsyncMock, return_value={"text": link}) as call:
+            result = asyncio.run(self.invoke(self.tools()["phone_clipboard"]))
+        self.assertEqual(json.loads(result)["clipboard_text"], link)
+        call.assert_awaited_once_with("clipboard")
+
     def test_phone_session_finishes_without_quality_loop_or_next_phase_and_releases_lock(self):
         from cowork import runner
         ws.create_job("default", "Browse Turkish ceramics", "cowork", "fast", thread="chat")

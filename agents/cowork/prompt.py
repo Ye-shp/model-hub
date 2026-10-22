@@ -123,7 +123,8 @@ def instructions(job: dict, space: sandbox.Workspace, helper: bool = False, esca
                      "plus tappable elements with coordinates), then phone_tap/phone_swipe/phone_type/phone_key/phone_open act "
                      "on it, and phone_collect gathers TikTok/Instagram posts into the collected posts. Look at the screen "
                      "again after each action. Use phone_review_action for social interaction within the current "
-                     "mission. Use the numbered-draft workflow for publishing videos. Ask before actions outside "
+                     "mission. For direct phone publishing, review the selected media, account, audience and caption "
+                     "with phone_review_action(action='post', details=...). No scheduler is required. Ask before actions outside "
                      "the mission; account settings and purchases are not part of feed-personalization missions.")
     if escalation:
         names = {"claude": "ask_claude (Claude Code: the strongest at complex coding, debugging, multi-file engineering, "
