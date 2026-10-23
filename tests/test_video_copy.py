@@ -39,7 +39,7 @@ class Space:
         return str(Path(path).relative_to(self.dir))
 
 
-class VideoCopyTests(unittest.TestCase):
+class Base(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.space = Space(Path(self.temp.name) / "chat")
@@ -63,6 +63,8 @@ class VideoCopyTests(unittest.TestCase):
         vc.save_reference("default", "character", "Our fictional presenter in a blue jacket")
         vc.save_reference("default", "background", "Our bright ceramics studio")
 
+
+class VideoCopyTests(Base):
     def test_bare_copy_waits_and_next_video_routes_without_generic_study(self):
         self.configure()
         self.handle("/copy")
@@ -178,12 +180,16 @@ class VideoCopyTests(unittest.TestCase):
              patch("hub.model", return_value="qwen"), \
              patch("frames.probe", new_callable=AsyncMock, return_value=({"frames": []}, "", None)) as probe, \
              patch("frames.read_frames", new_callable=AsyncMock, return_value=([], 0, set())), \
+             patch.object(vc, "review_output", new_callable=AsyncMock,
+                          return_value=('{"verdict": "deliver"}', "glm")) as review, \
              patch("agents.Runner.run", new_callable=AsyncMock, side_effect=production) as run:
             answer = asyncio.run(vc.run_job(job))
             self.assertIn("frames were inspected once", answer)
             again = asyncio.run(vc.run_job(job))
             self.assertIn("duplicate paid", again)
         self.assertEqual(run.await_count, 1)
+        self.assertEqual(review.await_count, 1)  # the output is checked once, against the storyboard
+        self.assertEqual(review.await_args.args[0], "Shot plan")
         self.assertEqual(probe.await_count, 1)
         self.assertEqual(create_client.call_count, 1)
         client.close.assert_awaited_once()
@@ -201,6 +207,128 @@ class VideoCopyTests(unittest.TestCase):
         self.assertIn("reconnect", answer)
         self.assertFalse(self.space.resolve(root + "/generation-started.json").exists())
         run.assert_not_awaited()
+
+
+
+class RecreateTests(Base):
+    """/recreate: multi-image references, albums, written sheets and the GLM-written plan."""
+
+    def png(self, colour="red"):
+        from PIL import Image
+        import io
+        out = io.BytesIO()
+        Image.new("RGB", (32, 32), colour).save(out, "PNG")
+        return out.getvalue()
+
+    def photo(self, text, file_id="p1", **extra):
+        return asyncio.run(tg.handle({**self.message, "caption": text,
+                                      "photo": [{"file_id": file_id, "file_size": 100}], **extra}))
+
+    def test_recreate_routes_like_copy_and_copy_still_works(self):
+        self.configure()
+        with patch("higgsfield.status", return_value={"connected": True}), patch("glm.available", return_value=None):
+            self.handle("/recreate https://www.tiktok.com/@ceramics/video/123")
+            self.handle("/copy https://www.instagram.com/reel/Example/")
+        rows = ws.query("SELECT skill,task,allow_frontier FROM jobs ORDER BY created_at")
+        self.assertEqual([r["skill"] for r in rows], ["video-copy", "video-copy"])
+        self.assertTrue(all(r["allow_frontier"] for r in rows))
+        self.assertIn("GLM", tg.send.call_args.args[2])
+
+    def test_album_photos_build_one_character_set(self):
+        with patch.object(tg, "download", new_callable=AsyncMock, side_effect=lambda token, fid: self.png()):
+            self.photo("/recreate character Mila, our host", "a", media_group_id="g1")
+            # The album's other photos arrive without a caption.
+            asyncio.run(tg.handle({**self.message, "message_id": 2, "media_group_id": "g1",
+                                   "photo": [{"file_id": "b", "file_size": 100}]}))
+            asyncio.run(tg.handle({**self.message, "message_id": 3, "media_group_id": "g1",
+                                   "photo": [{"file_id": "c", "file_size": 100}]}))
+            value = vc.settings("default")["character"]
+            self.assertEqual(len(value["images"]), 3)
+            self.assertEqual(value["description"], "Mila, our host")
+            # add keeps the set; a new captioned photo starts a new one.
+            self.photo("/recreate character add", "d")
+            self.assertEqual(len(vc.settings("default")["character"]["images"]), 4)
+            self.photo("/recreate character Mila, new look", "e")
+            self.assertEqual(len(vc.settings("default")["character"]["images"]), 1)
+        self.assertEqual(ws.query("SELECT * FROM jobs"), [])  # album photos never became Cowork tasks
+
+    def test_uncaptioned_album_photos_from_other_albums_stay_normal_messages(self):
+        with patch.object(tg, "download", new_callable=AsyncMock, return_value=self.png()):
+            self.assertFalse(asyncio.run(vc.album_item("t", 42, {**self.message, "media_group_id": "other",
+                                                                 "photo": [{"file_id": "x", "file_size": 1}]})))
+
+    def test_image_limit_and_bad_images(self):
+        for _ in range(vc.MAX_IMAGES):
+            vc.save_reference("default", "background", "Studio", self.png(), add=True)
+        with self.assertRaisesRegex(ValueError, "already has"):
+            vc.save_reference("default", "background", "", self.png(), add=True)
+        with self.assertRaisesRegex(ValueError, "isn't an image"):
+            vc.save_reference("default", "character", "Mila", b"not an image")
+
+    def test_first_release_settings_are_read_as_a_list(self):
+        root = vc.folder("default")
+        root.mkdir(parents=True)
+        (root / "character-old.jpg").write_bytes(self.png())
+        (root / "settings.json").write_text(json.dumps({"character": {"description": "Old", "image": "character-old.jpg"},
+                                                        "background": {"description": "Studio"}}))
+        self.assertEqual(vc.settings("default")["character"]["images"], ["character-old.jpg"])
+        config = vc.snapshot("default", self.space)
+        self.assertEqual(len(config["character"]["images"]), 1)
+        self.assertTrue(self.space.resolve(config["character"]["images"][0]).is_file())
+
+    def test_uploaded_sheet_and_frame_sheet(self):
+        with patch.object(tg, "download", new_callable=AsyncMock, return_value=b"# Mila\nRed bob, green coat"):
+            asyncio.run(tg.handle({**self.message, "caption": "/recreate character sheet",
+                                   "document": {"file_id": "s", "file_size": 30, "file_name": "mila.md"}}))
+        value = vc.settings("default")["character"]
+        self.assertEqual(value["sheet_label"], "uploaded mila.md")
+        # A /frame sheet from any of the owner's chats, newest first.
+        import sandbox
+        root = Path(self.temp.name) / "cowork"
+        sheet = root / "owner" / "threads" / "tg-42-1" / "character-sheets" / "studio-20261020-101010" / "sheet.md"
+        sheet.parent.mkdir(parents=True)
+        sheet.write_text("# Studio\nWhite brick, wheel")
+        with patch.object(sandbox, "ROOT", root):
+            self.handle("/recreate background sheet Studio")
+            with self.assertRaisesRegex(ValueError, "No /frame sheet"):
+                vc.frame_sheet("nobody")
+        self.assertIn("studio-20261020", vc.settings("default")["background"]["sheet_label"])
+        config = vc.snapshot("default", self.space)
+        self.assertIn("Red bob", self.space.read_text(config["character"]["sheet"]))
+        self.assertIn("White brick", self.space.read_text(config["background"]["sheet"]))
+
+    def test_snapshot_needs_both_kinds_and_clear_removes_one(self):
+        vc.save_reference("default", "character", "Mila")
+        with self.assertRaisesRegex(ValueError, "background"):
+            vc.snapshot("default", self.space)
+        vc.save_reference("default", "background", "Studio")
+        vc.snapshot("default", self.space)
+        self.handle("/recreate clear character")
+        self.assertNotIn("character", vc.settings("default"))
+
+    def test_storyboard_uses_the_sheet_and_the_reference_images(self):
+        vc.save_reference("default", "character", "Mila", self.png())
+        vc.save_sheet("default", "character", "# Mila\nRed bob, green coat", "uploaded mila.md")
+        vc.save_reference("default", "background", "Studio")
+        config = vc.snapshot("default", self.space)
+        asks = []
+
+        async def ask(messages, vision, client, gate, tokens):
+            asks.append((messages, vision))
+            return ("Reference notes" if vision else "Storyboard"), 0.01, "glm-model"
+        with patch("frames.probe", new_callable=AsyncMock, return_value=({"frames": []}, "", None)), \
+             patch("frames.read_frames", new_callable=AsyncMock, return_value=([], 0.0, set())), \
+             patch("frames._ask", side_effect=ask), patch.object(ws, "write_artifact"):
+            root, brief = asyncio.run(vc.analyze("source.mp4", config, self.space, {"id": "j1", "project": "default"},
+                                                 None, None, lambda *a: None))
+        self.assertEqual(brief, "Storyboard")
+        vision = [m for m, v in asks if v]
+        self.assertEqual(len(vision), 1)  # one read of the character images; the background has none
+        self.assertEqual(sum(1 for part in vision[0][0]["content"] if part["type"] == "image_url"), 1)
+        writer = [m for m, v in asks if not v][0][0]["content"]
+        self.assertIn("Red bob, green coat", writer)
+        self.assertIn("Reference notes", writer)
+        self.assertIn("Continuity", writer)
 
 
 if __name__ == "__main__":

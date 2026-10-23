@@ -58,7 +58,9 @@ The old box streams everything to the new one: databases are copied consistently
 | `TUNNEL_PROTOCOL` | `http2` | cloudflared transport. QUIC kept timing out on the V100 host |
 | `COWORK_MIN_FREE_GB` | `4` | refuse new work below this much free disk (deleting still works) |
 | `COWORK_FRIEND_QUOTA_GB` | `5` | each invited friend's folder allowance |
-| `COWORK_MAX_PHASES` / `COWORK_FRIEND_MAX_PHASES` | `6` / `2` | automatic project phases in a row |
+| `COWORK_MAX_PHASES` / `COWORK_FRIEND_MAX_PHASES` | `0` / `2` | automatic project phases in a row (`0` = no limit) |
+| `COWORK_AUTO_CONTINUE` | `0` | automatic continuations after a time/step limit (`0` = no limit) |
+| `COWORK_NO_PROGRESS_RUNS` | `2` | automatic runs in a row that change nothing in the chat's folder before the chain stops and waits for you |
 | `COWORK_CONTEXT_SOFT_CHARS` / `_HARD_CHARS` | `120000` / `260000` | when old tool output starts being shortened |
 | `COWORK_LEAD_MODEL` / `COWORK_HELPER_MODEL` | `auto` | pin the lead or helpers to `qwen-1`/`qwen-2` instead of balancing |
 | `COWORK_MAX_PARALLEL_HELPERS` | `4` | helpers one `delegate_many` call may start |

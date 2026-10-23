@@ -28,10 +28,15 @@ ORCHESTRATOR_SOFT_CHARS = int(os.environ.get("COWORK_ORCHESTRATOR_SOFT_CHARS", "
 ORCHESTRATOR_HARD_CHARS = int(os.environ.get("COWORK_ORCHESTRATOR_HARD_CHARS", "120000"))
 # Helper reports the GLM lead reads are cut to this many characters (details stay in the files helpers write).
 ORCHESTRATOR_REPORT_CHARS = int(os.environ.get("COWORK_ORCHESTRATOR_REPORT_CHARS", "5000"))
-MAX_CHAIN = {"owner": int(os.environ.get("COWORK_MAX_PHASES", "6")), "friend": int(os.environ.get("COWORK_FRIEND_MAX_PHASES", "2"))}
+# Automatic project phases in a row. 0 = no limit (the owner's default): a project keeps going phase after phase
+# until it is finished or stops making progress (NO_PROGRESS_RUNS below).
+MAX_CHAIN = {"owner": int(os.environ.get("COWORK_MAX_PHASES", "0")), "friend": int(os.environ.get("COWORK_FRIEND_MAX_PHASES", "2"))}
 # When a task hits its time or step limit, the next part starts by itself in the same chat (no "continue" needed),
-# up to this many times in a row.
-AUTO_CONTINUE = int(os.environ.get("COWORK_AUTO_CONTINUE", "4"))
+# up to this many times in a row. 0 = no limit (the default).
+AUTO_CONTINUE = int(os.environ.get("COWORK_AUTO_CONTINUE", "0"))
+# The safety net once the counts are unlimited: automatic continuations and phases stop after this many runs in a
+# row that changed nothing (no file in the chat's folder added or changed, nothing shared).
+NO_PROGRESS_RUNS = max(1, int(os.environ.get("COWORK_NO_PROGRESS_RUNS", "2")))
 PLAN_FILE = "plan.md"
 PLAN_LIMIT = 10_000
 

@@ -1,4 +1,4 @@
-# Direct phone control and Telegram /copy
+# Direct phone control and Telegram /recreate
 
 These features require the updated controller. Interactive phone work still requires the Phone
 bridge to show connected; a Tailscale/ADB connection alone does not register the interactive tools.
@@ -63,51 +63,61 @@ The system does not guarantee regional reach, a particular recommendation feed, 
 indistinguishability. Relevant browsing can influence recommendations; no fake biography or
 fabricated expertise is part of the persona.
 
-## Set up /copy
+## Set up /recreate
 
-Connect Higgsfield in the owner's web Cowork chat with `/connect higgsfield`.
-Then send the Telegram bot:
+`/recreate` recreates a reference video in Higgsfield with your own character and background. `/copy` is the same
+command under its old name.
 
-1. A reference character image with caption `/copy character <your character/cast description>`.
-2. A background image with caption `/copy background <your setting description>`.
-3. `/copy settings` to inspect the saved choices.
+Connect Higgsfield in the owner's web Cowork chat with `/connect higgsfield`. Then save your references in Telegram:
 
-Text-only descriptions also work. A new character/background setting replaces that setting
-for future requests. Each request snapshots its configuration and copies uploaded source
-bytes to a unique path so later uploads cannot alter an in-flight job.
+- **Character images.** Send one photo or an album (turnaround sheet, angles, close-ups) with the caption
+  `/recreate character <description>`. The other photos of the album join the same set as they arrive. A new
+  captioned photo starts a new set; `/recreate character add` adds photos to the current one (up to 8).
+  Photos sent as files work too.
+- **Written character sheet.** `/recreate character sheet <name>` uses the newest sheet made with `/frame <video> <name>`
+  in any of your chats. Or send a `.md`/`.txt` file captioned `/recreate character sheet`.
+- **Background.** The same commands with `background`.
+- `/recreate settings` shows what's saved; `/recreate clear character` (or `background`) removes one.
 
-Use any of:
+Each kind needs at least a description, a sheet or an image. Each request snapshots the references into the chat
+folder, so later changes can't alter a job in progress.
 
-- `/copy https://www.instagram.com/reel/...`
-- `/copy https://www.tiktok.com/@.../video/...`
-- Upload a video with caption `/copy`.
-- Reply `/copy` to a video.
-- Send `/copy`, then send the link/video in the next message. `/copy cancel` cancels waiting.
+Send the video any of these ways:
 
-Telegram bot downloads are limited to 20 MB; send a source link for larger videos. Reference
-photos are decoded and normalized. Commands work only in the paired owner's private chat.
-Output attachments must fit the bot's 49 MB delivery cap; larger results need a smaller
-delivery copy or their actual provider URL.
+- `/recreate https://www.instagram.com/reel/...`
+- `/recreate https://www.tiktok.com/@.../video/...`
+- Upload a video with caption `/recreate`.
+- Reply `/recreate` to a video.
+- Send `/recreate`, then the link or video in the next message. `/recreate cancel` cancels waiting.
 
-One request runs a fixed source-analysis stage and saves a storyboard, then uses the connected
-Higgsfield tools to produce an original adaptation. It carries over useful pacing and camera
-structure, with new dialogue/staging and the owner's characters/backgrounds. It does not copy
-the source person's identity, voice, music, branding or exact dialogue.
+Telegram bot downloads are limited to 20 MB; send a source link for larger videos. Output attachments must fit the
+bot's 49 MB delivery cap; larger results need a smaller delivery copy or their actual provider URL.
 
-Generation uses the provider's current discovered schemas and may consume Higgsfield credits.
-Provider-issued upload/download URLs can transfer saved reference images and generated clips.
-There are at most 24 production-agent turns and one output-inspection pass, with no helpers,
-automatic continuation or source re-analysis tools. Identical provider submissions are journaled
-before sending and not retried. Status polling is bounded. A controller restart after generation
-begins leaves receipts for reconciliation instead of risking duplicate paid work.
+### Who does what
 
-The bot returns the real generated file or provider URL, or the specific blocker with the saved
-storyboard. It never automatically publishes the adaptation. Provider model capabilities,
-source-download access and image/voice consistency still need live validation on your account.
+1. GLM's vision model reads the source frames and your reference images once.
+2. The large GLM model writes the storyboard: a Continuity block (your fixed character and setting, pasted into every
+   prompt), then per shot the duration, framing, action, new dialogue, which of your reference images to condition on,
+   and the full Higgsfield prompt.
+3. A Qwen agent runs Higgsfield with the provider's current discovered schemas: at most 24 turns, no helpers,
+   continuation or re-analysis.
+4. GLM checks the generated video once against the storyboard and your references and says deliver or fix; the agent
+   makes at most that one fix.
+
+Without GLM connected (or over its monthly budget), Qwen does steps 1, 2 and 4.
+
+The recreation keeps the source's pacing and camera structure, with new dialogue and staging. It does not copy the
+source person's identity, voice, music, branding or exact dialogue. Generation may consume Higgsfield credits.
+Identical provider submissions are journaled before sending and not retried; status polling is bounded. A controller
+restart after generation begins leaves receipts for reconciliation instead of risking duplicate paid work.
+
+The bot returns the real generated file or provider URL, or the specific blocker with the saved storyboard. It never
+publishes. Character consistency across shots depends on the provider's reference features and still needs live
+validation on your account.
 
 ## Validation scope
 
 Offline tests cover persona persistence, rejection without content/audio evidence, unrelated
 reply rejection, current-target checks, duplicate fences, session limits, Telegram pairing,
-command routing, source retention, one-time source analysis and provider request journaling.
+command routing, source retention, one-time source analysis, provider request journaling, album and sheet handling, and the single output review.
 They mock model/provider/phone behavior and cannot prove semantic accuracy on real videos.

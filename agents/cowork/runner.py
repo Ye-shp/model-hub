@@ -17,7 +17,7 @@ from crew import CallBudget
 
 from .config import AUTO_CONTINUE, PLAN_FILE, PROFILES
 from .context import RUN_CONFIG, describe, replayable, trim_items
-from .continuity import current_request, read_plan, recap
+from .continuity import current_request, read_plan, recap, stuck
 from .effort import AdaptiveModel
 from .gpu import assign_gpus, release_gpus
 from . import orchestrator
@@ -155,15 +155,19 @@ def auto_continues(job: dict) -> int:
     return count
 
 
-def queue_continuation(job: dict, reason: str) -> str | None:
+def queue_continuation(job: dict, reason: str, space: sandbox.Workspace) -> str | None:
     """After a time or step limit, start the next part in the same chat by itself (the owner's Cowork tasks only).
-    The new task gets a recap of this one (continuity.recap) and the same request."""
+    The new task gets a recap of this one (continuity.recap) and the same request. With AUTO_CONTINUE at 0 there is no
+    fixed count: the chain goes on until the work is finished or stops making progress (continuity.stuck)."""
     if job.get("skill") != "cowork" or tier_for(job) != "owner":
         return None
     done = auto_continues(job)
-    if done >= AUTO_CONTINUE:
+    if AUTO_CONTINUE and done >= AUTO_CONTINUE:
         return None
-    nxt = ws.create_job(job["project"], f"AUTOMATIC CONTINUATION {done + 1} of up to {AUTO_CONTINUE} (the previous task in "
+    if stuck(job, space):
+        return None
+    count = f"{done + 1} of up to {AUTO_CONTINUE}" if AUTO_CONTINUE else str(done + 1)
+    nxt = ws.create_job(job["project"], f"AUTOMATIC CONTINUATION {count} (the previous task in "
                         f"this chat stopped because {reason}; carry on from where it stopped).\n\nCURRENT REQUEST:\n"
                         + current_request(job.get("task") or ""), "cowork", job["profile"], bool(job["allow_frontier"]),
                         bool(job["allow_images"]), thread=job.get("thread"), requested_by=job.get("requested_by"),
@@ -234,14 +238,14 @@ def shared_files(job_id: str) -> list[str]:
     return [r["name"] for r in ws.query("SELECT name FROM artifacts WHERE job_id=? ORDER BY created_at,rowid", (job_id,))]
 
 
-async def continue_after(job: dict, reason: str, report: str) -> bool:
+async def continue_after(job: dict, reason: str, report: str, space: sandbox.Workspace) -> bool:
     """Queue the next part after a limit, unless Jev reads the report as finished (or blocked on the user)."""
     from . import judge
     done = await judge.finished(job, report)
     if done is not None and done >= 0.8:
         ws.event(job["id"], "tool", "The work looks finished; not continuing automatically")
         return False
-    return bool(queue_continuation(job, reason))
+    return bool(queue_continuation(job, reason, space))
 
 
 def log_usage(job_id: str, result) -> None:
@@ -323,7 +327,7 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
                 ws.event(job["id"], "partial", reason)
                 ws.event(job["id"], "tool", "Writing up what was done")
                 report = await wrap_up(client, gate, profile, job, session, reason)
-                if not state.get("phone_lease") and await continue_after(job, reason, report):
+                if not state.get("phone_lease") and await continue_after(job, reason, report, space):
                     header = f"⏱ **Reached the {minutes}-minute limit for one task; the next part has started automatically.**"
                 else:
                     header = (f"⏱ **Stopped at the {minutes}-minute time limit.** Reply **continue** to keep going: the "
@@ -336,7 +340,7 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
         if state.get("out_of_steps") and not state.get("next"):
             reason = f"it used all {turns} steps"
             ws.event(job["id"], "partial", reason)
-            if not state.get("phone_lease") and not state.get("stop") and await continue_after(job, reason, answer):
+            if not state.get("phone_lease") and not state.get("stop") and await continue_after(job, reason, answer, space):
                 answer = "🔁 **Used all steps for one task; the next part has started automatically.**\n\n" + answer
             return answer
         if state.get("phone_lease"):
@@ -345,6 +349,9 @@ async def run_job(job: dict, gate: asyncio.Semaphore | None = None) -> str:
             state.pop("next", None)
         if state.get("stop"):
             answer += "\n\nStopped: " + state["stop"]
+        if state.get("next") and stuck(job, space):
+            state.pop("next")
+            answer += "\n\nThe next phase wasn't started: the last automatic runs changed nothing. Reply **continue** to go on."
         if state.get("next"):
             nxt = ws.create_job(job["project"], "AUTOMATIC NEXT PHASE (queued by the previous task in this chat; the "
                                 f"project plan is in {PLAN_FILE}).\n\nCURRENT REQUEST:\n" + state["next"], "cowork",

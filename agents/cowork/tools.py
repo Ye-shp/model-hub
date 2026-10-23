@@ -282,7 +282,7 @@ def _queue_next_phase(ctx: ToolContext):
             return "The next phase is already queued."
         if not (ctx.space.dir / PLAN_FILE).is_file():
             return f"Not queued: write {PLAN_FILE} first (goal, phases as a checklist, decisions, file map)."
-        if chain_depth(ctx.job) >= MAX_CHAIN[account]:
+        if MAX_CHAIN[account] and chain_depth(ctx.job) >= MAX_CHAIN[account]:
             return (f"Not queued: {MAX_CHAIN[account]} phases already ran automatically in a row. Finish with a summary of "
                     "where the project stands; the user can reply 'continue' to start the next phase.")
         if not 20 <= len(brief.strip()) <= 6000:
