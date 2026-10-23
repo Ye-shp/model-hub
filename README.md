@@ -35,7 +35,7 @@ Pick **Qwen Cowork** in the chat site's model list for projects, or **Qwen (chat
   - X posts through your connected account.
   - Instagram reels and stories go through the official API. Image posts need the next hub image.
   - TikTok goes through the phone: the media lands in its gallery and Cowork posts it in the app.
-- **Phone:** when the phone bridge is connected (see below), Cowork can look at and operate the phone and collect TikTok/Instagram posts. Taps that would post, send, comment, follow, like or buy are blocked unless your message approves them, for example "approved, post it".
+- **Phone:** when the phone bridge is connected (see below), Cowork can operate the actual app screens: open apps, tap, long-press, swipe, type, read copied links, transfer media and complete authorized social tasks. It checks the content and target before replies, messages, group joins or posts. Direct phone tasks do not require scheduling. See [direct phone setup](docs/social-missions-and-copy.md).
 
 Behind the scenes:
 
@@ -65,11 +65,12 @@ focuses on reach, and preference exports stay separate from model training.
 
 ## Phone bridge
 
-On the PC the phone is plugged into:
+On the computer with the authorized ADB connection to the phone (USB or private network):
 
 1. Install Android platform-tools (adb) and Python 3.
 2. Turn on USB debugging on the phone and allow the prompt.
 3. Download `bridge.py` from the console's Phone page and run the command shown there (`python bridge.py --url https://api.handydandy.cc --key phb_…`).
+4. For Turkish/other Unicode text and copied post links, install `python -m pip install uiautomator2==3.7.0` on that computer. Select your exact phone with `--serial` when needed. After a bridge update, download the new script and restart it too.
 
 The bridge only makes outgoing HTTPS requests. The key only works for the bridge endpoints and can be replaced on the Phone page.
 

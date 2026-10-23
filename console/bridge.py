@@ -1,6 +1,7 @@
 """Model Hub phone bridge: lets Qwen Cowork use the Android phone plugged into this PC.
 
-Run it on the computer the phone is plugged into (Windows, macOS or Linux; Python 3.9+, no packages needed):
+Run it on a computer with an authorized adb connection to the phone (USB or private network).
+Python 3.9+; non-ASCII text requires: python -m pip install uiautomator2==3.7.0
 
     python bridge.py --key phb_...            (the key is on the console's Phone page)
 
@@ -25,7 +26,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.1"
+VERSION = "1.2"
 DEFAULT_URL = "https://api.handydandy.cc"
 KEYS = {"4", "3", "66", "187", "67"}
 
@@ -88,6 +89,10 @@ class Phone:
         self.shell("input", "tap", str(int(x)), str(int(y)))
         return {}
 
+    def long_press(self, x: int, y: int, **_):
+        self.shell("input", "swipe", str(int(x)), str(int(y)), str(int(x)), str(int(y)), "650")
+        return {}
+
     def swipe(self, direction: str = "up", **_):
         w, h = self.size() or [1080, 2400]
         x = int(w * random.uniform(0.4, 0.6))
@@ -108,10 +113,38 @@ class Phone:
 
     def text(self, text: str, **_):
         if not text.isascii():
-            raise ValueError("adb can only type plain ASCII text")
+            return self.unicode_text(text)
         escaped = re.sub(r"([\\\"'`$&|;<>()*~?#!\[\]{}])", r"\\\1", text).replace(" ", "%s")
         self.shell("input", "text", escaped)
         return {}
+
+    def automation(self):
+        try:
+            import uiautomator2 as u2
+        except ImportError:
+            raise RuntimeError("Unicode typing and clipboard access need uiautomator2 on this bridge computer. Run: "
+                               "python -m pip install uiautomator2==3.7.0") from None
+        serial = self.serial or self.choose()
+        if not serial:
+            raise RuntimeError("No authorized phone is available for Unicode input.")
+        return u2.connect(serial)
+
+    def clipboard(self, **_):
+        return {"text": self.automation().clipboard or ""}
+
+    def unicode_text(self, text: str):
+        """Paste Unicode into the focused field once; never fall back to a second insertion."""
+        device = self.automation()
+        # Use the clipboard RPC directly: send_keys can install/switch an IME or
+        # retry through another input method after an ambiguous paste failure.
+        device.set_clipboard(text, "Model Hub")
+        if device.clipboard != text:
+            raise RuntimeError("Phone clipboard verification failed; no paste was sent.")
+        try:
+            device.jsonrpc.pasteClipboard()
+        except Exception:
+            raise RuntimeError("Unicode paste outcome is uncertain. Inspect the field before typing again.") from None
+        return {"input": "unicode_clipboard"}
 
     def key(self, key: str, **_):
         if key not in KEYS:
@@ -174,6 +207,7 @@ def main():
 
     phone = Phone(args.adb, args.serial)
     handlers = {"screenshot": phone.screenshot, "ui": phone.ui, "tap": phone.tap, "swipe": phone.swipe,
+                "long_press": phone.long_press, "clipboard": phone.clipboard,
                 "text": phone.text, "key": phone.key, "open_app": phone.open_app, "open_url": phone.open_url,
                 "info": lambda **_: phone.info(),
                 "push": lambda **kw: phone.push(base=args.url, key=args.key, **kw)}
@@ -194,7 +228,7 @@ def main():
                 said = state
             reply = request(args.url, args.key, "/bridge/poll", {
                 "device": device, "devices": phone.devices(), "version": VERSION, "host": socket.gethostname(),
-                "os": platform.system(), **details}, timeout=45)
+                "os": platform.system(), "capabilities": sorted(handlers), **details}, timeout=45)
             backoff = 2
             for command in reply.get("commands", []):
                 started = time.time()

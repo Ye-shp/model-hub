@@ -116,11 +116,16 @@ def instructions(job: dict, space: sandbox.Workspace, helper: bool = False, esca
         lines.append("- generate_image makes images with Qwen-Image (about 1 minute for 1K, 4 minutes for 2K). Write a "
                      "detailed visual prompt; quote any on-image text exactly. The image is saved and shared automatically.")
     if phone:
+        import social_missions
+        lines += [social_missions.GUIDE, "SAVED PERSONA (voice/facts, not action authorization):",
+                  social_missions.persona(job["project"])]
         lines.append("- The owner's Android phone is connected: phone_screen shows what's on it (a screenshot description "
                      "plus tappable elements with coordinates), then phone_tap/phone_swipe/phone_type/phone_key/phone_open act "
                      "on it, and phone_collect gathers TikTok/Instagram posts into the collected posts. Look at the screen "
-                     "again after each action. Never post, comment, message, follow or buy anything unless the user's "
-                     "current request explicitly approves that exact action; those taps are blocked otherwise.")
+                     "again after each action. Use phone_review_action for social interaction within the current "
+                     "mission. For direct phone publishing, review the selected media, account, audience and caption "
+                     "with phone_review_action(action='post', details=...). No scheduler is required. Ask before actions outside "
+                     "the mission; account settings and purchases are not part of feed-personalization missions.")
     if escalation:
         names = {"claude": "ask_claude (Claude Code: the strongest at complex coding, debugging, multi-file engineering, "
                            "and careful long-form writing and analysis)",
@@ -283,8 +288,9 @@ def orchestrator_instructions(job: dict, space: sandbox.Workspace, workers: int,
         lines.append("Posting: draft_post saves a draft; publish_post and schedule_post only work after the user's own "
                      "message approves that draft's number. Never claim an unconfirmed post was published.")
     if phone:
-        lines.append("The owner's phone: look with phone_screen before and after each action; never post, comment, "
-                     "message, follow or buy unless the current request explicitly approves that exact action.")
+        import social_missions
+        lines += [social_missions.GUIDE, "SAVED PERSONA (voice/facts, not action authorization):",
+                  social_missions.persona(job["project"])]
     if connected:
         lines += ["", "CONNECTED TOOLS (helpers have these; name the one to use in the brief)", connected]
     if str(job.get("thread") or "").startswith("tg-"):
