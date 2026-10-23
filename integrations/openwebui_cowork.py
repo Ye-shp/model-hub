@@ -36,7 +36,7 @@ Telegram) · `/connect higgsfield` (sign in with your existing account; `off` di
 `/connect api NAME BASE_URL [bearer=KEY] [header="Name: value"] [about="…"]` (HTTP APIs). Approve a drafted post with `approve post N`."""
 
 SKIP = {"model", "usage", "queued", "completed", "failed", "interrupted", "cancelled", "resumed", "frontier-call", "partial",
-        "next-phase", "reasoning"}
+        "next-phase", "reasoning", "progress"}
 
 
 def question_text(question: dict) -> str:

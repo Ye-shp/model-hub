@@ -232,7 +232,7 @@ async function openJob(id) {
   const tl = el('div', undefined, 'timeline');
   let thinking = null;
   for (const e of t.events) {
-    if (['usage', 'model'].includes(e.kind)) continue;
+    if (['usage', 'model', 'progress'].includes(e.kind)) continue;
     if (e.kind === 'reasoning') {  // streamed thoughts: one collapsed block per stretch of thinking
       if (!thinking) { thinking = el('details'); thinking.append(el('summary', 'Thinking'), el('div', '', 'text')); tl.append(thinking); }
       thinking.lastChild.textContent += e.detail;

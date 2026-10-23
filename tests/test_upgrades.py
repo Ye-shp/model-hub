@@ -175,15 +175,15 @@ class ContinuityTests(Base):
         self.assertIn("Report: started the long download.", answer)
         self.assertTrue(ws.query("SELECT 1 FROM events WHERE job_id=? AND kind='partial'", (job["id"],)))
         child = ws.query("SELECT * FROM jobs WHERE parent=?", (job["id"],))[0]
-        self.assertTrue(child["task"].startswith("AUTOMATIC CONTINUATION 1 of up to"))
+        self.assertTrue(child["task"].startswith("AUTOMATIC CONTINUATION 1 ("))
         self.assertTrue(child["task"].rstrip().endswith("Long job"))
         self.assertEqual((child["thread"], child["skill"]), ("chat-t", "cowork"))
         self.assertIn("STOPPED BEFORE FINISHING", cowork.recap(child))
         # Continuations don't ask kickoff questions or hand the request to Claude again.
         self.assertFalse(cowork.may_ask_first(child["task"]))
 
-        # After the allowed number of automatic continuations it stops and waits for "continue".
-        with patch.object(cowork.runner, "AUTO_CONTINUE", 0):
+        # Once the chain stops making progress it stops and waits for "continue".
+        with patch.object(cowork.runner, "stuck", return_value=True):
             async def again():
                 ws.create_job("default", "CURRENT REQUEST:\nLong job", "cowork", "fast", thread="chat-t2")
                 job = ws.claim_job()
@@ -196,6 +196,49 @@ class ContinuityTests(Base):
             job, answer = asyncio.run(again())
         self.assertIn("Stopped at the 0-minute time limit", answer)
         self.assertFalse(ws.query("SELECT 1 FROM jobs WHERE parent=?", (job["id"],)))
+
+
+class UnlimitedContinuationTests(Base):
+    def row(self, job_id):
+        return ws.query("SELECT * FROM jobs WHERE id=?", (job_id,))[0]
+
+    def test_continuations_have_no_fixed_count_and_stop_when_runs_change_nothing(self):
+        space = sandbox.Workspace("owner", "chat-np").prepare()
+        job = self.row(ws.create_job("default", "CURRENT REQUEST:\nBig job", "cowork", "fast", thread="chat-np"))
+        for n in range(12):  # well past the old limit of 4
+            (space.dir / f"step{n}.md").write_text(str(n))
+            job = self.row(cowork.runner.queue_continuation(job, "the time limit was reached", space))
+        self.assertTrue(job["task"].startswith("AUTOMATIC CONTINUATION 12 ("), job["task"][:60])
+        self.assertTrue(job["task"].rstrip().endswith("Big job"))
+        # Rewriting a file with the same text is not progress; one idle run is tolerated, the second stops the chain.
+        (space.dir / "step0.md").write_text("0")
+        job = self.row(cowork.runner.queue_continuation(job, "the time limit was reached", space))
+        self.assertIsNone(cowork.runner.queue_continuation(job, "the time limit was reached", space))
+        self.assertTrue(ws.query("SELECT 1 FROM events WHERE job_id=? AND detail LIKE 'No progress in the last 2%'",
+                                 (job["id"],)))
+
+    def test_shared_files_count_as_progress(self):
+        space = sandbox.Workspace("owner", "chat-sh").prepare()
+        job = self.row(ws.create_job("default", "CURRENT REQUEST:\nReport", "cowork", "fast", thread="chat-sh"))
+        for _ in range(4):
+            ws.write_artifact("default", job["id"], "report.md", b"same", "text/markdown")
+            job = self.row(cowork.runner.queue_continuation(job, "it used all 30 steps", space))
+        self.assertTrue(job["task"].startswith("AUTOMATIC CONTINUATION 4 ("))
+
+    def test_a_fixed_count_still_applies_when_configured(self):
+        space = sandbox.Workspace("owner", "chat-cap").prepare()
+        job = self.row(ws.create_job("default", "CURRENT REQUEST:\nCapped", "cowork", "fast", thread="chat-cap"))
+        with patch.object(cowork.runner, "AUTO_CONTINUE", 2):
+            for n in range(2):
+                (space.dir / f"f{n}.md").write_text(str(n))
+                job = self.row(cowork.runner.queue_continuation(job, "the time limit was reached", space))
+            self.assertTrue(job["task"].startswith("AUTOMATIC CONTINUATION 2 of up to 2"))
+            (space.dir / "f9.md").write_text("9")
+            self.assertIsNone(cowork.runner.queue_continuation(job, "the time limit was reached", space))
+
+    def test_phases_have_no_fixed_count_for_the_owner(self):
+        self.assertEqual(cowork.MAX_CHAIN["owner"], 0)
+        self.assertEqual(cowork.runner.AUTO_CONTINUE, 0)
 
 
 class AccountTests(Base):

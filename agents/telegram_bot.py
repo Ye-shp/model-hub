@@ -41,8 +41,8 @@ HELP = ("Send me a TikTok, Reel, X post or thread, Reddit thread or YouTube link
         "Cowork request. If a task needs something from you, it asks here and waits for your reply.\n\n/frame <video link> "
         "[name] (or a video with /frame as its caption) builds a character sheet from the video frame by frame: look, "
         "outfits, setting, light, camera, palette and a prompt kit, saved for later. /new starts a fresh conversation, "
-        "/status shows what's running. /copy adapts a reference video with your saved characters and backgrounds; "
-        "/copy help explains setup. /persona <brief> saves your social account's voice.")
+        "/status shows what's running. /recreate recreates a video in Higgsfield with your own saved character sheet and "
+        "background; /recreate help explains setup. /persona <brief> saves your social account's voice.")
 
 _watchers: dict[str, asyncio.Task] = {}
 
@@ -319,10 +319,14 @@ async def handle(message: dict) -> None:
             saved = str(error)
         await send(token, chat, saved)
         return
-    if command == "/copy":
+    if command in {"/recreate", "/copy"}:
         import video_copy
         await video_copy.command(token, chat, message, text, thread)
         return
+    if not command and message.get("media_group_id"):
+        import video_copy
+        if await video_copy.album_item(token, chat, message):
+            return
     if command == "/status":
         rows = ws.query("SELECT id,status,task FROM jobs WHERE project=? AND thread=? AND status IN ('queued','running') "
                         "ORDER BY created_at", (PROJECT, thread))
@@ -345,7 +349,7 @@ async def handle(message: dict) -> None:
     awaiting_copy = state.get("copy_waiting", {}).get(str(chat))
     if not command and awaiting_copy and awaiting_copy.get("thread") == thread:
         import video_copy
-        await video_copy.command(token, chat, message, "/copy", thread)
+        await video_copy.command(token, chat, message, "/recreate", thread)
         return
 
     found = message_links(message)

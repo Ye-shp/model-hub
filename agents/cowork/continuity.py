@@ -1,15 +1,18 @@
 """Continuity: what a stopped attempt did, and the chat's plan.md."""
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+from pathlib import Path
 
 import coordination
 import sandbox
 import store
 import workspace as ws
 
-from .config import ACTION_KINDS, PLAN_FILE, PLAN_LIMIT
+from .config import ACTION_KINDS, NO_PROGRESS_RUNS, PLAN_FILE, PLAN_LIMIT
 from .context import _cut, describe
 
 
@@ -135,3 +138,83 @@ def chain_depth(job: dict) -> int:
         depth += 1
         parent = rows[0]["parent"] if rows else None
     return depth
+
+
+# ---- progress between automatic runs ----
+# With no fixed limit on automatic continuations and phases, a chain stops when it stops changing anything: each
+# automatic-capable run records a fingerprint of the chat's folder when it ends, and a run that left the folder as its
+# parent left it (and shared nothing) counts as stalled.
+_SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".cache", ".npm", ".pip"}
+_HASH_BELOW = 1024 * 1024   # small files are fingerprinted by content (rewriting identical text isn't progress)
+_MAX_FILES = 20000
+
+
+def folder_mark(space: sandbox.Workspace) -> str:
+    """A fingerprint of the chat's folder: every file's path and size, and the content of the small ones."""
+    digest, root, count = hashlib.sha256(), Path(space.dir), 0
+    for folder, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if d not in _SKIP_DIRS)
+        for name in sorted(files):
+            if name == ".claude-brief.md":  # rewritten by every hand-off; says nothing about the work
+                continue
+            path = Path(folder) / name
+            try:
+                size = path.stat().st_size
+                if path.is_symlink() or not path.is_file():
+                    continue
+                content = hashlib.sha256(path.read_bytes()).hexdigest() if size < _HASH_BELOW else str(path.stat().st_mtime_ns)
+            except OSError:
+                continue
+            digest.update(f"{path.relative_to(root)}\0{size}\0{content}\n".encode())
+            count += 1
+            if count >= _MAX_FILES:
+                return digest.hexdigest()
+    return digest.hexdigest()
+
+
+def _progress(job_id: str | None) -> dict | None:
+    if not job_id:
+        return None
+    rows = ws.query("SELECT detail FROM events WHERE job_id=? AND kind='progress' ORDER BY id DESC LIMIT 1", (job_id,))
+    try:
+        return json.loads(rows[0]["detail"]) if rows else None
+    except ValueError:
+        return None
+
+
+def record_progress(job: dict, space: sandbox.Workspace) -> dict:
+    """Record (once per run) whether this run changed anything compared with the run before it in the chain."""
+    found = _progress(job["id"])
+    if found is not None:
+        return found
+    mark = folder_mark(space)
+    before = _progress(job.get("parent"))
+    shared = bool(ws.query("SELECT 1 FROM artifacts WHERE job_id=? LIMIT 1", (job["id"],)))
+    found = {"mark": mark, "moved": bool(shared or before is None or before.get("mark") != mark)}
+    ws.event(job["id"], "progress", json.dumps(found))
+    return found
+
+
+def stalled_runs(job: dict, space: sandbox.Workspace) -> int:
+    """How many runs in a row, ending with this one, changed nothing."""
+    if record_progress(job, space)["moved"]:
+        return 0
+    count, parent = 1, job.get("parent")
+    while parent and count < 50:
+        found = _progress(parent)
+        if not found or found.get("moved"):
+            break
+        count += 1
+        rows = ws.query("SELECT parent FROM jobs WHERE id=?", (parent,))
+        parent = rows[0]["parent"] if rows else None
+    return count
+
+
+def stuck(job: dict, space: sandbox.Workspace) -> bool:
+    """True when the chain has stopped making progress and should wait for the owner instead of going on."""
+    stalled = stalled_runs(job, space)
+    if stalled >= NO_PROGRESS_RUNS:
+        ws.event(job["id"], "tool", f"No progress in the last {stalled} automatic run(s); waiting for you instead of "
+                                    "continuing")
+        return True
+    return False
